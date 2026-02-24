@@ -222,6 +222,79 @@ function requiredCandleWindow(config) {
   return Math.max(2, momentum + 1, volatility + 1);
 }
 
+function ema(values = [], period = 9) {
+  const p = Math.max(2, Math.floor(asNumber(period, 9)));
+  const alpha = 2 / (p + 1);
+  let out = null;
+  for (const v of values) {
+    const n = asNumber(v, null);
+    if (!Number.isFinite(n)) {
+      continue;
+    }
+    out = out === null ? n : (alpha * n) + ((1 - alpha) * out);
+  }
+  return out;
+}
+
+function evaluateReboundGate(candles = [], reboundConfig = {}) {
+  if (reboundConfig?.enabled === false) {
+    return { ok: true, reason: "rebound_disabled" };
+  }
+
+  const dropLookback = Math.max(3, Math.floor(asNumber(reboundConfig?.dropLookback, 8)));
+  const dropPct = asNumber(reboundConfig?.dropPct, -2.5);
+  const confirmEma = Math.max(3, Math.floor(asNumber(reboundConfig?.confirmEma, 9)));
+
+  if (!Array.isArray(candles) || candles.length < Math.max(dropLookback + 2, confirmEma + 2)) {
+    return { ok: false, reason: "rebound_insufficient_candles" };
+  }
+
+  const closes = candles
+    .map((c) => asNumber(c?.close ?? c?.tradePrice ?? c?.price, null))
+    .filter((v) => Number.isFinite(v));
+  if (closes.length < Math.max(dropLookback + 2, confirmEma + 2)) {
+    return { ok: false, reason: "rebound_invalid_closes" };
+  }
+
+  const last = closes[closes.length - 1];
+  const prev = closes[closes.length - 2];
+  const lookback = closes.slice(Math.max(0, closes.length - 1 - dropLookback), closes.length - 1);
+  const peak = lookback.length > 0 ? Math.max(...lookback) : prev;
+  const dropFromPeakPct = peak > 0 ? ((last - peak) / peak) * 100 : 0;
+  const emaValue = ema(closes, confirmEma);
+
+  const ok = Number.isFinite(emaValue)
+    && dropFromPeakPct <= dropPct
+    && last >= emaValue
+    && last > prev;
+
+  if (!ok) {
+    return {
+      ok: false,
+      reason: "rebound_gate_block",
+      metrics: {
+        dropFromPeakPct,
+        dropThresholdPct: dropPct,
+        ema: emaValue,
+        last,
+        prev,
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    reason: "rebound_gate_pass",
+    metrics: {
+      dropFromPeakPct,
+      dropThresholdPct: dropPct,
+      ema: emaValue,
+      last,
+      prev,
+    },
+  };
+}
+
 function calculateAccountMetrics(accounts = []) {
   let cashKrw = 0;
   let cashAvailableKrw = 0;
@@ -1634,7 +1707,12 @@ export class TradingSystem {
                 selectedSource = "ai_override";
               } else if (signal.action === "BUY") {
                 if (aiPolicy.allowBuy) {
-                  selectedAction = "BUY";
+                  const reboundGate = evaluateReboundGate(candlesSnapshot, this.config.strategy?.rebound || {});
+                  if (reboundGate.ok) {
+                    selectedAction = "BUY";
+                  } else {
+                    selectedReason = reboundGate.reason || "rebound_gate_block";
+                  }
                 } else {
                   selectedReason = "ai_filter_block_buy";
                 }

@@ -186,6 +186,17 @@ export function loadConfig(env = process.env) {
       sellAllOnExit: toBoolean(env.STRATEGY_SELL_ALL_ON_EXIT, true),
       sellAllQtyPrecision: toPositiveInt(env.STRATEGY_SELL_ALL_QTY_PRECISION, 8),
       baseOrderAmountKrw: toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 20_000),
+      rebound: {
+        enabled: toBoolean(env.REBOUND_ENABLED, true),
+        dropLookback: toPositiveInt(env.REBOUND_DROP_LOOKBACK, 8),
+        dropPct: toNumber(env.REBOUND_DROP_PCT, -2.5),
+        confirmEma: toPositiveInt(env.REBOUND_CONFIRM_EMA, 9),
+        entrySplits: [0.4, 0.3, 0.3],
+        stopLossPct: toPositiveNumber(env.REBOUND_STOP_LOSS_PCT, 4.8),
+        tp1Pct: toPositiveNumber(env.REBOUND_TP1_PCT, 2.2),
+        tp2Pct: toPositiveNumber(env.REBOUND_TP2_PCT, 3.8),
+        trailPct: toPositiveNumber(env.REBOUND_TRAIL_PCT, 1.2),
+      },
     },
     optimizer: {
       enabled: toBoolean(env.OPTIMIZER_ENABLED, true),
