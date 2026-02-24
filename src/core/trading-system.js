@@ -1360,6 +1360,27 @@ export class TradingSystem {
     const pnlRatio = price / avgBuyPrice - 1;
     const stopLossPct = asNumber(this.config.risk.maxHoldingLossPct, 0);
     const takeProfitPct = asNumber(this.config.risk.maxHoldingTakeProfitPct, 0);
+    const trailingStopPct = asNumber(this.config.risk.trailingStopPct, 0);
+    const trailingArmPct = asNumber(this.config.risk.trailingArmPct, 0);
+
+    const state = this.store.snapshot();
+    const peaks = state?.system?.holdingPeaks && typeof state.system.holdingPeaks === "object"
+      ? state.system.holdingPeaks
+      : {};
+    const prevPeak = Math.max(asNumber(peaks[normalizedSymbol], 0), avgBuyPrice);
+    const nextPeak = Math.max(prevPeak, price);
+    if (nextPeak > prevPeak) {
+      await this.store.update((draft) => {
+        if (!draft.system) {
+          draft.system = {};
+        }
+        if (!draft.system.holdingPeaks || typeof draft.system.holdingPeaks !== "object") {
+          draft.system.holdingPeaks = {};
+        }
+        draft.system.holdingPeaks[normalizedSymbol] = nextPeak;
+        return draft;
+      });
+    }
 
     if (Number.isFinite(stopLossPct) && stopLossPct > 0 && pnlRatio <= -Math.abs(stopLossPct) / 100) {
       return {
@@ -1380,6 +1401,29 @@ export class TradingSystem {
         pnlRatio,
         avgBuyPrice,
         currentPrice: price,
+      };
+    }
+
+    const armed = Number.isFinite(trailingArmPct) && trailingArmPct > 0
+      ? pnlRatio >= Math.abs(trailingArmPct) / 100
+      : pnlRatio > 0;
+    const trailDropPct = nextPeak > 0 ? ((nextPeak - price) / nextPeak) * 100 : 0;
+
+    if (
+      armed
+      && Number.isFinite(trailingStopPct)
+      && trailingStopPct > 0
+      && trailDropPct >= trailingStopPct
+    ) {
+      return {
+        shouldExit: true,
+        action: "SELL",
+        reason: "protective_trailing_stop",
+        pnlRatio,
+        avgBuyPrice,
+        currentPrice: price,
+        peakPrice: nextPeak,
+        trailDropPct,
       };
     }
 

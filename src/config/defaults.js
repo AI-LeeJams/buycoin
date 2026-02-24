@@ -254,8 +254,10 @@ export function loadConfig(env = process.env) {
       maxOpenOrdersPerSymbol: toPositiveInt(env.RISK_MAX_OPEN_ORDERS_PER_SYMBOL, 1),
       maxExposureKrw: toPositiveNumber(env.RISK_MAX_EXPOSURE_KRW, 2_000_000),
       maxDailyLossKrw: toPositiveNumber(env.RISK_MAX_DAILY_LOSS_KRW, 500_000),
-      maxHoldingLossPct: toNumber(env.RISK_MAX_HOLDING_LOSS_PCT, 0),
-      maxHoldingTakeProfitPct: toNumber(env.RISK_MAX_HOLDING_TAKE_PROFIT_PCT, 0),
+      maxHoldingLossPct: toNumber(env.RISK_MAX_HOLDING_LOSS_PCT, 4.8),
+      maxHoldingTakeProfitPct: toNumber(env.RISK_MAX_HOLDING_TAKE_PROFIT_PCT, 2.2),
+      trailingStopPct: toPositiveNumber(env.RISK_TRAILING_STOP_PCT, 1.2),
+      trailingArmPct: toPositiveNumber(env.RISK_TRAILING_ARM_PCT, 2.2),
       maxConsecutiveRiskRejects: toPositiveInt(env.RISK_MAX_CONSECUTIVE_RISK_REJECTS, 4),
       riskRejectResetSec: toPositiveInt(
         env.RISK_REJECT_RESET_SEC ?? env.RISK_RISK_REJECT_RESET_SEC,
