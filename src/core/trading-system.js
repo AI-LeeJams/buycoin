@@ -1903,7 +1903,15 @@ export class TradingSystem {
                   fallbackAmountKrw: cappedAmount,
                 });
                 orderAmountKrw = asNumber(sellPlan.amountKrw, cappedAmount);
-                orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
+
+                const sellAllPlan = sellPlan?.source === "sell_all_available_qty";
+                const protectiveSell = selectedSource === "protective_exit";
+                const allowFullSellAmount = sellAllPlan || protectiveSell;
+
+                if (!allowFullSellAmount) {
+                  orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
+                }
+
                 if (!Number.isFinite(orderAmountKrw) || orderAmountKrw <= 0) {
                   if (forcedExit) {
                     await this.recordRiskEvent({
