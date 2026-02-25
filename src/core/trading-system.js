@@ -2621,13 +2621,20 @@ export class TradingSystem {
           "SELL_EXCEEDS_HOLDING",
           "NO_SELLABLE_HOLDING",
         ]);
+        const nonEscalatingBuyRejectRules = new Set([
+          "INSUFFICIENT_CASH",
+          "MIN_ORDER_NOTIONAL_KRW",
+        ]);
         const isNonEscalatingSellReject = orderInput.side === "sell"
           && reasonRules.length > 0
           && reasonRules.every((rule) => nonEscalatingSellRejectRules.has(rule));
+        const isNonEscalatingBuyReject = orderInput.side === "buy"
+          && reasonRules.length > 0
+          && reasonRules.every((rule) => nonEscalatingBuyRejectRules.has(rule));
         const isKillSwitchEchoReject = reasonRules.length > 0
           && reasonRules.every((rule) => rule === "KILL_SWITCH_ACTIVE");
 
-        const shouldEscalateRejectStreak = !isNonEscalatingSellReject && !isKillSwitchEchoReject;
+        const shouldEscalateRejectStreak = !isNonEscalatingSellReject && !isNonEscalatingBuyReject && !isKillSwitchEchoReject;
         const streak = shouldEscalateRejectStreak
           ? await this.bumpRiskRejectStreak({
             symbol: orderInput.symbol,
