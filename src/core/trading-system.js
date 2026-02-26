@@ -1912,6 +1912,26 @@ export class TradingSystem {
                   orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
                 }
 
+                const minSellNotionalKrw = Math.max(asNumber(this.config?.risk?.chanceMinTotalKrw, 5000), 5000);
+                if (orderAmountKrw < minSellNotionalKrw) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "sell_notional_below_min",
+                    orderAmountKrw,
+                    minSellNotionalKrw,
+                    sellPlanSource: sellPlan?.source || null,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
+
                 if (!Number.isFinite(orderAmountKrw) || orderAmountKrw <= 0) {
                   if (forcedExit) {
                     await this.recordRiskEvent({
