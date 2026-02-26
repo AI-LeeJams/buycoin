@@ -117,19 +117,21 @@ function buildKpiReportText(input) {
     `1) 결론: ${input.decision}`,
     `2) 실행결과: attempted=${input.attempted}, successful=${input.successful}, rejected=${input.rejected}, fills=${input.fillCount}`,
     `3) 손익: realized=${Math.round(input.realizedPnlKrw).toLocaleString()} KRW, unrealized=${Math.round(toNum(input.mtm.unrealizedPnlKrw, 0)).toLocaleString()} KRW, winRate=${input.winRatePct}%`,
-    `4) 포지션: KRW ${Math.round(input.mtm.krw).toLocaleString()}, ${assetsText}`,
-    `5) 실패원인 Top3: ${rejectTop}`,
-    `6) 변경값: ${input.changeSummary}`,
-    `7) 다음 점검 시각: ${input.nextCheckAtKst}`,
+    `4) 기준손익: baseline=${Math.round(input.baselineEquityKrw).toLocaleString()} KRW, equity=${Math.round(input.currentEquityKrw).toLocaleString()} KRW, pnl=${Math.round(input.baselinePnlKrw).toLocaleString()} KRW`,
+    `5) 포지션: KRW ${Math.round(input.mtm.krw).toLocaleString()}, ${assetsText}`,
+    `6) 실패원인 Top3: ${rejectTop}`,
+    `7) 변경값: ${input.changeSummary}`,
+    `8) 다음 점검 시각: ${input.nextCheckAtKst}`,
   ].join("\n");
 }
 
 export async function generateKpiReport(baseDir = process.cwd()) {
   const traderDir = path.join(baseDir, ".trader");
-  const [state, summary, aiRuntime] = await Promise.all([
+  const [state, summary, aiRuntime, operatorBaseline] = await Promise.all([
     readJson(path.join(traderDir, "state.json"), {}),
     readJson(path.join(traderDir, "execution-kpi-summary.json"), {}),
     readJson(path.join(traderDir, "ai-runtime.json"), {}),
+    readJson(path.join(traderDir, "operator-baseline.json"), null),
   ]);
 
   const s = summary?.summary || {};
@@ -147,6 +149,13 @@ export async function generateKpiReport(baseDir = process.cwd()) {
 
   const decision = `regime=${aiRuntime?.overlay?.regime || "unknown"}, killSwitch=${Boolean(aiRuntime?.controls?.killSwitch)}`;
   const changeSummary = `ai-runtime updatedAt=${aiRuntime?.updatedAt || "n/a"}`;
+
+  const currentEquityKrw = toNum(mtm.krw, 0)
+    + mtm.assets
+      .map((x) => toNum(x.valuationKrw, 0))
+      .reduce((a, b) => a + b, 0);
+  const baselineEquityKrw = toNum(operatorBaseline?.baselineEquityKrw, currentEquityKrw);
+  const baselinePnlKrw = currentEquityKrw - baselineEquityKrw;
 
   const next = new Date(Date.now() + 2 * 60 * 60 * 1000);
   const nextCheckAtKst = new Intl.DateTimeFormat("ko-KR", {
@@ -170,6 +179,9 @@ export async function generateKpiReport(baseDir = process.cwd()) {
     rejectTopReasons,
     decision,
     changeSummary,
+    currentEquityKrw,
+    baselineEquityKrw,
+    baselinePnlKrw,
     nextCheckAtKst,
     text: buildKpiReportText({
       attempted,
@@ -182,6 +194,9 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       rejectTopReasons,
       decision,
       changeSummary,
+      currentEquityKrw,
+      baselineEquityKrw,
+      baselinePnlKrw,
       nextCheckAtKst,
     }),
   };
