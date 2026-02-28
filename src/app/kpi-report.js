@@ -28,6 +28,16 @@ function aggregateRejectReasons(state = {}, fromMs = 0, limit = 3) {
     if (Number.isFinite(ts) && ts < fromMs) {
       continue;
     }
+
+    const reasons = Array.isArray(row?.reasons) ? row.reasons : [];
+    if (reasons.length > 0) {
+      for (const reason of reasons) {
+        const key = String(reason?.rule || reason?.detail || "unknown_reject");
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      continue;
+    }
+
     const key = String(row?.reason || row?.code || "unknown_reject");
     counts.set(key, (counts.get(key) || 0) + 1);
   }

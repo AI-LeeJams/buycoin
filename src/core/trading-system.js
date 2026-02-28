@@ -1959,6 +1959,26 @@ export class TradingSystem {
                   }
                   return;
                 }
+              } else {
+                const accountContext = await this.loadAccountContext();
+                const availableCashKrw = asNumber(accountContext?.metrics?.availableCashKrw, 0);
+                if (!Number.isFinite(availableCashKrw) || availableCashKrw + 1e-9 < orderAmountKrw) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "buy_insufficient_cash_gate",
+                    availableCashKrw,
+                    requiredOrderKrw: orderAmountKrw,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
               }
 
               attemptedOrders += 1;
