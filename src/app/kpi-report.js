@@ -112,6 +112,20 @@ function extractLatestPrices(state = {}) {
   return out;
 }
 
+function summarizeMarket(universe = {}) {
+  const candidates = Array.isArray(universe?.candidates) ? universe.candidates : [];
+  if (candidates.length === 0) {
+    return "시장 데이터 없음";
+  }
+
+  const sortedByChange = [...candidates].sort((a, b) => toNum(b?.change24hPct, -999) - toNum(a?.change24hPct, -999));
+  const top = sortedByChange.slice(0, 3).map((c) => `${toKoreanSymbol(c.symbol)} ${toNum(c.change24hPct, 0).toFixed(1)}%`);
+
+  const avgChange = candidates.reduce((acc, c) => acc + toNum(c?.change24hPct, 0), 0) / candidates.length;
+  const tone = avgChange >= 1 ? "강세" : avgChange <= -1 ? "약세" : "혼조";
+  return `${tone} / 상위 모멘텀: ${top.join(", ")}`;
+}
+
 function collectRecentTrades(state = {}, fromMs = 0, limit = 5) {
   const orders = Array.isArray(state?.orders) ? state.orders : [];
   const done = orders.filter((o) => String(o?.state || "").toUpperCase() === "DONE");
@@ -186,6 +200,7 @@ function buildKpiReportText(input) {
   return [
     "[코마 요약 보고]",
     `• 설정 코인: ${configuredSymbolsText}`,
+    `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
     `• 최근 거래: ${recentTradesText}`,
     `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
@@ -197,11 +212,12 @@ function buildKpiReportText(input) {
 
 export async function generateKpiReport(baseDir = process.cwd()) {
   const traderDir = path.join(baseDir, ".trader");
-  const [state, summary, aiRuntime, operatorBaseline] = await Promise.all([
+  const [state, summary, aiRuntime, operatorBaseline, marketUniverse] = await Promise.all([
     readJson(path.join(traderDir, "state.json"), {}),
     readJson(path.join(traderDir, "execution-kpi-summary.json"), {}),
     readJson(path.join(traderDir, "ai-runtime.json"), {}),
     readJson(path.join(traderDir, "operator-baseline.json"), null),
+    readJson(path.join(traderDir, "market-universe.json"), {}),
   ]);
 
   const s = summary?.summary || {};
@@ -220,6 +236,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
   const mtm = markToMarket(latestBalances(state), latestPrices);
   const rejectTopReasons = aggregateRejectReasons(state, fromMs, 3);
   const recentTrades = collectRecentTrades(state, fromMs, 5);
+  const marketSummary = summarizeMarket(marketUniverse);
   const situationPlan = buildSituationPlan({ attempted, successful, buySignals, rejected });
 
   const decision = `regime=${aiRuntime?.overlay?.regime || "unknown"}, killSwitch=${Boolean(aiRuntime?.controls?.killSwitch)}`;
@@ -254,6 +271,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
     mtm,
     rejectTopReasons,
     recentTrades,
+    marketSummary,
     situationPlan,
     decision,
     changeSummary,
@@ -273,6 +291,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       mtm,
       rejectTopReasons,
       recentTrades,
+      marketSummary,
       situationPlan,
       decision,
       changeSummary,
