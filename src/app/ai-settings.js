@@ -6,11 +6,11 @@ import { nowIso } from "../lib/time.js";
 const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout"]);
 
 // Safe ranges for strategy parameters per README AI Operator Contract.
-// Values outside these ranges silently break strategy behavior (e.g. momentumEntryBps>30 disables buying).
+// Values outside these ranges can silently degrade behavior; high momentumEntryBps over-filters buy entries.
 const STRATEGY_SAFE_RANGES = {
   momentumLookback:         { min: 12,   max: 72   },
   volatilityLookback:       { min: 48,   max: 144  },
-  momentumEntryBps:         { min: 6,    max: 30   },
+  momentumEntryBps:         { min: 6,    max: 24   },
   momentumExitBps:          { min: 4,    max: 20   },
   targetVolatilityPct:      { min: 0.30, max: 1.20 },
   riskManagedMinMultiplier: { min: 0.40, max: 1.00 },
