@@ -1961,8 +1961,10 @@ export class TradingSystem {
                 }
               } else {
                 const accountContext = await this.loadAccountContext();
-                const availableCashKrw = asNumber(accountContext?.metrics?.availableCashKrw, 0);
-                if (!Number.isFinite(availableCashKrw) || availableCashKrw + 1e-9 < orderAmountKrw) {
+                const availableCashKrw = asNumber(accountContext?.metrics?.availableCashKrw, null);
+                const cashKnown = Number.isFinite(availableCashKrw);
+
+                if (cashKnown && availableCashKrw + 1e-9 < orderAmountKrw) {
                   decisions.push({
                     at: nowIso(),
                     price: tick.tradePrice,
@@ -1978,6 +1980,21 @@ export class TradingSystem {
                     decisions.shift();
                   }
                   return;
+                }
+
+                if (!cashKnown) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    note: "cash_unknown_gate_bypassed",
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
                 }
               }
 
