@@ -94,21 +94,35 @@ function markToMarket(accounts = [], latestPrices = {}) {
   return result;
 }
 
-function extractLatestPrices(state = {}) {
-  const md = state.marketData;
-  if (!md || typeof md !== "object") {
-    return {};
-  }
+function extractLatestPrices(state = {}, universe = {}) {
   const out = {};
-  for (const [symbol, row] of Object.entries(md)) {
-    if (!row || typeof row !== "object") {
+
+  const md = state.marketData;
+  if (md && typeof md === "object") {
+    for (const [symbol, row] of Object.entries(md)) {
+      if (!row || typeof row !== "object") {
+        continue;
+      }
+      const p = toNum(row.tradePrice ?? row.close ?? row.price, null);
+      if (Number.isFinite(p)) {
+        out[symbol] = p;
+      }
+    }
+  }
+
+  // Fallback to market-universe snapshot when runtime marketData is missing/stale.
+  const candidates = Array.isArray(universe?.candidates) ? universe.candidates : [];
+  for (const c of candidates) {
+    const symbol = c?.symbol;
+    if (!symbol || out[symbol]) {
       continue;
     }
-    const p = toNum(row.tradePrice ?? row.close ?? row.price, null);
+    const p = toNum(c?.lastPrice ?? c?.price, null);
     if (Number.isFinite(p)) {
       out[symbol] = p;
     }
   }
+
   return out;
 }
 
@@ -251,7 +265,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
   const realizedPnlKrw = toNum(s?.realized?.realizedPnlKrw, 0);
   const winRatePct = toNum(s?.realized?.winRatePct, 0);
 
-  const latestPrices = extractLatestPrices(state);
+  const latestPrices = extractLatestPrices(state, marketUniverse);
   const mtm = markToMarket(latestBalances(state), latestPrices);
   const rejectTopReasons = aggregateRejectReasons(state, fromMs, 3);
   const recentTrades = collectRecentTrades(state, fromMs, 5);
