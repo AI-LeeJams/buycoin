@@ -9,7 +9,7 @@ const KPI = `${TRADER}/execution-kpi-summary.json`;
 const UNIVERSE = `${TRADER}/market-universe.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
-const BLACKLIST = new Set(['ENSO_KRW']);
+const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
 
 function readJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
@@ -37,23 +37,29 @@ function getMarketTone(universe) {
   return { tone, avg, up, down };
 }
 
+function rankScore(c) {
+  const ch = changePct(c);
+  const vol = volume24h(c);
+  // volume field can be empty/zero in current snapshots -> keep momentum-only fallback alive.
+  const volScore = vol > 0 ? Math.log10(vol) : 0;
+  return ch * 0.75 + volScore * 0.25;
+}
+
 function buildUniversePicks(universe, tone) {
   const cs = Array.isArray(universe?.candidates) ? universe.candidates : [];
   const filtered = cs
     .filter((c) => c && c.symbol && !BLACKLIST.has(c.symbol))
+    .filter((c) => String(c.symbol).endsWith('_KRW'))
     .map((c) => ({
       symbol: c.symbol,
       ch: changePct(c),
       vol: volume24h(c),
+      score: rankScore(c),
     }))
-    .filter((x) => x.symbol.endsWith('_KRW'))
-    .filter((x) => x.vol >= 5_000_000_000); // 50억 KRW 이상
-
-  const ranked = filtered
     .filter((x) => tone === 'risk_off' ? x.ch > -1.5 : true)
-    .sort((a, b) => (b.ch * 0.65 + Math.log10(Math.max(b.vol, 1)) * 0.35) - (a.ch * 0.65 + Math.log10(Math.max(a.vol, 1)) * 0.35));
+    .sort((a, b) => b.score - a.score);
 
-  const extras = ranked
+  const extras = filtered
     .map((x) => x.symbol)
     .filter((s) => !CORE.includes(s))
     .slice(0, 4);
@@ -62,8 +68,33 @@ function buildUniversePicks(universe, tone) {
   return symbols.slice(0, 8);
 }
 
+function pickConfigByTone(tone) {
+  if (tone === 'risk_on') {
+    return { attempts: 3, maxSymbols: 5, order: 20000, multiplier: 1.0, regime: 'risk_on' };
+  }
+  if (tone === 'risk_off') {
+    return { attempts: 1, maxSymbols: 3, order: 10000, multiplier: 0.8, regime: 'risk_off' };
+  }
+  return { attempts: 2, maxSymbols: 4, order: 20000, multiplier: 0.95, regime: 'neutral' };
+}
+
+function snapshotForCompare(runtimeObj) {
+  return JSON.stringify({
+    execution: runtimeObj.execution,
+    decision: runtimeObj.decision,
+    overlay: {
+      multiplier: runtimeObj.overlay?.multiplier,
+      regime: runtimeObj.overlay?.regime,
+      score: runtimeObj.overlay?.score,
+    },
+    controls: runtimeObj.controls,
+  });
+}
+
 function main() {
   const runtime = readJson(RUNTIME, {});
+  const prevComparable = snapshotForCompare(runtime || {});
+
   const kpi = readJson(KPI, {});
   const universe = readJson(UNIVERSE, {});
 
@@ -75,36 +106,19 @@ function main() {
   const rejectRate = attempted > 0 ? rejected / attempted : 0;
 
   const m = getMarketTone(universe);
+  const base = pickConfigByTone(m.tone);
 
-  // base profile by tone
   let symbols = buildUniversePicks(universe, m.tone);
-  let attempts = 2;
-  let maxSymbols = 4;
-  let order = 20000;
-  let multiplier = 0.95;
+  let attempts = base.attempts;
+  let maxSymbols = base.maxSymbols;
+  let order = base.order;
+  let multiplier = base.multiplier;
   let allowBuy = true;
-  let regime = 'neutral';
+  const regime = base.regime;
 
-  if (m.tone === 'risk_on') {
-    attempts = 3;
-    maxSymbols = 5;
-    order = 20000;
-    multiplier = 1.0;
-    regime = 'risk_on';
-  } else if (m.tone === 'risk_off') {
-    attempts = 1;
-    maxSymbols = 3;
-    order = 10000;
-    multiplier = 0.8;
-    regime = 'risk_off';
-  }
-
-  // execution-quality feedback
   if (attempted === 0) {
-    // dead zone: open path (not full risk-on)
     attempts = Math.max(attempts, 3);
     maxSymbols = Math.max(maxSymbols, 4);
-    allowBuy = true;
     multiplier = Math.max(multiplier, 0.95);
   }
 
@@ -117,6 +131,9 @@ function main() {
     order = 20000;
     attempts = clamp(attempts, 2, 3);
   }
+
+  // Keep total symbol list and per-window execution count decoupled for safety.
+  maxSymbols = clamp(maxSymbols, 3, 5);
 
   runtime.version = 1;
   runtime.updatedAt = new Date().toISOString();
@@ -143,13 +160,18 @@ function main() {
   };
   runtime.controls = { killSwitch: false };
 
-  writeJson(RUNTIME, runtime);
+  const nextComparable = snapshotForCompare(runtime);
+  const changed = prevComparable !== nextComparable;
 
-  execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
-  execSync('pm2 restart buycoin', { stdio: 'ignore' });
+  if (changed) {
+    writeJson(RUNTIME, runtime);
+    execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
+    execSync('pm2 restart buycoin', { stdio: 'ignore' });
+  }
 
   process.stdout.write(JSON.stringify({
     ok: true,
+    changed,
     tone: m.tone,
     attempted,
     successful,
