@@ -7,6 +7,7 @@ const TRADER = `${ROOT}/.trader`;
 const RUNTIME = `${TRADER}/ai-runtime.json`;
 const KPI = `${TRADER}/execution-kpi-summary.json`;
 const UNIVERSE = `${TRADER}/market-universe.json`;
+const STATE = `${TRADER}/state.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
@@ -91,12 +92,41 @@ function snapshotForCompare(runtimeObj) {
   });
 }
 
+function krwBalance(state) {
+  const snaps = Array.isArray(state?.balancesSnapshot) ? state.balancesSnapshot : [];
+  const latest = snaps.length > 0 ? snaps[snaps.length - 1] : null;
+  const items = Array.isArray(latest?.items) ? latest.items : [];
+  for (const it of items) {
+    if (String(it?.currency || '').toUpperCase() !== 'KRW') continue;
+    return n(it.balance, 0) + n(it.locked, 0);
+  }
+  return 0;
+}
+
+function recentCashRejectCount(state, limit = 120) {
+  const ev = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
+  let count = 0;
+  for (const e of ev.slice(-limit)) {
+    if (e?.type !== 'order_rejected') continue;
+    const reasons = Array.isArray(e?.reasons) ? e.reasons : [];
+    if (reasons.length === 0) {
+      if (String(e?.reason || '').toUpperCase() === 'INSUFFICIENT_CASH') count += 1;
+      continue;
+    }
+    for (const r of reasons) {
+      if (String(r?.rule || '').toUpperCase() === 'INSUFFICIENT_CASH') count += 1;
+    }
+  }
+  return count;
+}
+
 function main() {
   const runtime = readJson(RUNTIME, {});
   const prevComparable = snapshotForCompare(runtime || {});
 
   const kpi = readJson(KPI, {});
   const universe = readJson(UNIVERSE, {});
+  const state = readJson(STATE, {});
 
   const s = kpi?.summary || {};
   const attempted = n(s?.orders?.attempted, 0);
@@ -132,6 +162,18 @@ function main() {
     attempts = clamp(attempts, 2, 3);
   }
 
+  // Cash-aware safety: prevent repeated insufficient-cash loops.
+  const krw = krwBalance(state);
+  const cashRejects = recentCashRejectCount(state, 120);
+  if (krw < 30000 || cashRejects >= 8) {
+    order = 10000;
+    attempts = 1;
+    maxSymbols = 3;
+  }
+  if (krw < 12000) {
+    allowBuy = false;
+  }
+
   // Keep total symbol list and per-window execution count decoupled for safety.
   maxSymbols = clamp(maxSymbols, 3, 5);
 
@@ -156,7 +198,7 @@ function main() {
     multiplier,
     regime,
     score: Number((m.avg / 10).toFixed(2)),
-    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, symbols=${symbols.join(',')}`,
+    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
   };
   runtime.controls = { killSwitch: false };
 

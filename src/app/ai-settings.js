@@ -235,6 +235,17 @@ function normalizeDecision(raw = {}, fallback = {}) {
   return decision;
 }
 
+async function writeJsonAtomic(filePath, payload) {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tempFile = path.join(
+    dir,
+    `${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), "utf8");
+  await fs.rename(tempFile, filePath);
+}
+
 function normalizeRuntimeMeta(raw = {}) {
   const meta = raw && typeof raw === "object" ? raw : null;
   if (!meta) {
@@ -393,7 +404,7 @@ export class AiSettingsSource {
       }
 
       const template = this.defaultTemplate();
-      await fs.writeFile(this.settingsFile, JSON.stringify(template, null, 2), "utf8");
+      await writeJsonAtomic(this.settingsFile, template);
       this.logger.info("ai settings template created", {
         file: this.settingsFile,
       });
