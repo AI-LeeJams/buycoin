@@ -175,7 +175,10 @@ function collectRecentTrades(state = {}, fromMs = 0, limit = 5) {
   }));
 }
 
-function buildSituationPlan({ attempted = 0, successful = 0, buySignals = 0, rejected = 0 }) {
+function buildSituationPlan({ attempted = 0, successful = 0, buySignals = 0, rejected = 0, expectancyKrw = null, tradeCount = 0 }) {
+  if (Number.isFinite(expectancyKrw) && tradeCount >= 3 && expectancyKrw < 0) {
+    return "기대값이 음수: 신규 진입 강도 축소/매수 필터 강화, 수수료 대비 기대이익 미달 시 진입 차단";
+  }
   if (attempted === 0 && buySignals > 0) {
     return "신호는 있으나 주문이 없음: 진입 필터/시도 제한을 완화해 체결 가능성 점검";
   }
@@ -201,6 +204,19 @@ function toKoreanSymbol(symbol = "") {
     ENSO_KRW: "엔소",
   };
   return map[symbol] || symbol;
+}
+
+function qualityLabel({ expectancyKrw = null, tradeCount = 0, baselinePnlKrw = 0 }) {
+  if (tradeCount >= 3 && Number.isFinite(expectancyKrw) && expectancyKrw < 0) {
+    return "주의(기대값 음수)";
+  }
+  if (baselinePnlKrw < 0) {
+    return "주의(누적 손익 음수)";
+  }
+  if (tradeCount < 3) {
+    return "데이터부족";
+  }
+  return "양호";
 }
 
 function buildKpiReportText(input) {
@@ -229,11 +245,14 @@ function buildKpiReportText(input) {
     ? input.mtm.assets.map((a) => `${toKoreanSymbol(a.symbol)} ${a.qty.toFixed(6)}`).join(", ")
     : "보유 없음";
 
+  const qLabel = qualityLabel(input);
+
   return [
     "[코마 요약 보고]",
     `• 설정 코인: ${configuredSymbolsText}`,
     `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
+    `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
     `• 최근 거래: ${recentTradesText}`,
     `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
     `• 현재 상태: KRW ${Math.round(input.mtm.krw).toLocaleString()}원, 보유 ${positionText}`,
@@ -264,13 +283,16 @@ export async function generateKpiReport(baseDir = process.cwd()) {
   const rejected = Math.max(0, attempted - successful);
   const realizedPnlKrw = toNum(s?.realized?.realizedPnlKrw, 0);
   const winRatePct = toNum(s?.realized?.winRatePct, 0);
+  const expectancyKrw = toNum(s?.realized?.expectancyKrw, NaN);
+  const tradeCount = toNum(s?.realized?.tradeCount, 0);
+  const totalFeeKrw = toNum(s?.fills?.totalFeeKrw, 0);
 
   const latestPrices = extractLatestPrices(state, marketUniverse);
   const mtm = markToMarket(latestBalances(state), latestPrices);
   const rejectTopReasons = aggregateRejectReasons(state, fromMs, 3);
   const recentTrades = collectRecentTrades(state, fromMs, 5);
   const marketSummary = summarizeMarket(marketUniverse, { buySignals, sellSignals });
-  const situationPlan = buildSituationPlan({ attempted, successful, buySignals, rejected });
+  const situationPlan = buildSituationPlan({ attempted, successful, buySignals, rejected, expectancyKrw, tradeCount });
 
   const decision = `regime=${aiRuntime?.overlay?.regime || "unknown"}, killSwitch=${Boolean(aiRuntime?.controls?.killSwitch)}`;
   const changeSummary = `ai-runtime updatedAt=${aiRuntime?.updatedAt || "n/a"}`;
@@ -301,6 +323,9 @@ export async function generateKpiReport(baseDir = process.cwd()) {
     buySignals,
     realizedPnlKrw,
     winRatePct,
+    expectancyKrw,
+    tradeCount,
+    totalFeeKrw,
     mtm,
     rejectTopReasons,
     recentTrades,
@@ -321,6 +346,9 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       buySignals,
       realizedPnlKrw,
       winRatePct,
+      expectancyKrw,
+      tradeCount,
+      totalFeeKrw,
       mtm,
       rejectTopReasons,
       recentTrades,
