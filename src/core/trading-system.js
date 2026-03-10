@@ -2849,6 +2849,49 @@ export class TradingSystem {
         };
       }
 
+      const duplicateWindowMs = Math.max(5_000, Math.floor(asNumber(this.config?.runtime?.duplicateOrderWindowMs, 90_000)));
+      const nowMs = Date.now();
+      const stateSnapshot = this.store.snapshot();
+      const orders = Array.isArray(stateSnapshot?.orders) ? stateSnapshot.orders : [];
+      const openStates = openOrderStates();
+      const duplicate = orders.find((row) => {
+        if (!row) return false;
+        if (normalizeSymbol(row.symbol) !== normalizeSymbol(orderInput.symbol)) return false;
+        if (String(row.side || "").toLowerCase() !== String(orderInput.side || "").toLowerCase()) return false;
+        const ts = Date.parse(row.placedAt || row.createdAt || "");
+        if (!Number.isFinite(ts) || nowMs - ts > duplicateWindowMs) return false;
+
+        const state = String(row.state || "").toUpperCase();
+        if (!openStates.has(state) && state !== "DONE") return false;
+
+        const prevAmount = asNumber(row.amountKrw, null);
+        const nextAmount = asNumber(orderInput.amountKrw, null);
+        if (!Number.isFinite(prevAmount) || !Number.isFinite(nextAmount)) return true;
+        const diff = Math.abs(prevAmount - nextAmount);
+        return diff <= Math.max(500, nextAmount * 0.03);
+      });
+
+      if (duplicate) {
+        await this.recordRiskEvent({
+          type: "order_rejected",
+          source: "duplicate_order_guard",
+          symbol: orderInput.symbol,
+          reasons: [{ rule: "DUPLICATE_ORDER_WINDOW", detail: "duplicate_order_guard" }],
+          metrics: { duplicateWindowMs },
+          streak: asNumber(this.store.snapshot().settings?.riskReject?.streak, 0),
+          nonEscalating: true,
+        });
+        return {
+          ok: false,
+          code: EXIT_CODES.RISK_REJECTED,
+          error: {
+            message: "Duplicate order blocked by guard",
+            reasons: [{ rule: "DUPLICATE_ORDER_WINDOW", detail: "duplicate_order_guard" }],
+            duplicateOrderId: duplicate.id || duplicate.exchangeOrderId || duplicate.clientOrderKey || null,
+          },
+        };
+      }
+
         const submitted = await this.executionEngine.submit(orderInput);
         submitted.expectedPrice = orderInput.expectedPrice;
         let reconciled = await this.reconcileOrder(submitted, { persist: false });
