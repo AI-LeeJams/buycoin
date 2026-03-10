@@ -169,8 +169,6 @@ function main() {
     order = 10000;
     attempts = 1;
     maxSymbols = 3;
-  }
-  if (krw < 12000) {
     allowBuy = false;
   }
 
