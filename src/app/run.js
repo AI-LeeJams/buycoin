@@ -200,43 +200,6 @@ function isLiquidationDirective(decision = {}) {
     && decision.allowSell === true;
 }
 
-function extractNonKrwHoldings(accounts = []) {
-  if (!Array.isArray(accounts)) {
-    return [];
-  }
-  return accounts
-    .map((account) => {
-      const currency = String(account?.currency || "").toUpperCase();
-      const available = Math.max(asNumber(account?.balance, 0), 0);
-      const locked = Math.max(asNumber(account?.locked, 0), 0);
-      const quantity = available + locked;
-      if (!currency || currency === "KRW" || quantity <= 0) {
-        return null;
-      }
-      return {
-        currency,
-        quantity: roundNum(quantity, 8),
-        available: roundNum(available, 8),
-        locked: roundNum(locked, 8),
-        avgBuyPrice: asNumber(account?.avgBuyPrice, 0),
-      };
-    })
-    .filter(Boolean);
-}
-
-async function getLiquidationHoldingsState(trader) {
-  if (!trader || typeof trader.loadAccountContext !== "function") {
-    return { hasHoldings: false, holdings: [], source: "unsupported" };
-  }
-  const context = await trader.loadAccountContext();
-  const holdings = extractNonKrwHoldings(context?.accounts || []);
-  return {
-    hasHoldings: holdings.length > 0,
-    holdings,
-    source: context?.source || "unknown",
-  };
-}
-
 function normalizeAiRefreshRange(aiConfig = {}) {
   const fixedRaw = Number(aiConfig?.refreshFixedSec);
   const fixedSec = Number.isFinite(fixedRaw) && fixedRaw > 0 ? Math.floor(fixedRaw) : 0;
@@ -721,7 +684,6 @@ export async function runExecutionService({
     let lastOverlayHash = null;
     let lastKillSwitch = null;
     let pendingKillSwitchApply = false;
-    let lastLiquidationLogHash = null;
     let lastStrategyHash = null;
     let lastDecisionHash = null;
     let lastFilteredSymbolsHash = null;
@@ -878,55 +840,20 @@ export async function runExecutionService({
 
       if (requestedKillSwitch === true) {
         if (pendingKillSwitchApply || requestedKillSwitch !== lastKillSwitch) {
-          try {
-            const holdingState = await getLiquidationHoldingsState(trader);
-            if (holdingState.hasHoldings) {
-              pendingKillSwitchApply = true;
-              if (lastKillSwitch !== false) {
-                await trader.setKillSwitch(false, "liquidation_pending");
-                lastKillSwitch = false;
-              }
-              const liquidationLogHash = JSON.stringify({
-                liquidationDirective,
-                holdings: holdingState.holdings.map((item) => `${item.currency}:${item.quantity}`),
-              });
-              if (liquidationLogHash !== lastLiquidationLogHash) {
-                logger.warn("kill switch deferred: liquidation in progress", {
-                  source: aiRuntimeForExecution.source,
-                  liquidationDirective,
-                  holdings: holdingState.holdings,
-                });
-                lastLiquidationLogHash = liquidationLogHash;
-              }
-            } else {
-              const killSwitchResult = await trader.setKillSwitch(true, "ai_settings_control");
-              if (killSwitchResult.ok) {
-                const completedFromPending = pendingKillSwitchApply;
-                pendingKillSwitchApply = false;
-                lastKillSwitch = true;
-                lastLiquidationLogHash = null;
-                logger.warn("kill switch updated from ai settings", {
-                  enabled: true,
-                  liquidationCompleted: completedFromPending,
-                });
-              }
-            }
-          } catch (error) {
-            logger.warn("kill switch hold-state check failed; deferring kill switch", {
-              reason: error.message,
+          const killSwitchResult = await trader.setKillSwitch(true, "ai_settings_control");
+          if (killSwitchResult.ok) {
+            pendingKillSwitchApply = false;
+            lastKillSwitch = true;
+            logger.warn("kill switch updated from ai settings", {
+              enabled: true,
+              liquidationDirective,
             });
-            pendingKillSwitchApply = true;
-            if (lastKillSwitch !== false) {
-              await trader.setKillSwitch(false, "liquidation_check_failed");
-              lastKillSwitch = false;
-            }
           }
         }
       } else if (requestedKillSwitch === false && requestedKillSwitch !== lastKillSwitch) {
         const killSwitchResult = await trader.setKillSwitch(false, "ai_settings_control");
         if (killSwitchResult.ok) {
           pendingKillSwitchApply = false;
-          lastLiquidationLogHash = null;
           lastKillSwitch = false;
           logger.warn("kill switch updated from ai settings", {
             enabled: false,
