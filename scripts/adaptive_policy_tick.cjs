@@ -159,6 +159,9 @@ function main() {
   const rejected = Math.max(0, attempted - successful);
   const successRate = attempted > 0 ? successful / attempted : 0;
   const rejectRate = attempted > 0 ? rejected / attempted : 0;
+  const tradeCount = n(s?.realized?.tradeCount, 0);
+  const expectancyKrw = n(s?.realized?.expectancyKrw, 0);
+  const totalFeeKrw = n(s?.fills?.totalFeeKrw, 0);
 
   const m = getMarketTone(universe);
   const base = pickConfigByTone(m.tone);
@@ -185,6 +188,22 @@ function main() {
   if (attempted > 0 && successRate >= 0.5 && m.tone === 'risk_on') {
     order = 20000;
     attempts = clamp(attempts, 2, 3);
+  }
+
+  // Profit-quality guard: if expectancy turns negative with enough samples, cut buy risk.
+  if (tradeCount >= 3 && expectancyKrw < 0) {
+    allowBuy = false;
+    attempts = 1;
+    maxSymbols = 3;
+    order = 10000;
+    multiplier = Math.min(multiplier, 0.9);
+  }
+
+  // Fee-drag guard: low tradeCount but already high fees -> suppress churn.
+  if (tradeCount < 3 && totalFeeKrw >= 150) {
+    attempts = 1;
+    order = 10000;
+    multiplier = Math.min(multiplier, 0.9);
   }
 
   // Cash-aware safety: prevent repeated insufficient-cash loops.
@@ -221,7 +240,7 @@ function main() {
     multiplier,
     regime,
     score: Number((m.avg / 10).toFixed(2)),
-    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
+    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
   };
   runtime.controls = { killSwitch: false };
 
