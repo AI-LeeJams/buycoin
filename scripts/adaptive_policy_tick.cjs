@@ -8,6 +8,7 @@ const RUNTIME = `${TRADER}/ai-runtime.json`;
 const KPI = `${TRADER}/execution-kpi-summary.json`;
 const UNIVERSE = `${TRADER}/market-universe.json`;
 const STATE = `${TRADER}/state.json`;
+const POLICY_STATE = `${TRADER}/adaptive-policy-state.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
@@ -90,6 +91,30 @@ function snapshotForCompare(runtimeObj) {
     },
     controls: runtimeObj.controls,
   });
+}
+
+function ymd(d = new Date()) {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function isTightening(prevRuntime = {}, nextRuntime = {}) {
+  const prev = prevRuntime || {};
+  const next = nextRuntime || {};
+  const pExec = prev.execution || {};
+  const nExec = next.execution || {};
+  const pDec = prev.decision || {};
+  const nDec = next.decision || {};
+
+  return (
+    (nDec.allowBuy === false && pDec.allowBuy !== false)
+    || n(pExec.orderAmountKrw, 0) > n(nExec.orderAmountKrw, 0)
+    || n(pExec.maxOrderAttemptsPerWindow, 99) > n(nExec.maxOrderAttemptsPerWindow, 99)
+    || n(pExec.maxSymbolsPerWindow, 99) > n(nExec.maxSymbolsPerWindow, 99)
+    || (next.controls?.killSwitch === true && prev.controls?.killSwitch !== true)
+  );
 }
 
 function krwBalance(state) {
@@ -203,15 +228,44 @@ function main() {
   const nextComparable = snapshotForCompare(runtime);
   const changed = prevComparable !== nextComparable;
 
+  const policyState = readJson(POLICY_STATE, {});
+  const nowMs = Date.now();
+  const today = ymd(new Date());
+  const minObserveMs = Math.max(600000, n(runtime.execution?.windowSec, 300) * 1000 * 2); // >=10m or 2 windows
+  const lastAppliedAtMs = n(policyState?.lastAppliedAtMs, 0);
+  const elapsedMs = lastAppliedAtMs > 0 ? nowMs - lastAppliedAtMs : Number.POSITIVE_INFINITY;
+  const tightening = isTightening(readJson(RUNTIME, {}), runtime);
+  const dayState = policyState?.day === today
+    ? { day: today, applyCount: n(policyState?.applyCount, 0) }
+    : { day: today, applyCount: 0 };
+
+  let throttled = false;
+  const dailyLimit = 8;
+
   if (changed) {
-    writeJson(RUNTIME, runtime);
-    execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
-    execSync('pm2 restart buycoin', { stdio: 'ignore' });
+    if (!tightening && elapsedMs < minObserveMs) {
+      throttled = true;
+    }
+    if (!tightening && dayState.applyCount >= dailyLimit) {
+      throttled = true;
+    }
+
+    if (!throttled) {
+      writeJson(RUNTIME, runtime);
+      execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
+      execSync('pm2 restart buycoin', { stdio: 'ignore' });
+      writeJson(POLICY_STATE, {
+        day: today,
+        applyCount: dayState.applyCount + 1,
+        lastAppliedAtMs: nowMs,
+      });
+    }
   }
 
   process.stdout.write(JSON.stringify({
     ok: true,
     changed,
+    throttled,
     tone: m.tone,
     attempted,
     successful,
