@@ -8,6 +8,7 @@ const RUNTIME = `${TRADER}/ai-runtime.json`;
 const KPI = `${TRADER}/execution-kpi-summary.json`;
 const UNIVERSE = `${TRADER}/market-universe.json`;
 const STATE = `${TRADER}/state.json`;
+const AI_SETTINGS = `${TRADER}/ai-settings.json`;
 const POLICY_STATE = `${TRADER}/adaptive-policy-state.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
@@ -17,6 +18,13 @@ function readJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
 }
 function writeJson(p, obj) { fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n'); }
+function writeJsonAtomic(p, obj) {
+  const dir = require('path').dirname(p);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
+  fs.renameSync(tmp, p);
+}
 function n(v, d = 0) { const x = Number(v); return Number.isFinite(x) ? x : d; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
@@ -91,6 +99,19 @@ function snapshotForCompare(runtimeObj) {
     },
     controls: runtimeObj.controls,
   });
+}
+
+function extractPolicyComparable(source = {}) {
+  return {
+    execution: source?.execution || {},
+    decision: source?.decision || {},
+    overlay: {
+      multiplier: source?.overlay?.multiplier,
+      regime: source?.overlay?.regime,
+      score: source?.overlay?.score,
+    },
+    controls: source?.controls || {},
+  };
 }
 
 function ymd(d = new Date()) {
@@ -261,6 +282,11 @@ function main() {
   let throttled = false;
   const dailyLimit = 8;
 
+  const aiSettings = readJson(AI_SETTINGS, {});
+  const runtimePolicyComparable = extractPolicyComparable(runtime);
+  const aiPolicyComparable = extractPolicyComparable(aiSettings);
+  const settingsDrift = JSON.stringify(runtimePolicyComparable) !== JSON.stringify(aiPolicyComparable);
+
   if (changed) {
     if (!tightening && elapsedMs < minObserveMs) {
       throttled = true;
@@ -268,23 +294,60 @@ function main() {
     if (!tightening && dayState.applyCount >= dailyLimit) {
       throttled = true;
     }
+  }
 
-    if (!throttled) {
-      writeJson(RUNTIME, runtime);
-      execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
-      execSync('pm2 restart buycoin', { stdio: 'ignore' });
-      writeJson(POLICY_STATE, {
-        day: today,
-        applyCount: dayState.applyCount + 1,
-        lastAppliedAtMs: nowMs,
-      });
-    }
+  const shouldApplyRuntime = changed && !throttled;
+  const shouldSyncSettings = shouldApplyRuntime || (!changed && settingsDrift);
+
+  if (shouldApplyRuntime) {
+    writeJson(RUNTIME, runtime);
+    execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
+  }
+
+  if (shouldSyncSettings) {
+    const nextSettings = {
+      ...(aiSettings && typeof aiSettings === 'object' ? aiSettings : {}),
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      execution: {
+        ...(aiSettings?.execution || {}),
+        ...runtime.execution,
+        enabled: true,
+        symbol: Array.isArray(runtime.execution?.symbols) && runtime.execution.symbols.length > 0
+          ? runtime.execution.symbols[0]
+          : (aiSettings?.execution?.symbol || 'BTC_KRW'),
+      },
+      decision: {
+        ...(aiSettings?.decision || {}),
+        ...runtime.decision,
+      },
+      overlay: {
+        ...(aiSettings?.overlay || {}),
+        ...runtime.overlay,
+      },
+      controls: {
+        ...(aiSettings?.controls || {}),
+        ...runtime.controls,
+      },
+    };
+    writeJsonAtomic(AI_SETTINGS, nextSettings);
+    execSync('pm2 restart buycoin', { stdio: 'ignore' });
+  }
+
+  if (shouldApplyRuntime) {
+    writeJson(POLICY_STATE, {
+      day: today,
+      applyCount: dayState.applyCount + 1,
+      lastAppliedAtMs: nowMs,
+    });
   }
 
   process.stdout.write(JSON.stringify({
     ok: true,
     changed,
     throttled,
+    settingsDrift,
+    syncedSettings: shouldSyncSettings,
     tone: m.tone,
     attempted,
     successful,
