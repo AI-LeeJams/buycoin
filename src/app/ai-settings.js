@@ -235,6 +235,13 @@ function normalizeDecision(raw = {}, fallback = {}) {
   return decision;
 }
 
+const SETTINGS_FILE_STABILITY_ATTEMPTS = 3;
+const SETTINGS_FILE_STABILITY_DELAY_MS = 60;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function writeJsonAtomic(filePath, payload) {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
@@ -244,6 +251,57 @@ async function writeJsonAtomic(filePath, payload) {
   );
   await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), "utf8");
   await fs.rename(tempFile, filePath);
+}
+
+async function readJsonWithWriteStabilityGuard(filePath) {
+  for (let attempt = 1; attempt <= SETTINGS_FILE_STABILITY_ATTEMPTS; attempt += 1) {
+    let beforeStat;
+    try {
+      beforeStat = await fs.stat(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    let rawText;
+    try {
+      rawText = await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    let afterStat;
+    try {
+      afterStat = await fs.stat(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    if (beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) return {};
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    const trimmed = rawText.trim();
+    if (!trimmed) return {};
+    try {
+      return JSON.parse(trimmed);
+    } catch (error) {
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+    }
+  }
+
+  return {};
 }
 
 function normalizeRuntimeMeta(raw = {}) {
@@ -563,8 +621,7 @@ export class AiSettingsSource {
     }
 
     try {
-      const rawText = await fs.readFile(this.settingsFile, "utf8");
-      const parsed = rawText.trim() ? JSON.parse(rawText) : {};
+      const parsed = await readJsonWithWriteStabilityGuard(this.settingsFile);
       this.lastError = null;
       return this.normalize(parsed);
     } catch (error) {
