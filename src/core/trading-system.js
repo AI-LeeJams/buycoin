@@ -1349,6 +1349,39 @@ export class TradingSystem {
     });
   }
 
+  isAiOverrideConsumedOnce(key) {
+    if (!key) {
+      return false;
+    }
+    const state = this.store.snapshot();
+    const consumed = state?.settings?.aiOverrideConsumed;
+    return Boolean(consumed && Object.hasOwn(consumed, key));
+  }
+
+  async markAiOverrideConsumedOnce(key) {
+    if (!key) {
+      return;
+    }
+    await this.store.update((state) => {
+      const now = nowIso();
+      const consumed = state.settings.aiOverrideConsumed && typeof state.settings.aiOverrideConsumed === "object"
+        ? state.settings.aiOverrideConsumed
+        : {};
+      consumed[key] = now;
+
+      const entries = Object.entries(consumed)
+        .sort((a, b) => Date.parse(a[1] || 0) - Date.parse(b[1] || 0));
+      const maxKeep = 200;
+      while (entries.length > maxKeep) {
+        const [oldestKey] = entries.shift();
+        delete consumed[oldestKey];
+      }
+
+      state.settings.aiOverrideConsumed = consumed;
+      return state;
+    });
+  }
+
   hasRecentProtectiveExit(symbol, cooldownSec = 0) {
     const windowMs = Math.max(0, Math.floor(asNumber(cooldownSec, 0) * 1000));
     if (!symbol || windowMs <= 0) {
@@ -1699,6 +1732,14 @@ export class TradingSystem {
     const aiPolicy = normalizeExecutionPolicy(executionPolicy, {
       autoSellEnabled,
     });
+    const overrideConsumeKey = aiPolicy.mode === "override" && aiPolicy.forceOnce && aiPolicy.forceAction
+      ? [
+        normalizedSymbol,
+        aiPolicy.forceAction,
+        asPositiveNumber(aiPolicy.forceAmountKrw, 0) || 0,
+        String(aiPolicy.note || ""),
+      ].join("|")
+      : null;
 
     await this.store.update((state) => {
       state.strategyRuns.push({
@@ -1745,7 +1786,7 @@ export class TradingSystem {
     let streamHandle = null;
     let timer = null;
     let processing = Promise.resolve();
-    let overrideActionConsumed = false;
+    let overrideActionConsumed = this.isAiOverrideConsumedOnce(overrideConsumeKey);
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
 
@@ -2023,6 +2064,7 @@ export class TradingSystem {
               });
               if (!dryRun && selectedSource === "ai_override" && aiPolicy.forceOnce) {
                 overrideActionConsumed = true;
+                await this.markAiOverrideConsumedOnce(overrideConsumeKey);
               }
 
               if (order.ok) {
