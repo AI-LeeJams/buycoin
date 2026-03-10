@@ -208,7 +208,7 @@ function toKoreanSymbol(symbol = "") {
 
 function qualityLabel({ expectancyKrw = null, tradeCount = 0, baselinePnlKrw = 0 }) {
   if (tradeCount >= 3 && Number.isFinite(expectancyKrw) && expectancyKrw < 0) {
-    return "주의(기대값 음수)";
+    return "위험(기대값 음수)";
   }
   if (baselinePnlKrw < 0) {
     return "주의(누적 손익 음수)";
@@ -249,12 +249,12 @@ function buildKpiReportText(input) {
 
   return [
     "[코마 요약 보고]",
+    `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
+    `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
     `• 설정 코인: ${configuredSymbolsText}`,
     `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
-    `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
     `• 최근 거래: ${recentTradesText}`,
-    `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
     `• 현재 상태: KRW ${Math.round(input.mtm.krw).toLocaleString()}원, 보유 ${positionText}`,
     `• 실패원인: ${rejectTop}`,
     `• 다음 계획: ${input.situationPlan}`,
