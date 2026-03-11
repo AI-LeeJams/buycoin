@@ -149,7 +149,7 @@ function krwBalance(state) {
   return 0;
 }
 
-function recentCashRejectCount(state, limit = 120) {
+function recentCashRejectCount(state, limit = 40) {
   const ev = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
   let count = 0;
   for (const e of ev.slice(-limit)) {
@@ -229,12 +229,19 @@ function main() {
 
   // Cash-aware safety: prevent repeated insufficient-cash loops.
   const krw = krwBalance(state);
-  const cashRejects = recentCashRejectCount(state, 120);
-  if (krw < 30000 || cashRejects >= 8) {
+  const cashRejects = recentCashRejectCount(state, 40);
+  if (krw < 30000) {
     order = 10000;
     attempts = 1;
     maxSymbols = 3;
     allowBuy = false;
+  } else if (cashRejects >= 5 && krw < 50000) {
+    order = 10000;
+    attempts = 1;
+    maxSymbols = 3;
+    allowBuy = false;
+  } else {
+    allowBuy = true;
   }
 
   // Keep total symbol list and per-window execution count decoupled for safety.
