@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const { execSync } = require('child_process');
+const crypto = require('crypto');
 
 const ROOT = '/Users/leejam/buycoin';
 const TRADER = `${ROOT}/.trader`;
@@ -103,15 +104,34 @@ function snapshotForCompare(runtimeObj) {
 
 function extractPolicyComparable(source = {}) {
   return {
-    execution: source?.execution || {},
-    decision: source?.decision || {},
+    execution: {
+      orderAmountKrw: source?.execution?.orderAmountKrw,
+      symbols: Array.isArray(source?.execution?.symbols) ? source.execution.symbols : [],
+      maxSymbolsPerWindow: source?.execution?.maxSymbolsPerWindow,
+      maxOrderAttemptsPerWindow: source?.execution?.maxOrderAttemptsPerWindow,
+    },
+    decision: {
+      mode: source?.decision?.mode,
+      allowBuy: source?.decision?.allowBuy,
+      allowSell: source?.decision?.allowSell,
+      forceAction: source?.decision?.forceAction,
+      forceAmountKrw: source?.decision?.forceAmountKrw,
+      forceOnce: source?.decision?.forceOnce,
+    },
     overlay: {
       multiplier: source?.overlay?.multiplier,
       regime: source?.overlay?.regime,
       score: source?.overlay?.score,
     },
-    controls: source?.controls || {},
+    controls: {
+      killSwitch: source?.controls?.killSwitch,
+    },
   };
+}
+
+function policyHash(policyObj = {}) {
+  const text = JSON.stringify(policyObj || {});
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 function ymd(d = new Date()) {
@@ -183,6 +203,7 @@ function main() {
   const tradeCount = n(s?.realized?.tradeCount, 0);
   const expectancyKrw = n(s?.realized?.expectancyKrw, 0);
   const totalFeeKrw = n(s?.fills?.totalFeeKrw, 0);
+  const realizedPnlKrw = n(s?.realized?.realizedPnlKrw, 0);
 
   const m = getMarketTone(universe);
   const base = pickConfigByTone(m.tone);
@@ -268,7 +289,7 @@ function main() {
     multiplier,
     regime,
     score: Number((m.avg / 10).toFixed(2)),
-    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
+    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, realizedPnlKrw=${Math.round(realizedPnlKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
   };
   runtime.controls = { killSwitch: false };
 
@@ -292,7 +313,9 @@ function main() {
   const aiSettings = readJson(AI_SETTINGS, {});
   const runtimePolicyComparable = extractPolicyComparable(runtime);
   const aiPolicyComparable = extractPolicyComparable(aiSettings);
-  const settingsDrift = JSON.stringify(runtimePolicyComparable) !== JSON.stringify(aiPolicyComparable);
+  const runtimePolicyHash = policyHash(runtimePolicyComparable);
+  const aiPolicyHash = policyHash(aiPolicyComparable);
+  const settingsDrift = runtimePolicyHash !== aiPolicyHash;
 
   if (changed) {
     if (!tightening && elapsedMs < minObserveMs) {
@@ -341,11 +364,23 @@ function main() {
     execSync('pm2 restart buycoin', { stdio: 'ignore' });
   }
 
-  if (shouldApplyRuntime) {
+  if (shouldApplyRuntime || shouldSyncSettings) {
     writeJson(POLICY_STATE, {
       day: today,
-      applyCount: dayState.applyCount + 1,
-      lastAppliedAtMs: nowMs,
+      applyCount: shouldApplyRuntime ? (dayState.applyCount + 1) : dayState.applyCount,
+      lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
+      policyHash: runtimePolicyHash,
+      aiPolicyHash,
+      lastQuality: {
+        sampledAt: new Date().toISOString(),
+        attempted,
+        successful,
+        rejected,
+        tradeCount,
+        expectancyKrw,
+        realizedPnlKrw,
+        totalFeeKrw,
+      },
     });
   }
 
@@ -355,6 +390,8 @@ function main() {
     throttled,
     settingsDrift,
     syncedSettings: shouldSyncSettings,
+    policyHash: runtimePolicyHash,
+    settingsPolicyHash: aiPolicyHash,
     tone: m.tone,
     attempted,
     successful,
