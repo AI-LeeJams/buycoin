@@ -11,6 +11,7 @@ const UNIVERSE = `${TRADER}/market-universe.json`;
 const STATE = `${TRADER}/state.json`;
 const AI_SETTINGS = `${TRADER}/ai-settings.json`;
 const POLICY_STATE = `${TRADER}/adaptive-policy-state.json`;
+const QUALITY_COMPARE = `${TRADER}/quality-compare.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
@@ -184,6 +185,35 @@ function recentCashRejectCount(state, limit = 40) {
     }
   }
   return count;
+}
+
+function buildQualitySnapshot({ attempted, successful, rejected, tradeCount, expectancyKrw, realizedPnlKrw, totalFeeKrw }) {
+  const successRate = attempted > 0 ? successful / attempted : 0;
+  const rejectRate = attempted > 0 ? rejected / attempted : 0;
+  return {
+    sampledAt: new Date().toISOString(),
+    attempted,
+    successful,
+    rejected,
+    successRate,
+    rejectRate,
+    tradeCount,
+    expectancyKrw,
+    realizedPnlKrw,
+    totalFeeKrw,
+  };
+}
+
+function buildQualityDelta(prev, cur) {
+  if (!prev) return null;
+  return {
+    attemptedDelta: n(cur.attempted, 0) - n(prev.attempted, 0),
+    successRateDeltaPct: Math.round((n(cur.successRate, 0) - n(prev.successRate, 0)) * 10000) / 100,
+    rejectRateDeltaPct: Math.round((n(cur.rejectRate, 0) - n(prev.rejectRate, 0)) * 10000) / 100,
+    expectancyDeltaKrw: Math.round(n(cur.expectancyKrw, 0) - n(prev.expectancyKrw, 0)),
+    realizedPnlDeltaKrw: Math.round(n(cur.realizedPnlKrw, 0) - n(prev.realizedPnlKrw, 0)),
+    feeDeltaKrw: Math.round(n(cur.totalFeeKrw, 0) - n(prev.totalFeeKrw, 0)),
+  };
 }
 
 function main() {
@@ -364,6 +394,18 @@ function main() {
     execSync('pm2 restart buycoin', { stdio: 'ignore' });
   }
 
+  const qualitySnapshot = buildQualitySnapshot({
+    attempted,
+    successful,
+    rejected,
+    tradeCount,
+    expectancyKrw,
+    realizedPnlKrw,
+    totalFeeKrw,
+  });
+  const previousQuality = policyState?.lastQuality || null;
+  const qualityDelta = buildQualityDelta(previousQuality, qualitySnapshot);
+
   if (shouldApplyRuntime || shouldSyncSettings) {
     writeJson(POLICY_STATE, {
       day: today,
@@ -371,16 +413,15 @@ function main() {
       lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
       policyHash: runtimePolicyHash,
       aiPolicyHash,
-      lastQuality: {
-        sampledAt: new Date().toISOString(),
-        attempted,
-        successful,
-        rejected,
-        tradeCount,
-        expectancyKrw,
-        realizedPnlKrw,
-        totalFeeKrw,
-      },
+      lastQuality: qualitySnapshot,
+    });
+
+    writeJson(QUALITY_COMPARE, {
+      sampledAt: qualitySnapshot.sampledAt,
+      policyHash: runtimePolicyHash,
+      previous: previousQuality,
+      current: qualitySnapshot,
+      delta: qualityDelta,
     });
   }
 
@@ -392,6 +433,7 @@ function main() {
     syncedSettings: shouldSyncSettings,
     policyHash: runtimePolicyHash,
     settingsPolicyHash: aiPolicyHash,
+    qualityDelta,
     tone: m.tone,
     attempted,
     successful,
