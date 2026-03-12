@@ -245,21 +245,25 @@ function main() {
   let multiplier = base.multiplier;
   let allowBuy = true;
   const regime = base.regime;
+  const gateReasons = [];
 
   if (attempted === 0) {
     attempts = Math.max(attempts, 3);
     maxSymbols = Math.max(maxSymbols, 4);
     multiplier = Math.max(multiplier, 0.95);
+    gateReasons.push('no_activity_open_path');
   }
 
   if (attempted > 0 && rejectRate > 0.6) {
     attempts = Math.max(1, attempts - 1);
     order = 10000;
+    gateReasons.push('high_reject_rate_throttle');
   }
 
   if (attempted > 0 && successRate >= 0.5 && m.tone === 'risk_on') {
     order = 20000;
     attempts = clamp(attempts, 2, 3);
+    gateReasons.push('risk_on_quality_expand');
   }
 
   // Profit-quality guard: if expectancy turns negative with enough samples, cut buy risk.
@@ -269,6 +273,7 @@ function main() {
     maxSymbols = 3;
     order = 10000;
     multiplier = Math.min(multiplier, 0.9);
+    gateReasons.push('negative_expectancy_block_buy');
   }
 
   // Fee-drag guard: low tradeCount but already high fees -> suppress churn.
@@ -276,6 +281,7 @@ function main() {
     attempts = 1;
     order = 10000;
     multiplier = Math.min(multiplier, 0.9);
+    gateReasons.push('fee_drag_throttle');
   }
 
   // Cash-aware safety: prevent repeated insufficient-cash loops.
@@ -286,13 +292,16 @@ function main() {
     attempts = 1;
     maxSymbols = 3;
     allowBuy = false;
+    gateReasons.push('low_cash_block_buy');
   } else if (cashRejects >= 5 && krw < 50000) {
     order = 10000;
     attempts = 1;
     maxSymbols = 3;
     allowBuy = false;
+    gateReasons.push('cash_reject_loop_block_buy');
   } else {
     allowBuy = true;
+    gateReasons.push('buy_allowed_normal');
   }
 
   // Keep total symbol list and per-window execution count decoupled for safety.
@@ -319,7 +328,7 @@ function main() {
     multiplier,
     regime,
     score: Number((m.avg / 10).toFixed(2)),
-    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, realizedPnlKrw=${Math.round(realizedPnlKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, symbols=${symbols.join(',')}`,
+    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, realizedPnlKrw=${Math.round(realizedPnlKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, reasons=${gateReasons.join('|')}, symbols=${symbols.join(',')}`,
   };
   runtime.controls = { killSwitch: false };
 
@@ -434,6 +443,7 @@ function main() {
     policyHash: runtimePolicyHash,
     settingsPolicyHash: aiPolicyHash,
     qualityDelta,
+    gateReasons,
     tone: m.tone,
     attempted,
     successful,
