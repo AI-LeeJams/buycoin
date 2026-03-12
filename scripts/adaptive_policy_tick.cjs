@@ -276,12 +276,31 @@ function main() {
     gateReasons.push('negative_expectancy_block_buy');
   }
 
+  // Realized-loss guard: prevent immediate re-entry churn when realized loss is already negative.
+  if (tradeCount >= 2 && realizedPnlKrw < 0) {
+    allowBuy = false;
+    attempts = 1;
+    maxSymbols = 3;
+    order = 10000;
+    multiplier = Math.min(multiplier, 0.85);
+    gateReasons.push('realized_loss_block_buy');
+  }
+
   // Fee-drag guard: low tradeCount but already high fees -> suppress churn.
   if (tradeCount < 3 && totalFeeKrw >= 150) {
     attempts = 1;
     order = 10000;
     multiplier = Math.min(multiplier, 0.9);
     gateReasons.push('fee_drag_throttle');
+  }
+
+  // Rejection-wall guard: lots of attempts but almost no fills means execution quality collapse.
+  if (attempted >= 5 && rejectRate >= 0.8) {
+    allowBuy = false;
+    attempts = 1;
+    order = 10000;
+    maxSymbols = 3;
+    gateReasons.push('rejection_wall_block_buy');
   }
 
   // Cash-aware safety: prevent repeated insufficient-cash loops.
