@@ -219,6 +219,17 @@ function qualityLabel({ expectancyKrw = null, tradeCount = 0, baselinePnlKrw = 0
   return "양호";
 }
 
+function extractGateReasons(note = "") {
+  const text = String(note || "");
+  const marker = "reasons=";
+  const idx = text.indexOf(marker);
+  if (idx < 0) return "N/A";
+  const tail = text.slice(idx + marker.length);
+  const end = tail.indexOf(", symbols=");
+  const raw = end >= 0 ? tail.slice(0, end) : tail;
+  return raw || "N/A";
+}
+
 function buildKpiReportText(input) {
   const rejectTop = input.rejectTopReasons.length > 0
     ? input.rejectTopReasons.map((x) => `${x.reason} x${x.count}`).join(", ")
@@ -246,6 +257,7 @@ function buildKpiReportText(input) {
     : "보유 없음";
 
   const qLabel = qualityLabel(input);
+  const gateReasons = input.gateReasonsText || extractGateReasons(input.policyNote);
 
   return [
     "[코마 요약 보고]",
@@ -255,6 +267,7 @@ function buildKpiReportText(input) {
     `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
     `• 시도 허용치(cap): 윈도우당 최대 ${input.maxOrderAttemptsPerWindow ?? "N/A"}회 / 실제(actual): ${input.attempted}회`,
+    `• 정책 전환 사유: ${gateReasons}`,
     `• 최근 거래: ${recentTradesText}`,
     `• 현재 상태: KRW ${Math.round(input.mtm.krw).toLocaleString()}원, 보유 ${positionText}`,
     `• 실패원인: ${rejectTop}`,
@@ -264,12 +277,13 @@ function buildKpiReportText(input) {
 
 export async function generateKpiReport(baseDir = process.cwd()) {
   const traderDir = path.join(baseDir, ".trader");
-  const [state, summary, aiRuntime, operatorBaseline, marketUniverse] = await Promise.all([
+  const [state, summary, aiRuntime, operatorBaseline, marketUniverse, policyState] = await Promise.all([
     readJson(path.join(traderDir, "state.json"), {}),
     readJson(path.join(traderDir, "execution-kpi-summary.json"), {}),
     readJson(path.join(traderDir, "ai-runtime.json"), {}),
     readJson(path.join(traderDir, "operator-baseline.json"), null),
     readJson(path.join(traderDir, "market-universe.json"), {}),
+    readJson(path.join(traderDir, "adaptive-policy-state.json"), {}),
   ]);
 
   const s = summary?.summary || {};
@@ -360,6 +374,10 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       windowLabel,
       executionSymbols: aiRuntime?.execution?.symbols || [],
       maxOrderAttemptsPerWindow: aiRuntime?.execution?.maxOrderAttemptsPerWindow ?? null,
+      policyNote: aiRuntime?.overlay?.note || "",
+      gateReasonsText: Array.isArray(policyState?.gateReasons) && policyState.gateReasons.length > 0
+        ? policyState.gateReasons.join("|")
+        : "",
       currentEquityKrw,
       baselineEquityKrw,
       baselinePnlKrw,

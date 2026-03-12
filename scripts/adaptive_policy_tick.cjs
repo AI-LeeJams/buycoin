@@ -415,24 +415,24 @@ function main() {
   const previousQuality = policyState?.lastQuality || null;
   const qualityDelta = buildQualityDelta(previousQuality, qualitySnapshot);
 
-  if (shouldApplyRuntime || shouldSyncSettings) {
-    writeJson(POLICY_STATE, {
-      day: today,
-      applyCount: shouldApplyRuntime ? (dayState.applyCount + 1) : dayState.applyCount,
-      lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
-      policyHash: runtimePolicyHash,
-      aiPolicyHash,
-      lastQuality: qualitySnapshot,
-    });
+  writeJson(POLICY_STATE, {
+    day: today,
+    applyCount: shouldApplyRuntime ? (dayState.applyCount + 1) : dayState.applyCount,
+    lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
+    policyHash: runtimePolicyHash,
+    aiPolicyHash,
+    gateReasons,
+    lastQuality: qualitySnapshot,
+  });
 
-    writeJson(QUALITY_COMPARE, {
-      sampledAt: qualitySnapshot.sampledAt,
-      policyHash: runtimePolicyHash,
-      previous: previousQuality,
-      current: qualitySnapshot,
-      delta: qualityDelta,
-    });
-  }
+  writeJson(QUALITY_COMPARE, {
+    sampledAt: qualitySnapshot.sampledAt,
+    policyHash: runtimePolicyHash,
+    previous: previousQuality,
+    current: qualitySnapshot,
+    delta: qualityDelta,
+    gateReasons,
+  });
 
   process.stdout.write(JSON.stringify({
     ok: true,
