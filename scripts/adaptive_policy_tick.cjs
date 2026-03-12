@@ -12,6 +12,7 @@ const STATE = `${TRADER}/state.json`;
 const AI_SETTINGS = `${TRADER}/ai-settings.json`;
 const POLICY_STATE = `${TRADER}/adaptive-policy-state.json`;
 const QUALITY_COMPARE = `${TRADER}/quality-compare.json`;
+const STABILITY_MONITOR = `${TRADER}/stability-monitor.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
@@ -213,6 +214,33 @@ function buildQualityDelta(prev, cur) {
     expectancyDeltaKrw: Math.round(n(cur.expectancyKrw, 0) - n(prev.expectancyKrw, 0)),
     realizedPnlDeltaKrw: Math.round(n(cur.realizedPnlKrw, 0) - n(prev.realizedPnlKrw, 0)),
     feeDeltaKrw: Math.round(n(cur.totalFeeKrw, 0) - n(prev.totalFeeKrw, 0)),
+  };
+}
+
+function stabilitySnapshot(state, settingsDrift) {
+  const ev = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
+  let duplicateGuardHits = 0;
+  for (const e of ev.slice(-200)) {
+    if (e?.type !== 'order_rejected') continue;
+    const reasons = Array.isArray(e?.reasons) ? e.reasons : [];
+    for (const r of reasons) {
+      if (String(r?.rule || '').toUpperCase() === 'DUPLICATE_ORDER_WINDOW') {
+        duplicateGuardHits += 1;
+      }
+    }
+  }
+
+  const aiOverrideConsumedCount = Object.keys(state?.settings?.aiOverrideConsumed || {}).length;
+  const killSwitch = Boolean(state?.settings?.killSwitch);
+  const killSwitchReason = state?.settings?.killSwitchReason || null;
+
+  return {
+    sampledAt: new Date().toISOString(),
+    settingsDrift,
+    duplicateGuardHits,
+    aiOverrideConsumedCount,
+    killSwitch,
+    killSwitchReason,
   };
 }
 
@@ -453,6 +481,13 @@ function main() {
     gateReasons,
   });
 
+  const stability = stabilitySnapshot(state, settingsDrift);
+  writeJson(STABILITY_MONITOR, {
+    ...stability,
+    policyHash: runtimePolicyHash,
+    settingsPolicyHash: aiPolicyHash,
+  });
+
   process.stdout.write(JSON.stringify({
     ok: true,
     changed,
@@ -463,6 +498,7 @@ function main() {
     settingsPolicyHash: aiPolicyHash,
     qualityDelta,
     gateReasons,
+    stability,
     tone: m.tone,
     attempted,
     successful,
