@@ -351,6 +351,66 @@ function main() {
     gateReasons.push('buy_allowed_normal');
   }
 
+  const policyState = readJson(POLICY_STATE, {});
+  const nowMs = Date.now();
+  const today = ymd(new Date());
+  const dayStateBase = policyState?.day === today
+    ? policyState
+    : { day: today, applyCount: 0, dayStartKrw: krw, dayPeakKrw: krw, lockTriggered: false, lossStreakTicks: 0 };
+  const dayStartKrw = n(dayStateBase.dayStartKrw, krw || 1);
+  const dayPeakKrw = Math.max(n(dayStateBase.dayPeakKrw, krw), krw);
+  const dayPnlPct = dayStartKrw > 0 ? ((krw - dayStartKrw) / dayStartKrw) * 100 : 0;
+  const dayFromPeakPct = dayPeakKrw > 0 ? ((krw - dayPeakKrw) / dayPeakKrw) * 100 : 0;
+
+  // Profit-lock rules (capital preservation first).
+  if (dayPnlPct >= 1.5) {
+    attempts = Math.min(attempts, 1);
+    maxSymbols = Math.min(maxSymbols, 3);
+    order = Math.min(order, 10000);
+    gateReasons.push('profit_lock_soft');
+  }
+  if (dayPnlPct <= 0.3 && n(dayStateBase.lockTriggered ? 1 : 0, 0) === 1) {
+    allowBuy = false;
+    attempts = 1;
+    maxSymbols = 3;
+    order = 10000;
+    gateReasons.push('profit_roundtrip_block_buy');
+  }
+
+  // Re-entry cooldown after recent profitable sells (symbol-level lockout).
+  const doneOrders = (Array.isArray(state?.orders) ? state.orders : []).filter((o) => String(o?.state || '').toUpperCase() === 'DONE');
+  const nowIsoMs = Date.now();
+  const cooldownMs = 2 * 60 * 60 * 1000;
+  const cooledSymbols = new Set();
+  for (const o of doneOrders.slice(-40)) {
+    if (String(o?.side || '').toLowerCase() !== 'sell') continue;
+    const ts = Date.parse(o?.placedAt || o?.createdAt || '');
+    if (!Number.isFinite(ts) || nowIsoMs - ts > cooldownMs) continue;
+    if (n(o?.amountKrw, 0) > 0) cooledSymbols.add(String(o?.symbol || ''));
+  }
+  if (cooledSymbols.size > 0) {
+    const before = symbols.length;
+    symbols = symbols.filter((s) => !cooledSymbols.has(s));
+    if (symbols.length < before) {
+      gateReasons.push('post_profit_symbol_cooldown');
+    }
+    if (symbols.length === 0) {
+      symbols = CORE.slice(0, 2);
+    }
+  }
+
+  // Loss streak tick guard (if realized pnl delta keeps dropping, cool down one window).
+  const prevQuality = policyState?.lastQuality || null;
+  const realizedDelta = prevQuality ? (realizedPnlKrw - n(prevQuality.realizedPnlKrw, 0)) : 0;
+  let lossStreakTicks = n(dayStateBase.lossStreakTicks, 0);
+  if (realizedDelta < 0) lossStreakTicks += 1;
+  else if (realizedDelta > 0) lossStreakTicks = 0;
+  if (lossStreakTicks >= 2) {
+    allowBuy = false;
+    attempts = 1;
+    gateReasons.push('loss_streak_cooldown');
+  }
+
   // Keep total symbol list and per-window execution count decoupled for safety.
   maxSymbols = clamp(maxSymbols, 3, 5);
 
@@ -382,9 +442,6 @@ function main() {
   const nextComparable = snapshotForCompare(runtime);
   const changed = prevComparable !== nextComparable;
 
-  const policyState = readJson(POLICY_STATE, {});
-  const nowMs = Date.now();
-  const today = ymd(new Date());
   const minObserveMs = Math.max(600000, n(runtime.execution?.windowSec, 300) * 1000 * 2); // >=10m or 2 windows
   const lastAppliedAtMs = n(policyState?.lastAppliedAtMs, 0);
   const elapsedMs = lastAppliedAtMs > 0 ? nowMs - lastAppliedAtMs : Number.POSITIVE_INFINITY;
@@ -462,10 +519,18 @@ function main() {
   const previousQuality = policyState?.lastQuality || null;
   const qualityDelta = buildQualityDelta(previousQuality, qualitySnapshot);
 
+  const lockTriggered = Boolean(dayStateBase.lockTriggered) || dayPnlPct >= 1.5;
+
   writeJson(POLICY_STATE, {
     day: today,
     applyCount: shouldApplyRuntime ? (dayState.applyCount + 1) : dayState.applyCount,
     lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
+    dayStartKrw,
+    dayPeakKrw,
+    dayPnlPct,
+    dayFromPeakPct,
+    lockTriggered,
+    lossStreakTicks,
     policyHash: runtimePolicyHash,
     aiPolicyHash,
     gateReasons,
@@ -499,6 +564,8 @@ function main() {
     qualityDelta,
     gateReasons,
     stability,
+    dayPnlPct,
+    dayFromPeakPct,
     tone: m.tone,
     attempted,
     successful,
