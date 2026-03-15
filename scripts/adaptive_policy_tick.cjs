@@ -172,6 +172,45 @@ function krwBalance(state) {
   return 0;
 }
 
+function estimateEquityKrw(state, universe) {
+  const snaps = Array.isArray(state?.balancesSnapshot) ? state.balancesSnapshot : [];
+  const latest = snaps.length > 0 ? snaps[snaps.length - 1] : null;
+  const items = Array.isArray(latest?.items) ? latest.items : [];
+  const candidates = Array.isArray(universe?.candidates) ? universe.candidates : [];
+  const prices = new Map(candidates.map((c) => [String(c?.symbol || ''), n(c?.lastPrice, 0)]));
+
+  let total = 0;
+  for (const it of items) {
+    const cur = String(it?.currency || '').toUpperCase();
+    const qty = n(it?.balance, 0) + n(it?.locked, 0);
+    if (!cur || qty <= 0) continue;
+    if (cur === 'KRW') {
+      total += qty;
+      continue;
+    }
+    const sym = `${cur}_KRW`;
+    const px = prices.get(sym) || n(it?.avgBuyPrice, 0);
+    total += qty * Math.max(px, 0);
+  }
+  return total;
+}
+
+function cleanupTmpFiles(dirPath, maxAgeMs = 6 * 60 * 60 * 1000) {
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(dirPath)) {
+      if (!name.endsWith('.tmp')) continue;
+      const p = `${dirPath}/${name}`;
+      const st = fs.statSync(p);
+      if (now - st.mtimeMs > maxAgeMs) {
+        fs.unlinkSync(p);
+      }
+    }
+  } catch {
+    // best effort cleanup
+  }
+}
+
 function recentCashRejectCount(state, limit = 40) {
   const ev = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
   let count = 0;
@@ -265,6 +304,8 @@ function main() {
   const kpi = readJson(KPI, {});
   const universe = readJson(UNIVERSE, {});
   const state = readJson(STATE, {});
+
+  cleanupTmpFiles(TRADER);
 
   const s = kpi?.summary || {};
   const attempted = n(s?.orders?.attempted, 0);
@@ -387,18 +428,19 @@ function main() {
   const policyState = readJson(POLICY_STATE, {});
   const nowMs = Date.now();
   const today = ymd(new Date());
+  const equityKrw = estimateEquityKrw(state, universe);
   const dayStateBase = policyState?.day === today
     ? policyState
-    : { day: today, applyCount: 0, dayStartKrw: krw, dayPeakKrw: krw, lockTriggered: false, lossStreakTicks: 0 };
-  let dayStartKrw = n(dayStateBase.dayStartKrw, krw || 1);
-  if (dayStartKrw <= 0) dayStartKrw = krw || 1;
+    : { day: today, applyCount: 0, dayStartEquityKrw: equityKrw, dayPeakEquityKrw: equityKrw, lockTriggered: false, lossStreakTicks: 0 };
+  let dayStartEquityKrw = n(dayStateBase.dayStartEquityKrw, n(dayStateBase.dayStartKrw, equityKrw || 1));
+  if (dayStartEquityKrw <= 0) dayStartEquityKrw = equityKrw || 1;
   // Baseline sanity reset: if baseline is stale/too small, avoid false huge PnL lock.
-  if (dayStartKrw > 0 && krw > 0 && (krw / dayStartKrw) >= 1.8) {
-    dayStartKrw = krw;
+  if (dayStartEquityKrw > 0 && equityKrw > 0 && (equityKrw / dayStartEquityKrw) >= 1.8) {
+    dayStartEquityKrw = equityKrw;
   }
-  const dayPeakKrw = Math.max(n(dayStateBase.dayPeakKrw, krw), krw);
-  const dayPnlPct = dayStartKrw > 0 ? ((krw - dayStartKrw) / dayStartKrw) * 100 : 0;
-  const dayFromPeakPct = dayPeakKrw > 0 ? ((krw - dayPeakKrw) / dayPeakKrw) * 100 : 0;
+  const dayPeakEquityKrw = Math.max(n(dayStateBase.dayPeakEquityKrw, n(dayStateBase.dayPeakKrw, equityKrw)), equityKrw);
+  const dayPnlPct = dayStartEquityKrw > 0 ? ((equityKrw - dayStartEquityKrw) / dayStartEquityKrw) * 100 : 0;
+  const dayFromPeakPct = dayPeakEquityKrw > 0 ? ((equityKrw - dayPeakEquityKrw) / dayPeakEquityKrw) * 100 : 0;
 
   // Profit-lock rules (capital preservation first).
   if (dayPnlPct >= 5.0) {
@@ -561,8 +603,8 @@ function main() {
     day: today,
     applyCount: shouldApplyRuntime ? (dayState.applyCount + 1) : dayState.applyCount,
     lastAppliedAtMs: shouldApplyRuntime ? nowMs : lastAppliedAtMs,
-    dayStartKrw,
-    dayPeakKrw,
+    dayStartEquityKrw,
+    dayPeakEquityKrw,
     dayPnlPct,
     dayFromPeakPct,
     lockTriggered,
@@ -600,6 +642,7 @@ function main() {
     qualityDelta,
     gateReasons,
     stability,
+    equityKrw,
     dayPnlPct,
     dayFromPeakPct,
     tone: m.tone,

@@ -266,7 +266,7 @@ function buildKpiReportText(input) {
     `• 설정 코인: ${configuredSymbolsText}`,
     `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
-    `• 시도 허용치(cap): 윈도우당 최대 ${input.maxOrderAttemptsPerWindow ?? "N/A"}회 / 실제(actual): ${input.attempted}회`,
+    `• 시도 허용치(cap): 윈도우당 최대 ${input.maxOrderAttemptsPerWindow ?? "N/A"}회 / 실제(actual, 최근 모니터 윈도우 누적): ${input.attempted}회`,
     `• 정책 전환 사유: ${gateReasons}`,
     `• 최근 거래: ${recentTradesText}`,
     `• 현재 상태: KRW ${Math.round(input.mtm.krw).toLocaleString()}원, 보유 ${positionText}`,
