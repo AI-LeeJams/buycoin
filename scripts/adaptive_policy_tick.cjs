@@ -272,13 +272,20 @@ function main() {
   let order = base.order;
   let multiplier = base.multiplier;
   let allowBuy = true;
+
+  // Profit-first baseline: keep participation unless hard risk conditions trigger.
+  attempts = Math.max(attempts, 2);
+  maxSymbols = Math.max(maxSymbols, 4);
+  order = Math.max(order, 20000);
+  multiplier = Math.max(multiplier, 1.0);
   const regime = base.regime;
   const gateReasons = [];
 
   if (attempted === 0) {
     attempts = Math.max(attempts, 3);
-    maxSymbols = Math.max(maxSymbols, 4);
-    multiplier = Math.max(multiplier, 0.95);
+    maxSymbols = Math.max(maxSymbols, 5);
+    order = Math.max(order, 20000);
+    multiplier = Math.max(multiplier, 1.0);
     gateReasons.push('no_activity_open_path');
   }
 
@@ -296,22 +303,20 @@ function main() {
 
   // Profit-quality guard: if expectancy turns negative with enough samples, cut buy risk.
   if (tradeCount >= 3 && expectancyKrw < 0) {
-    allowBuy = false;
     attempts = 1;
     maxSymbols = 3;
     order = 10000;
     multiplier = Math.min(multiplier, 0.9);
-    gateReasons.push('negative_expectancy_block_buy');
+    gateReasons.push('negative_expectancy_throttle');
   }
 
   // Realized-loss guard: prevent immediate re-entry churn when realized loss is already negative.
   if (tradeCount >= 2 && realizedPnlKrw < 0) {
-    allowBuy = false;
     attempts = 1;
     maxSymbols = 3;
     order = 10000;
     multiplier = Math.min(multiplier, 0.85);
-    gateReasons.push('realized_loss_block_buy');
+    gateReasons.push('realized_loss_throttle');
   }
 
   // Fee-drag guard: low tradeCount but already high fees -> suppress churn.
@@ -324,23 +329,22 @@ function main() {
 
   // Rejection-wall guard: lots of attempts but almost no fills means execution quality collapse.
   if (attempted >= 5 && rejectRate >= 0.8) {
-    allowBuy = false;
     attempts = 1;
     order = 10000;
     maxSymbols = 3;
-    gateReasons.push('rejection_wall_block_buy');
+    gateReasons.push('rejection_wall_throttle');
   }
 
   // Cash-aware safety: prevent repeated insufficient-cash loops.
   const krw = krwBalance(state);
   const cashRejects = recentCashRejectCount(state, 40);
-  if (krw < 30000) {
+  if (krw < 12000) {
     order = 10000;
     attempts = 1;
-    maxSymbols = 3;
+    maxSymbols = 2;
     allowBuy = false;
-    gateReasons.push('low_cash_block_buy');
-  } else if (cashRejects >= 5 && krw < 50000) {
+    gateReasons.push('low_cash_hard_block_buy');
+  } else if (cashRejects >= 8 && krw < 30000) {
     order = 10000;
     attempts = 1;
     maxSymbols = 3;
@@ -348,7 +352,7 @@ function main() {
     gateReasons.push('cash_reject_loop_block_buy');
   } else {
     allowBuy = true;
-    gateReasons.push('buy_allowed_normal');
+    gateReasons.push('buy_allowed_profit_first');
   }
 
   const policyState = readJson(POLICY_STATE, {});
@@ -357,24 +361,28 @@ function main() {
   const dayStateBase = policyState?.day === today
     ? policyState
     : { day: today, applyCount: 0, dayStartKrw: krw, dayPeakKrw: krw, lockTriggered: false, lossStreakTicks: 0 };
-  const dayStartKrw = n(dayStateBase.dayStartKrw, krw || 1);
+  let dayStartKrw = n(dayStateBase.dayStartKrw, krw || 1);
+  if (dayStartKrw <= 0) dayStartKrw = krw || 1;
+  // Baseline sanity reset: if baseline is stale/too small, avoid false huge PnL lock.
+  if (dayStartKrw > 0 && krw > 0 && (krw / dayStartKrw) >= 1.8) {
+    dayStartKrw = krw;
+  }
   const dayPeakKrw = Math.max(n(dayStateBase.dayPeakKrw, krw), krw);
   const dayPnlPct = dayStartKrw > 0 ? ((krw - dayStartKrw) / dayStartKrw) * 100 : 0;
   const dayFromPeakPct = dayPeakKrw > 0 ? ((krw - dayPeakKrw) / dayPeakKrw) * 100 : 0;
 
   // Profit-lock rules (capital preservation first).
-  if (dayPnlPct >= 1.5) {
+  if (dayPnlPct >= 5.0) {
     attempts = Math.min(attempts, 1);
     maxSymbols = Math.min(maxSymbols, 3);
     order = Math.min(order, 10000);
     gateReasons.push('profit_lock_soft');
   }
-  if (dayPnlPct <= 0.3 && n(dayStateBase.lockTriggered ? 1 : 0, 0) === 1) {
-    allowBuy = false;
+  if (dayStateBase.lockTriggered === true && dayFromPeakPct <= -1.0) {
     attempts = 1;
     maxSymbols = 3;
     order = 10000;
-    gateReasons.push('profit_roundtrip_block_buy');
+    gateReasons.push('profit_roundtrip_throttle');
   }
 
   // Re-entry cooldown after recent profitable sells (symbol-level lockout).
@@ -406,7 +414,6 @@ function main() {
   if (realizedDelta < 0) lossStreakTicks += 1;
   else if (realizedDelta > 0) lossStreakTicks = 0;
   if (lossStreakTicks >= 2) {
-    allowBuy = false;
     attempts = 1;
     gateReasons.push('loss_streak_cooldown');
   }
@@ -519,7 +526,7 @@ function main() {
   const previousQuality = policyState?.lastQuality || null;
   const qualityDelta = buildQualityDelta(previousQuality, qualitySnapshot);
 
-  const lockTriggered = Boolean(dayStateBase.lockTriggered) || dayPnlPct >= 1.5;
+  const lockTriggered = dayPnlPct >= 5.0;
 
   writeJson(POLICY_STATE, {
     day: today,
