@@ -1,4 +1,7 @@
-# AI Operator Guide (execution-first)
+# AI Operator Guide (profit-first)
+
+> 2026-03 업데이트: 기본 운영 목표는 **수익 기회 참여 우선(profit-first)** 입니다.  
+> 단, 하드 리스크(초저현금/심각한 거절 루프/킬스위치)에서만 강제 차단합니다.
 
 ## Objective
 
