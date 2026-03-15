@@ -2,6 +2,7 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 const crypto = require('crypto');
+const process = globalThis.process;
 
 const ROOT = '/Users/leejam/buycoin';
 const TRADER = `${ROOT}/.trader`;
@@ -188,6 +189,19 @@ function recentCashRejectCount(state, limit = 40) {
   return count;
 }
 
+function recentDuplicateGuardCount(state, limit = 120) {
+  const ev = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
+  let count = 0;
+  for (const e of ev.slice(-limit)) {
+    if (e?.type !== 'order_rejected') continue;
+    const reasons = Array.isArray(e?.reasons) ? e.reasons : [];
+    for (const r of reasons) {
+      if (String(r?.rule || '').toUpperCase() === 'DUPLICATE_ORDER_WINDOW') count += 1;
+    }
+  }
+  return count;
+}
+
 function buildQualitySnapshot({ attempted, successful, rejected, tradeCount, expectancyKrw, realizedPnlKrw, totalFeeKrw }) {
   const successRate = attempted > 0 ? successful / attempted : 0;
   const rejectRate = attempted > 0 ? rejected / attempted : 0;
@@ -271,7 +285,7 @@ function main() {
   let maxSymbols = base.maxSymbols;
   let order = base.order;
   let multiplier = base.multiplier;
-  let allowBuy = true;
+  let allowBuy;
 
   // Profit-first baseline: keep participation unless hard risk conditions trigger.
   attempts = Math.max(attempts, 2);
@@ -338,6 +352,7 @@ function main() {
   // Cash-aware safety: prevent repeated insufficient-cash loops.
   const krw = krwBalance(state);
   const cashRejects = recentCashRejectCount(state, 40);
+  const duplicateRejects = recentDuplicateGuardCount(state, 120);
   if (krw < 12000) {
     order = 10000;
     attempts = 1;
@@ -347,12 +362,26 @@ function main() {
   } else if (cashRejects >= 8 && krw < 30000) {
     order = 10000;
     attempts = 1;
-    maxSymbols = 3;
+    maxSymbols = 2;
     allowBuy = false;
     gateReasons.push('cash_reject_loop_block_buy');
   } else {
     allowBuy = true;
     gateReasons.push('buy_allowed_profit_first');
+  }
+
+  // Liquidity-aware throttle even in profit-first mode.
+  if (allowBuy && krw < 60000) {
+    order = 10000;
+    attempts = 1;
+    maxSymbols = Math.min(maxSymbols, 2);
+    gateReasons.push('low_cash_soft_throttle');
+  }
+
+  if (duplicateRejects >= 5) {
+    attempts = 1;
+    maxSymbols = Math.min(maxSymbols, 2);
+    gateReasons.push('duplicate_guard_throttle');
   }
 
   const policyState = readJson(POLICY_STATE, {});
@@ -442,7 +471,7 @@ function main() {
     multiplier,
     regime,
     score: Number((m.avg / 10).toFixed(2)),
-    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, realizedPnlKrw=${Math.round(realizedPnlKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, reasons=${gateReasons.join('|')}, symbols=${symbols.join(',')}`,
+    note: `${runtime.updatedAt} adaptive tick: tone=${m.tone}, avg=${m.avg.toFixed(2)}, attempted=${attempted}, successRate=${(successRate * 100).toFixed(1)}%, rejectRate=${(rejectRate * 100).toFixed(1)}%, tradeCount=${tradeCount}, expectancyKrw=${Math.round(expectancyKrw)}, feeKrw=${Math.round(totalFeeKrw)}, realizedPnlKrw=${Math.round(realizedPnlKrw)}, krw=${Math.round(krw)}, cashRejects=${cashRejects}, duplicateRejects=${duplicateRejects}, reasons=${gateReasons.join('|')}, symbols=${symbols.join(',')}`,
   };
   runtime.controls = { killSwitch: false };
 

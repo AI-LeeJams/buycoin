@@ -3017,7 +3017,12 @@ export class TradingSystem {
           price: lastClose,
           fallbackAmountKrw: cappedAmount,
         });
-        submittedAmountKrw = Math.min(asNumber(sellPlan.amountKrw, cappedAmount), cappedAmount);
+        submittedAmountKrw = asNumber(sellPlan.amountKrw, cappedAmount);
+        const sellAllPlan = sellPlan?.source === "sell_all_available_qty";
+        const protectivePlan = sellPlan?.source === "protective_exit";
+        if (!sellAllPlan && !protectivePlan) {
+          submittedAmountKrw = Math.min(submittedAmountKrw, cappedAmount);
+        }
       }
 
       const decision = {
