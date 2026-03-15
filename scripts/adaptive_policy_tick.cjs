@@ -17,6 +17,8 @@ const STABILITY_MONITOR = `${TRADER}/stability-monitor.json`;
 
 const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
+const MIN_SELLABLE_ORDER_KRW = 20000;
+const CASH_RESERVE_KRW = 2000;
 
 function readJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
@@ -346,7 +348,7 @@ function main() {
 
   if (attempted > 0 && rejectRate > 0.6) {
     attempts = Math.max(1, attempts - 1);
-    order = 10000;
+    order = MIN_SELLABLE_ORDER_KRW;
     gateReasons.push('high_reject_rate_throttle');
   }
 
@@ -360,7 +362,7 @@ function main() {
   if (tradeCount >= 3 && expectancyKrw < 0) {
     attempts = 1;
     maxSymbols = 3;
-    order = 10000;
+    order = MIN_SELLABLE_ORDER_KRW;
     multiplier = Math.min(multiplier, 0.9);
     gateReasons.push('negative_expectancy_throttle');
   }
@@ -369,7 +371,7 @@ function main() {
   if (tradeCount >= 2 && realizedPnlKrw < 0) {
     attempts = 1;
     maxSymbols = 3;
-    order = 10000;
+    order = MIN_SELLABLE_ORDER_KRW;
     multiplier = Math.min(multiplier, 0.85);
     gateReasons.push('realized_loss_throttle');
   }
@@ -377,7 +379,7 @@ function main() {
   // Fee-drag guard: low tradeCount but already high fees -> suppress churn.
   if (tradeCount < 3 && totalFeeKrw >= 150) {
     attempts = 1;
-    order = 10000;
+    order = MIN_SELLABLE_ORDER_KRW;
     multiplier = Math.min(multiplier, 0.9);
     gateReasons.push('fee_drag_throttle');
   }
@@ -385,7 +387,7 @@ function main() {
   // Rejection-wall guard: lots of attempts but almost no fills means execution quality collapse.
   if (attempted >= 5 && rejectRate >= 0.8) {
     attempts = 1;
-    order = 10000;
+    order = MIN_SELLABLE_ORDER_KRW;
     maxSymbols = 3;
     gateReasons.push('rejection_wall_throttle');
   }
@@ -394,14 +396,14 @@ function main() {
   const krw = krwBalance(state);
   const cashRejects = recentCashRejectCount(state, 40);
   const duplicateRejects = recentDuplicateGuardCount(state, 120);
-  if (krw < 12000) {
-    order = 10000;
+  if (krw < (MIN_SELLABLE_ORDER_KRW + CASH_RESERVE_KRW)) {
+    order = MIN_SELLABLE_ORDER_KRW;
     attempts = 1;
     maxSymbols = 2;
     allowBuy = false;
     gateReasons.push('low_cash_hard_block_buy');
-  } else if (cashRejects >= 8 && krw < 30000) {
-    order = 10000;
+  } else if (cashRejects >= 8 && krw < 40000) {
+    order = MIN_SELLABLE_ORDER_KRW;
     attempts = 1;
     maxSymbols = 2;
     allowBuy = false;
@@ -412,8 +414,8 @@ function main() {
   }
 
   // Liquidity-aware throttle even in profit-first mode.
-  if (allowBuy && krw < 60000) {
-    order = 10000;
+  if (allowBuy && krw < 80000) {
+    order = MIN_SELLABLE_ORDER_KRW;
     attempts = 1;
     maxSymbols = Math.min(maxSymbols, 2);
     gateReasons.push('low_cash_soft_throttle');
@@ -446,7 +448,7 @@ function main() {
   if (dayPnlPct >= 5.0) {
     attempts = Math.min(attempts, 1);
     maxSymbols = Math.min(maxSymbols, 3);
-    order = Math.min(order, 10000);
+    order = Math.min(order, MIN_SELLABLE_ORDER_KRW);
     gateReasons.push('profit_lock_soft');
   }
   if (dayStateBase.lockTriggered === true && dayFromPeakPct <= -1.0) {
@@ -491,6 +493,13 @@ function main() {
 
   // Keep total symbol list and per-window execution count decoupled for safety.
   maxSymbols = clamp(maxSymbols, 3, 5);
+  order = Math.max(order, MIN_SELLABLE_ORDER_KRW);
+
+  // Final buy-sellability guard: never buy if available KRW cannot support sellable order size.
+  if (allowBuy && krw < (order + CASH_RESERVE_KRW)) {
+    allowBuy = false;
+    gateReasons.push('final_sellability_block_buy');
+  }
 
   runtime.version = 1;
   runtime.updatedAt = new Date().toISOString();
