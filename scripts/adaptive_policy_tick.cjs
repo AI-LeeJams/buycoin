@@ -78,10 +78,10 @@ function buildUniversePicks(universe, tone) {
   const extras = filtered
     .map((x) => x.symbol)
     .filter((s) => !CORE.includes(s))
-    .slice(0, 4);
+    .slice(0, 6);
 
   const symbols = [...CORE, ...extras];
-  return symbols.slice(0, 8);
+  return symbols.slice(0, 10);
 }
 
 function pickConfigByTone(tone) {
