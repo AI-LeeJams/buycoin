@@ -197,6 +197,32 @@ function estimateEquityKrw(state, universe) {
   return total;
 }
 
+function heldSymbolsFromState(state) {
+  const snaps = Array.isArray(state?.balancesSnapshot) ? state.balancesSnapshot : [];
+  const latest = snaps.length > 0 ? snaps[snaps.length - 1] : null;
+  const items = Array.isArray(latest?.items) ? latest.items : [];
+  const out = [];
+  for (const it of items) {
+    const cur = String(it?.currency || '').toUpperCase();
+    if (!cur || cur === 'KRW') continue;
+    const qty = n(it?.balance, 0) + n(it?.locked, 0);
+    if (qty <= 0) continue;
+    out.push(`${cur}_KRW`);
+  }
+  return Array.from(new Set(out));
+}
+
+function prioritizeHeldSymbols(symbols, held) {
+  const set = new Set(held || []);
+  const first = [];
+  const rest = [];
+  for (const s of symbols) {
+    if (set.has(s)) first.push(s);
+    else rest.push(s);
+  }
+  return [...first, ...rest];
+}
+
 function cleanupTmpFiles(dirPath, maxAgeMs = 6 * 60 * 60 * 1000) {
   try {
     const now = Date.now();
@@ -324,6 +350,8 @@ function main() {
   const base = pickConfigByTone(m.tone);
 
   let symbols = buildUniversePicks(universe, m.tone);
+  const heldSymbols = heldSymbolsFromState(state).filter((s) => symbols.includes(s));
+  symbols = prioritizeHeldSymbols(symbols, heldSymbols);
   let attempts = base.attempts;
   let maxSymbols = base.maxSymbols;
   let order = base.order;
@@ -337,6 +365,9 @@ function main() {
   multiplier = Math.max(multiplier, 1.0);
   const regime = base.regime;
   const gateReasons = [];
+  if (heldSymbols.length > 0) {
+    gateReasons.push(`held_symbols_priority:${heldSymbols.join(',')}`);
+  }
 
   if (attempted === 0) {
     attempts = Math.max(attempts, 3);
