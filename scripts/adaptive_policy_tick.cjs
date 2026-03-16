@@ -571,13 +571,6 @@ function main() {
   let throttled = false;
   const dailyLimit = 8;
 
-  const aiSettings = readJson(AI_SETTINGS, {});
-  const runtimePolicyComparable = extractPolicyComparable(runtime);
-  const aiPolicyComparable = extractPolicyComparable(aiSettings);
-  const runtimePolicyHash = policyHash(runtimePolicyComparable);
-  const aiPolicyHash = policyHash(aiPolicyComparable);
-  const settingsDrift = runtimePolicyHash !== aiPolicyHash;
-
   if (changed) {
     if (!tightening && elapsedMs < minObserveMs) {
       throttled = true;
@@ -588,12 +581,21 @@ function main() {
   }
 
   const shouldApplyRuntime = changed && !throttled;
-  const shouldSyncSettings = shouldApplyRuntime || (!changed && settingsDrift);
-
   if (shouldApplyRuntime) {
     writeJson(RUNTIME, runtime);
     execSync(`${ROOT}/scripts/run-optimize-cron.sh`, { stdio: 'ignore' });
   }
+
+  // Drift/sync must be evaluated against the effective runtime actually in use,
+  // not a candidate blocked by throttle.
+  const effectiveRuntime = shouldApplyRuntime ? runtime : readJson(RUNTIME, runtime);
+  const aiSettings = readJson(AI_SETTINGS, {});
+  const runtimePolicyComparable = extractPolicyComparable(effectiveRuntime);
+  const aiPolicyComparable = extractPolicyComparable(aiSettings);
+  const runtimePolicyHash = policyHash(runtimePolicyComparable);
+  const aiPolicyHash = policyHash(aiPolicyComparable);
+  const settingsDrift = runtimePolicyHash !== aiPolicyHash;
+  const shouldSyncSettings = settingsDrift;
 
   if (shouldSyncSettings) {
     const nextSettings = {
@@ -602,23 +604,23 @@ function main() {
       updatedAt: new Date().toISOString(),
       execution: {
         ...(aiSettings?.execution || {}),
-        ...runtime.execution,
+        ...effectiveRuntime.execution,
         enabled: true,
-        symbol: Array.isArray(runtime.execution?.symbols) && runtime.execution.symbols.length > 0
-          ? runtime.execution.symbols[0]
+        symbol: Array.isArray(effectiveRuntime.execution?.symbols) && effectiveRuntime.execution.symbols.length > 0
+          ? effectiveRuntime.execution.symbols[0]
           : (aiSettings?.execution?.symbol || 'BTC_KRW'),
       },
       decision: {
         ...(aiSettings?.decision || {}),
-        ...runtime.decision,
+        ...effectiveRuntime.decision,
       },
       overlay: {
         ...(aiSettings?.overlay || {}),
-        ...runtime.overlay,
+        ...effectiveRuntime.overlay,
       },
       controls: {
         ...(aiSettings?.controls || {}),
-        ...runtime.controls,
+        ...effectiveRuntime.controls,
       },
     };
     writeJsonAtomic(AI_SETTINGS, nextSettings);
