@@ -1843,11 +1843,16 @@ export class TradingSystem {
                   if (inPostExitCooldown) {
                     selectedReason = "post_exit_buy_cooldown";
                   } else {
-                    const reboundGate = evaluateReboundGate(candlesSnapshot, this.config.strategy?.rebound || {});
-                    if (reboundGate.ok) {
+                    const useReboundGate = String(this.config?.strategy?.name || "").toLowerCase() === "risk_managed_momentum";
+                    if (!useReboundGate) {
                       selectedAction = "BUY";
                     } else {
-                      selectedReason = reboundGate.reason || "rebound_gate_block";
+                      const reboundGate = evaluateReboundGate(candlesSnapshot, this.config.strategy?.rebound || {});
+                      if (reboundGate.ok) {
+                        selectedAction = "BUY";
+                      } else {
+                        selectedReason = reboundGate.reason || "rebound_gate_block";
+                      }
                     }
                   }
                 } else {
@@ -1953,26 +1958,6 @@ export class TradingSystem {
                   orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
                 }
 
-                const minSellNotionalKrw = Math.max(asNumber(this.config?.risk?.chanceMinTotalKrw, 5000), 5000);
-                if (orderAmountKrw < minSellNotionalKrw) {
-                  decisions.push({
-                    at: nowIso(),
-                    price: tick.tradePrice,
-                    signal: signal.action,
-                    action: selectedAction,
-                    actionSource: selectedSource,
-                    side: orderSide,
-                    skipped: "sell_notional_below_min",
-                    orderAmountKrw,
-                    minSellNotionalKrw,
-                    sellPlanSource: sellPlan?.source || null,
-                  });
-                  while (decisions.length > decisionTrailLimit) {
-                    decisions.shift();
-                  }
-                  return;
-                }
-
                 if (!Number.isFinite(orderAmountKrw) || orderAmountKrw <= 0) {
                   if (forcedExit) {
                     await this.recordRiskEvent({
@@ -1994,6 +1979,26 @@ export class TradingSystem {
                     side: orderSide,
                     skipped: "no_position",
                     sellPlan,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
+
+                const minSellNotionalKrw = Math.max(asNumber(this.config?.risk?.chanceMinTotalKrw, 5000), 5000);
+                if (orderAmountKrw < minSellNotionalKrw) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "sell_notional_below_min",
+                    orderAmountKrw,
+                    minSellNotionalKrw,
+                    sellPlanSource: sellPlan?.source || null,
                   });
                   while (decisions.length > decisionTrailLimit) {
                     decisions.shift();
@@ -2062,14 +2067,13 @@ export class TradingSystem {
                 dryRun,
                 reason: `strategy:${this.config.strategy.name}:realtime:${selectedReason}`,
               });
-              if (!dryRun && selectedSource === "ai_override" && aiPolicy.forceOnce) {
-                overrideActionConsumed = true;
-                await this.markAiOverrideConsumedOnce(overrideConsumeKey);
-              }
-
               if (order.ok) {
                 successfulOrders += 1;
                 lastOrderAtMs = nowMs;
+                if (!dryRun && selectedSource === "ai_override" && aiPolicy.forceOnce) {
+                  overrideActionConsumed = true;
+                  await this.markAiOverrideConsumedOnce(overrideConsumeKey);
+                }
               }
 
               decisions.push({
@@ -3017,12 +3021,7 @@ export class TradingSystem {
           price: lastClose,
           fallbackAmountKrw: cappedAmount,
         });
-        submittedAmountKrw = asNumber(sellPlan.amountKrw, cappedAmount);
-        const sellAllPlan = sellPlan?.source === "sell_all_available_qty";
-        const protectivePlan = sellPlan?.source === "protective_exit";
-        if (!sellAllPlan && !protectivePlan) {
-          submittedAmountKrw = Math.min(submittedAmountKrw, cappedAmount);
-        }
+        submittedAmountKrw = Math.min(asNumber(sellPlan.amountKrw, cappedAmount), cappedAmount);
       }
 
       const decision = {
