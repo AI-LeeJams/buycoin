@@ -18,12 +18,12 @@ trap 'rmdir "$LOCK_DIR"' EXIT
 
 cd "$ROOT_DIR"
 {
-  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start adaptive-policy-tick"
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start adaptive-policy-tick(pre)"
   set +e
   "$NODE_BIN" ./scripts/adaptive_policy_tick.cjs
-  tick_status=$?
+  pre_tick_status=$?
   set -e
-  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] end adaptive-policy-tick exit=${tick_status}"
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] end adaptive-policy-tick(pre) exit=${pre_tick_status}"
 
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start optimize"
   set +e
@@ -31,5 +31,35 @@ cd "$ROOT_DIR"
   status=$?
   set -e
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] end optimize exit=${status}"
+
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start adaptive-policy-tick(post-verify)"
+  set +e
+  tick_json=$("$NODE_BIN" ./scripts/adaptive_policy_tick.cjs)
+  post_tick_status=$?
+  set -e
+  echo "$tick_json"
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] end adaptive-policy-tick(post-verify) exit=${post_tick_status}"
+
+  drift=$(
+    TICK_JSON="$tick_json" python3 - <<'PY'
+import json, os
+raw=os.environ.get('TICK_JSON','{}')
+try:
+    d=json.loads(raw)
+    print('1' if d.get('settingsDrift') else '0')
+except Exception:
+    print('1')
+PY
+  )
+
+  if [ "$drift" = "1" ]; then
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] post-verify drift detected, re-running tick once"
+    set +e
+    retry_json=$("$NODE_BIN" ./scripts/adaptive_policy_tick.cjs)
+    retry_status=$?
+    set -e
+    echo "$retry_json"
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] retry adaptive-policy-tick exit=${retry_status}"
+  fi
 } >> "$LOG_FILE" 2>&1
 exit "$status"
