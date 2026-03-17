@@ -280,7 +280,7 @@ export function loadConfig(env = process.env) {
       enabled: toBoolean(env.AI_SETTINGS_ENABLED, true),
       settingsFile: env.AI_SETTINGS_FILE || path.join(process.cwd(), ".trader", "ai-settings.json"),
       runtimeSettingsFile: env.AI_RUNTIME_SETTINGS_FILE || path.join(process.cwd(), ".trader", "ai-runtime.json"),
-      runtimeSettingsMaxAgeSec: toPositiveInt(env.AI_RUNTIME_SETTINGS_MAX_AGE_SEC, 0),
+      runtimeSettingsMaxAgeSec: toPositiveInt(env.AI_RUNTIME_SETTINGS_MAX_AGE_SEC, 7200),
       applyOnlyAfterOptimize: toBoolean(env.AI_SETTINGS_REQUIRE_OPTIMIZER_APPROVAL, false),
       applyOverlay: toBoolean(env.AI_SETTINGS_APPLY_OVERLAY, true),
       applyKillSwitch: toBoolean(env.AI_SETTINGS_APPLY_KILL_SWITCH, true),

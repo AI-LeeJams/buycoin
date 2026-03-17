@@ -1732,7 +1732,8 @@ export class TradingSystem {
     const aiPolicy = normalizeExecutionPolicy(executionPolicy, {
       autoSellEnabled,
     });
-    const overrideConsumeKey = aiPolicy.mode === "override" && aiPolicy.forceOnce && aiPolicy.forceAction
+    const effectiveForceOnce = aiPolicy.mode === "override" ? true : aiPolicy.forceOnce;
+    const overrideConsumeKey = aiPolicy.mode === "override" && effectiveForceOnce && aiPolicy.forceAction
       ? [
         normalizedSymbol,
         aiPolicy.forceAction,
@@ -1787,10 +1788,14 @@ export class TradingSystem {
     let timer = null;
     let processing = Promise.resolve();
     let overrideActionConsumed = this.isAiOverrideConsumedOnce(overrideConsumeKey);
+    let overrideActionsAttempted = 0;
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
 
     try {
+      // Determinism guard: keep one overlay snapshot per realtime window.
+      const windowOverlay = await this.resolveOverlay();
+
       streamHandle = await this.wsClient.openTickerStream({
         symbols: [normalizedSymbol],
         onTicker: (tick) => {
@@ -1828,7 +1833,8 @@ export class TradingSystem {
               const canUseOverride =
                 aiPolicy.mode === "override" &&
                 aiPolicy.forceAction &&
-                !(aiPolicy.forceOnce && overrideActionConsumed);
+                !(effectiveForceOnce && overrideActionConsumed) &&
+                overrideActionsAttempted < 1;
 
               if (forcedExit) {
                 selectedAction = protectiveExit.action;
@@ -1907,7 +1913,7 @@ export class TradingSystem {
                 return;
               }
 
-              const overlay = await this.resolveOverlay();
+              const overlay = windowOverlay;
               const aiOverrideAmount =
                 selectedSource === "ai_override" ? asPositiveNumber(aiPolicy.forceAmountKrw, null) : null;
               const baseAmount =
@@ -2045,6 +2051,9 @@ export class TradingSystem {
               }
 
               attemptedOrders += 1;
+              if (selectedSource === "ai_override") {
+                overrideActionsAttempted += 1;
+              }
               if (forcedExit) {
                 await this.recordRiskEvent({
                   type: "protective_exit",
@@ -2070,7 +2079,7 @@ export class TradingSystem {
               if (order.ok) {
                 successfulOrders += 1;
                 lastOrderAtMs = nowMs;
-                if (!dryRun && selectedSource === "ai_override" && aiPolicy.forceOnce) {
+                if (!dryRun && selectedSource === "ai_override" && effectiveForceOnce) {
                   overrideActionConsumed = true;
                   await this.markAiOverrideConsumedOnce(overrideConsumeKey);
                 }
