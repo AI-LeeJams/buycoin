@@ -18,6 +18,13 @@ trap 'rmdir "$LOCK_DIR"' EXIT
 
 cd "$ROOT_DIR"
 {
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start adaptive-policy-tick"
+  set +e
+  "$NODE_BIN" ./scripts/adaptive_policy_tick.cjs
+  tick_status=$?
+  set -e
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] end adaptive-policy-tick exit=${tick_status}"
+
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] start optimize"
   set +e
   "$NODE_BIN" ./src/app/optimize.js
