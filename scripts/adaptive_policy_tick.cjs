@@ -532,6 +532,15 @@ function main() {
     gateReasons.push('final_sellability_block_buy');
   }
 
+  // Hard invariant: never block sell path; always prioritize held symbols for liquidation opportunity.
+  runtime.decision = runtime.decision || {};
+  runtime.decision.allowSell = true;
+  if (heldSymbols.length > 0) {
+    symbols = prioritizeHeldSymbols(symbols, heldSymbols);
+    maxSymbols = Math.max(maxSymbols, Math.min(heldSymbols.length, 3));
+    gateReasons.push('never_block_sell_path');
+  }
+
   runtime.version = 1;
   runtime.updatedAt = new Date().toISOString();
   runtime.execution = {
