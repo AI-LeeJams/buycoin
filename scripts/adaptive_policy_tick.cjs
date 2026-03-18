@@ -19,6 +19,8 @@ const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
 const MIN_SELLABLE_ORDER_KRW = 20000;
 const CASH_RESERVE_KRW = 2000;
+const MIN_ENTRY_EDGE_PCT = 1.0; // expected-edge proxy threshold for new buys
+const ROUNDTRIP_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 
 function readJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
@@ -223,6 +225,51 @@ function prioritizeHeldSymbols(symbols, held) {
   return [...first, ...rest];
 }
 
+function symbolChangeMap(universe) {
+  const out = new Map();
+  const cs = Array.isArray(universe?.candidates) ? universe.candidates : [];
+  for (const c of cs) {
+    const sym = String(c?.symbol || '');
+    if (!sym) continue;
+    out.set(sym, changePct(c));
+  }
+  return out;
+}
+
+function recentRoundtripLossSymbols(state, cooldownMs = ROUNDTRIP_COOLDOWN_MS) {
+  const done = (Array.isArray(state?.orders) ? state.orders : [])
+    .filter((o) => String(o?.state || '').toUpperCase() === 'DONE')
+    .slice(-200);
+  const now = Date.now();
+  const lastBuyBySymbol = new Map();
+  const lossSymbols = new Set();
+
+  for (const o of done) {
+    const sym = String(o?.symbol || '');
+    if (!sym) continue;
+    const ts = Date.parse(o?.placedAt || o?.createdAt || '');
+    if (!Number.isFinite(ts) || (now - ts) > cooldownMs) continue;
+    const side = String(o?.side || '').toLowerCase();
+    const amt = n(o?.amountKrw, 0);
+
+    if (side === 'buy' && amt > 0) {
+      lastBuyBySymbol.set(sym, { ts, amt });
+      continue;
+    }
+
+    if (side === 'sell' && amt > 0) {
+      const lastBuy = lastBuyBySymbol.get(sym);
+      if (!lastBuy) continue;
+      const pnl = amt - lastBuy.amt;
+      if (pnl <= 0) {
+        lossSymbols.add(sym);
+      }
+    }
+  }
+
+  return Array.from(lossSymbols);
+}
+
 function cleanupTmpFiles(dirPath, maxAgeMs = 6 * 60 * 60 * 1000) {
   try {
     const now = Date.now();
@@ -350,8 +397,27 @@ function main() {
   const base = pickConfigByTone(m.tone);
 
   let symbols = buildUniversePicks(universe, m.tone);
-  const heldSymbols = heldSymbolsFromState(state).filter((s) => symbols.includes(s));
+  const universeSymbolSet = new Set((Array.isArray(universe?.symbols) ? universe.symbols : []).map(String));
+  const heldSymbols = heldSymbolsFromState(state).filter((s) => universeSymbolSet.has(String(s)));
+  // Hard invariant: always include currently held tradable symbols in execution universe.
+  symbols = Array.from(new Set([...heldSymbols, ...symbols]));
   symbols = prioritizeHeldSymbols(symbols, heldSymbols);
+
+  // Ban immediate re-entry on symbols that just produced roundtrip micro-loss.
+  const roundtripLossSymbols = recentRoundtripLossSymbols(state, ROUNDTRIP_COOLDOWN_MS);
+  if (roundtripLossSymbols.length > 0) {
+    const heldSet = new Set(heldSymbols);
+    symbols = symbols.filter((sym) => heldSet.has(sym) || !roundtripLossSymbols.includes(sym));
+  }
+
+  // Expected-edge proxy: for new entries, require minimum momentum edge.
+  const chMap = symbolChangeMap(universe);
+  symbols = symbols.filter((sym) => {
+    if (heldSymbols.includes(sym)) return true; // never block sell path on held symbols
+    const ch = n(chMap.get(sym), 0);
+    return ch >= MIN_ENTRY_EDGE_PCT;
+  });
+
   let attempts = base.attempts;
   let maxSymbols = base.maxSymbols;
   let order = base.order;
@@ -368,6 +434,10 @@ function main() {
   if (heldSymbols.length > 0) {
     gateReasons.push(`held_symbols_priority:${heldSymbols.join(',')}`);
   }
+  if (roundtripLossSymbols.length > 0) {
+    gateReasons.push(`roundtrip_loss_cooldown:${roundtripLossSymbols.join(',')}`);
+  }
+  gateReasons.push(`min_entry_edge_pct:${MIN_ENTRY_EDGE_PCT}`);
 
   if (attempted === 0) {
     attempts = Math.max(attempts, 3);
@@ -502,12 +572,14 @@ function main() {
   }
   if (cooledSymbols.size > 0) {
     const before = symbols.length;
-    symbols = symbols.filter((s) => !cooledSymbols.has(s));
+    const heldSet = new Set(heldSymbols);
+    // Never cooldown currently-held symbols; sell path must remain open.
+    symbols = symbols.filter((s) => heldSet.has(s) || !cooledSymbols.has(s));
     if (symbols.length < before) {
       gateReasons.push('post_profit_symbol_cooldown');
     }
     if (symbols.length === 0) {
-      symbols = CORE.slice(0, 2);
+      symbols = heldSymbols.length > 0 ? heldSymbols.slice(0, 2) : CORE.slice(0, 2);
     }
   }
 
@@ -523,7 +595,8 @@ function main() {
   }
 
   // Keep total symbol list and per-window execution count decoupled for safety.
-  maxSymbols = clamp(maxSymbols, 3, 5);
+  const heldCount = heldSymbols.length;
+  maxSymbols = clamp(maxSymbols, 3, Math.max(5, heldCount));
   order = Math.max(order, MIN_SELLABLE_ORDER_KRW);
 
   // Final buy-sellability guard: never buy if available KRW cannot support sellable order size.
@@ -536,8 +609,10 @@ function main() {
   runtime.decision = runtime.decision || {};
   runtime.decision.allowSell = true;
   if (heldSymbols.length > 0) {
+    symbols = Array.from(new Set([...heldSymbols, ...symbols]));
     symbols = prioritizeHeldSymbols(symbols, heldSymbols);
-    maxSymbols = Math.max(maxSymbols, Math.min(heldSymbols.length, 3));
+    // Ensure held symbols are not delayed by per-window cap.
+    maxSymbols = Math.max(maxSymbols, heldSymbols.length);
     gateReasons.push('never_block_sell_path');
   }
 
