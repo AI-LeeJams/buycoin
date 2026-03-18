@@ -415,6 +415,7 @@ function calculateExecutionKpiFromFills(fills = [], options = {}) {
       realizedPnlKrw: 0,
       winRatePct: 0,
       expectancyKrw: 0,
+      unmatchedSellCount: 0,
     },
     positions: {},
     symbol: targetSymbol || null,
@@ -495,6 +496,27 @@ function calculateExecutionKpiFromFills(fills = [], options = {}) {
           state.costKrw = 0;
         }
         positions.set(symbol, state);
+      } else {
+        // Window-local fills may not include the original buy leg.
+        // Count sell trades using fill-level avgBuyPrice when available,
+        // so realized trade activity is not permanently stuck at zero.
+        const inferredAvgBuyPrice = asNumber(fill?.avgBuyPrice, null);
+        const netExit = amountKrw - (Number.isFinite(fee) ? fee : 0);
+        const inferredCost = inferredAvgBuyPrice !== null && inferredAvgBuyPrice > 0
+          ? inferredAvgBuyPrice * qty
+          : netExit;
+        const realized = netExit - inferredCost;
+
+        summary.realized.tradeCount += 1;
+        summary.realized.unmatchedSellCount += 1;
+        summary.realized.realizedPnlKrw += realized;
+        if (realized > 0) {
+          summary.realized.wins += 1;
+        } else if (realized < 0) {
+          summary.realized.losses += 1;
+        } else {
+          summary.realized.breakEven += 1;
+        }
       }
     }
   }

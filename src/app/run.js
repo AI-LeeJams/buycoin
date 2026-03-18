@@ -314,6 +314,7 @@ function summarizeExecutionKpiSamples(samples = []) {
     realizedWins: 0,
     realizedLosses: 0,
     realizedBreakEven: 0,
+    realizedUnmatchedSellCount: 0,
     realizedPnlKrw: 0,
     attemptedOrders: 0,
     successfulOrders: 0,
@@ -346,6 +347,7 @@ function summarizeExecutionKpiSamples(samples = []) {
     totals.realizedLosses += Number(sample.realized?.losses || 0);
     totals.realizedBreakEven += Number(sample.realized?.breakEven || 0);
     totals.realizedPnlKrw += Number(sample.realized?.realizedPnlKrw || 0);
+    totals.realizedUnmatchedSellCount += Number(sample.realized?.unmatchedSellCount || 0);
     totals.attemptedOrders += Number(sample.orders?.attemptedOrders || 0);
     totals.successfulOrders += Number(sample.orders?.successfulOrders || 0);
     totals.failedWindowCount += sample.failures?.count ? 1 : 0;
@@ -379,6 +381,7 @@ function summarizeExecutionKpiSamples(samples = []) {
       wins: totals.realizedWins,
       losses: totals.realizedLosses,
       breakEven: totals.realizedBreakEven,
+      unmatchedSellCount: totals.realizedUnmatchedSellCount,
       winRatePct: tradeCount > 0 ? roundNum(totals.realizedWins / tradeCount * 100, 4) : 0,
       expectancyKrw: tradeCount > 0 ? roundNum(totals.realizedPnlKrw / tradeCount, 2) : 0,
       realizedPnlKrw: roundNum(totals.realizedPnlKrw, 2),
@@ -1097,6 +1100,7 @@ export async function runExecutionService({
             wins: safeExecutionKpiRealized.wins || 0,
             losses: safeExecutionKpiRealized.losses || 0,
             breakEven: safeExecutionKpiRealized.breakEven || 0,
+            unmatchedSellCount: safeExecutionKpiRealized.unmatchedSellCount || 0,
             winRatePct: roundNum(safeExecutionKpiRealized.winRatePct, 4),
             expectancyKrw: roundNum(safeExecutionKpiRealized.expectancyKrw, 2),
             realizedPnlKrw: roundNum(safeExecutionKpiRealized.realizedPnlKrw, 2),
@@ -1127,6 +1131,7 @@ export async function runExecutionService({
             wins: safeExecutionKpiRealized.wins || 0,
             losses: safeExecutionKpiRealized.losses || 0,
             breakEven: safeExecutionKpiRealized.breakEven || 0,
+            unmatchedSellCount: safeExecutionKpiRealized.unmatchedSellCount || 0,
             realizedPnlKrw: safeExecutionKpiRealized.realizedPnlKrw || 0,
             expectancyKrw: safeExecutionKpiRealized.expectancyKrw || 0,
           },

@@ -261,7 +261,7 @@ function buildKpiReportText(input) {
 
   return [
     "[코마 요약 보고]",
-    `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
+    `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 미매칭매도 ${input.unmatchedSellCount ?? 0}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
     `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
     `• 설정 코인: ${configuredSymbolsText}`,
     `• 시장 상황: ${input.marketSummary}`,
@@ -300,6 +300,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
   const winRatePct = toNum(s?.realized?.winRatePct, 0);
   const expectancyKrw = toNum(s?.realized?.expectancyKrw, NaN);
   const tradeCount = toNum(s?.realized?.tradeCount, 0);
+  const unmatchedSellCount = toNum(s?.realized?.unmatchedSellCount, 0);
   const totalFeeKrw = toNum(s?.fills?.totalFeeKrw, 0);
 
   const latestPrices = extractLatestPrices(state, marketUniverse);
@@ -340,6 +341,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
     winRatePct,
     expectancyKrw,
     tradeCount,
+    unmatchedSellCount,
     totalFeeKrw,
     mtm,
     rejectTopReasons,
@@ -363,6 +365,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       winRatePct,
       expectancyKrw,
       tradeCount,
+      unmatchedSellCount,
       totalFeeKrw,
       mtm,
       rejectTopReasons,
