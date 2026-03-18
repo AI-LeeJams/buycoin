@@ -19,7 +19,7 @@ const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
 const MIN_SELLABLE_ORDER_KRW = 20000;
 const CASH_RESERVE_KRW = 2000;
-const MIN_ENTRY_EDGE_PCT = 1.0; // expected-edge proxy threshold for new buys
+const MIN_ENTRY_EDGE_PCT = 0.3; // expected-edge proxy threshold for new buys
 const ROUNDTRIP_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 
 function readJson(p, fallback = null) {
@@ -80,10 +80,10 @@ function buildUniversePicks(universe, tone) {
   const extras = filtered
     .map((x) => x.symbol)
     .filter((s) => !CORE.includes(s))
-    .slice(0, 6);
+    .slice(0, 8);
 
   const symbols = [...CORE, ...extras];
-  return symbols.slice(0, 10);
+  return symbols.slice(0, 12);
 }
 
 function pickConfigByTone(tone) {
@@ -414,6 +414,7 @@ function main() {
   const chMap = symbolChangeMap(universe);
   symbols = symbols.filter((sym) => {
     if (heldSymbols.includes(sym)) return true; // never block sell path on held symbols
+    if (CORE.includes(sym)) return true; // keep core diversification baseline
     const ch = n(chMap.get(sym), 0);
     return ch >= MIN_ENTRY_EDGE_PCT;
   });
@@ -426,7 +427,7 @@ function main() {
 
   // Profit-first baseline: keep participation unless hard risk conditions trigger.
   attempts = Math.max(attempts, 2);
-  maxSymbols = Math.max(maxSymbols, 4);
+  maxSymbols = Math.max(maxSymbols, 5);
   order = Math.max(order, 20000);
   multiplier = Math.max(multiplier, 1.0);
   const regime = base.regime;
@@ -441,7 +442,7 @@ function main() {
 
   if (attempted === 0) {
     attempts = Math.max(attempts, 3);
-    maxSymbols = Math.max(maxSymbols, 5);
+    maxSymbols = Math.max(maxSymbols, 6);
     order = Math.max(order, 20000);
     multiplier = Math.max(multiplier, 1.0);
     gateReasons.push('no_activity_open_path');
@@ -515,16 +516,16 @@ function main() {
   }
 
   // Liquidity-aware throttle even in profit-first mode.
-  if (allowBuy && krw < 80000) {
+  if (allowBuy && krw < 60000) {
     order = MIN_SELLABLE_ORDER_KRW;
-    attempts = 1;
-    maxSymbols = Math.min(maxSymbols, 2);
+    attempts = Math.max(1, Math.min(attempts, 2));
+    maxSymbols = Math.min(maxSymbols, 4);
     gateReasons.push('low_cash_soft_throttle');
   }
 
-  if (duplicateRejects >= 5) {
-    attempts = 1;
-    maxSymbols = Math.min(maxSymbols, 2);
+  if (duplicateRejects >= 8) {
+    attempts = Math.max(1, Math.min(attempts, 2));
+    maxSymbols = Math.min(maxSymbols, 4);
     gateReasons.push('duplicate_guard_throttle');
   }
 
