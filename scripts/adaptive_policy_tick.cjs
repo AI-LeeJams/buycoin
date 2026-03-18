@@ -392,6 +392,8 @@ function main() {
   const expectancyKrw = n(s?.realized?.expectancyKrw, 0);
   const totalFeeKrw = n(s?.fills?.totalFeeKrw, 0);
   const realizedPnlKrw = n(s?.realized?.realizedPnlKrw, 0);
+  const buyFillCount = n(s?.fills?.buyFillCount, 0);
+  const sellFillCount = n(s?.fills?.sellFillCount, 0);
 
   const m = getMarketTone(universe);
   const base = pickConfigByTone(m.tone);
@@ -434,6 +436,15 @@ function main() {
   const gateReasons = [];
   if (heldSymbols.length > 0) {
     gateReasons.push(`held_symbols_priority:${heldSymbols.join(',')}`);
+  }
+
+  // Realized-trade bootstrap: if sells are lagging behind buys, prioritize exits first.
+  const bootstrapSellFirst = heldSymbols.length > 0 && tradeCount < 3 && buyFillCount > sellFillCount;
+  if (bootstrapSellFirst) {
+    symbols = prioritizeHeldSymbols(heldSymbols, heldSymbols);
+    maxSymbols = Math.min(Math.max(maxSymbols, 2), 3);
+    attempts = 1;
+    gateReasons.push('realized_trade_bootstrap_sell_first');
   }
   if (roundtripLossSymbols.length > 0) {
     gateReasons.push(`roundtrip_loss_cooldown:${roundtripLossSymbols.join(',')}`);
@@ -521,6 +532,11 @@ function main() {
     attempts = Math.max(1, Math.min(attempts, 2));
     maxSymbols = Math.min(maxSymbols, 4);
     gateReasons.push('low_cash_soft_throttle');
+  }
+
+  if (bootstrapSellFirst) {
+    allowBuy = false;
+    gateReasons.push('bootstrap_sell_until_realized_trades');
   }
 
   if (duplicateRejects >= 8) {
