@@ -20,7 +20,7 @@ const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
 const MIN_SELLABLE_ORDER_KRW = 20000;
 const CASH_RESERVE_KRW = 2000;
 const MIN_ENTRY_EDGE_PCT = 0.3; // expected-edge proxy threshold for new buys
-const ROUNDTRIP_COOLDOWN_MS = 3 * 60 * 60 * 1000;
+const ROUNDTRIP_COOLDOWN_MS = 60 * 60 * 1000;
 
 function readJson(p, fallback = null) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
@@ -443,7 +443,7 @@ function main() {
   if (bootstrapSellFirst) {
     symbols = prioritizeHeldSymbols(heldSymbols, heldSymbols);
     maxSymbols = Math.min(Math.max(maxSymbols, 2), 3);
-    attempts = 1;
+    attempts = Math.max(1, Math.min(attempts, 2));
     gateReasons.push('realized_trade_bootstrap_sell_first');
   }
   if (roundtripLossSymbols.length > 0) {
@@ -459,7 +459,7 @@ function main() {
     gateReasons.push('no_activity_open_path');
   }
 
-  if (attempted > 0 && rejectRate > 0.6) {
+  if (attempted >= 6 && rejectRate > 0.7) {
     attempts = Math.max(1, attempts - 1);
     order = MIN_SELLABLE_ORDER_KRW;
     gateReasons.push('high_reject_rate_throttle');
@@ -527,19 +527,26 @@ function main() {
   }
 
   // Liquidity-aware throttle even in profit-first mode.
-  if (allowBuy && krw < 60000) {
+  if (allowBuy && krw < 40000) {
     order = MIN_SELLABLE_ORDER_KRW;
     attempts = Math.max(1, Math.min(attempts, 2));
     maxSymbols = Math.min(maxSymbols, 4);
     gateReasons.push('low_cash_soft_throttle');
   }
 
-  if (bootstrapSellFirst) {
-    allowBuy = false;
-    gateReasons.push('bootstrap_sell_until_realized_trades');
+  // Relative-performance mode: in strong tape with enough cash, keep participation up.
+  if (allowBuy && krw >= 50000 && (m.tone === 'risk_on' || m.avg >= 0.6)) {
+    attempts = Math.max(attempts, 2);
+    maxSymbols = Math.max(maxSymbols, 4);
+    order = Math.max(order, MIN_SELLABLE_ORDER_KRW);
+    gateReasons.push('relative_performance_recovery_mode');
   }
 
-  if (duplicateRejects >= 8) {
+  if (bootstrapSellFirst) {
+    gateReasons.push('bootstrap_sell_priority_mode');
+  }
+
+  if (duplicateRejects >= 12) {
     attempts = Math.max(1, Math.min(attempts, 2));
     maxSymbols = Math.min(maxSymbols, 4);
     gateReasons.push('duplicate_guard_throttle');
