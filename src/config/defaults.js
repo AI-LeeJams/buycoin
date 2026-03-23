@@ -237,7 +237,9 @@ export function loadConfig(env = process.env) {
       walkForwardStepWindow: toPositiveInt(env.OPTIMIZER_WALK_FORWARD_STEP_WINDOW, 30),
       walkForwardMaxFolds: toPositiveInt(env.OPTIMIZER_WALK_FORWARD_MAX_FOLDS, 0),
       walkForwardMinScore: toNumber(env.OPTIMIZER_WALK_FORWARD_MIN_SCORE, -999999),
-      walkForwardMinFoldCount: toPositiveInt(env.OPTIMIZER_WALK_FORWARD_MIN_FOLD_COUNT, 4),
+      // With default optimizer windows (train 80 / test 40 / step 30) and 200 candles,
+      // max fold count is 3. Keep default min fold count aligned to avoid rejecting all candidates.
+      walkForwardMinFoldCount: toPositiveInt(env.OPTIMIZER_WALK_FORWARD_MIN_FOLD_COUNT, 3),
       walkForwardMinPassRate: toNumber(env.OPTIMIZER_WALK_FORWARD_MIN_PASS_RATE, 0.55),
       topResults: toPositiveInt(env.OPTIMIZER_TOP_RESULTS, 10),
       momentumLookbacks: toCsvPositiveInts(env.OPTIMIZER_MOMENTUM_LOOKBACKS, [24, 36, 48, 72]),

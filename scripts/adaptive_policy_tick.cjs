@@ -19,7 +19,7 @@ const CORE = ['BTC_KRW', 'ETH_KRW', 'XRP_KRW', 'SOL_KRW'];
 const BLACKLIST = new Set(['ENSO_KRW', 'USDT_KRW']);
 const MIN_SELLABLE_ORDER_KRW = 20000;
 const CASH_RESERVE_KRW = 2000;
-const MIN_ENTRY_EDGE_PCT = 0.3; // expected-edge proxy threshold for new buys
+const MIN_ENTRY_EDGE_PCT = 0.2; // expected-edge proxy threshold for new buys (v2: small relaxation to recover attempted orders)
 const ROUNDTRIP_COOLDOWN_MS = 60 * 60 * 1000;
 
 function readJson(p, fallback = null) {
