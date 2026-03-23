@@ -222,6 +222,91 @@ function requiredCandleWindow(config) {
   return Math.max(2, momentum + 1, volatility + 1);
 }
 
+function ema(values = [], period = 9) {
+  const p = Math.max(2, Math.floor(asNumber(period, 9)));
+  const alpha = 2 / (p + 1);
+  let out = null;
+  for (const v of values) {
+    const n = asNumber(v, null);
+    if (!Number.isFinite(n)) {
+      continue;
+    }
+    out = out === null ? n : (alpha * n) + ((1 - alpha) * out);
+  }
+  return out;
+}
+
+function evaluateReboundGate(candles = [], reboundConfig = {}) {
+  if (reboundConfig?.enabled === false) {
+    return { ok: true, reason: "rebound_disabled" };
+  }
+
+  const dropLookback = Math.max(3, Math.floor(asNumber(reboundConfig?.dropLookback, 8)));
+  const dropPct = asNumber(reboundConfig?.dropPct, -2.5);
+  const confirmEma = Math.max(3, Math.floor(asNumber(reboundConfig?.confirmEma, 9)));
+  const breakoutLookback = Math.max(4, Math.floor(asNumber(reboundConfig?.breakoutLookback, 6)));
+
+  if (!Array.isArray(candles) || candles.length < Math.max(dropLookback + 2, confirmEma + 2, breakoutLookback + 2)) {
+    return { ok: false, reason: "rebound_insufficient_candles" };
+  }
+
+  const closes = candles
+    .map((c) => asNumber(c?.close ?? c?.tradePrice ?? c?.price, null))
+    .filter((v) => Number.isFinite(v));
+  if (closes.length < Math.max(dropLookback + 2, confirmEma + 2, breakoutLookback + 2)) {
+    return { ok: false, reason: "rebound_invalid_closes" };
+  }
+
+  const last = closes[closes.length - 1];
+  const prev = closes[closes.length - 2];
+  const lookback = closes.slice(Math.max(0, closes.length - 1 - dropLookback), closes.length - 1);
+  const peak = lookback.length > 0 ? Math.max(...lookback) : prev;
+  const dropFromPeakPct = peak > 0 ? ((last - peak) / peak) * 100 : 0;
+  const emaValue = ema(closes, confirmEma);
+
+  // Case A: 급락 후 반등 진입
+  const reboundOk = Number.isFinite(emaValue)
+    && dropFromPeakPct <= dropPct
+    && last >= emaValue
+    && last > prev;
+
+  // Case B: 상승 추세 지속(신고점 돌파)도 진입 허용
+  const breakoutBase = closes.slice(Math.max(0, closes.length - 1 - breakoutLookback), closes.length - 1);
+  const breakoutHigh = breakoutBase.length > 0 ? Math.max(...breakoutBase) : prev;
+  const trendBreakoutOk = Number.isFinite(emaValue)
+    && last >= emaValue
+    && last >= breakoutHigh
+    && last > prev;
+
+  if (reboundOk || trendBreakoutOk) {
+    return {
+      ok: true,
+      reason: reboundOk ? "rebound_gate_pass" : "trend_breakout_pass",
+      metrics: {
+        dropFromPeakPct,
+        dropThresholdPct: dropPct,
+        ema: emaValue,
+        breakoutHigh,
+        last,
+        prev,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    reason: "rebound_gate_block",
+    metrics: {
+      dropFromPeakPct,
+      dropThresholdPct: dropPct,
+      ema: emaValue,
+      breakoutHigh,
+      last,
+      prev,
+    },
+  };
+}
+
 function calculateAccountMetrics(accounts = []) {
   let cashKrw = 0;
   let cashAvailableKrw = 0;
@@ -330,6 +415,7 @@ function calculateExecutionKpiFromFills(fills = [], options = {}) {
       realizedPnlKrw: 0,
       winRatePct: 0,
       expectancyKrw: 0,
+      unmatchedSellCount: 0,
     },
     positions: {},
     symbol: targetSymbol || null,
@@ -410,6 +496,27 @@ function calculateExecutionKpiFromFills(fills = [], options = {}) {
           state.costKrw = 0;
         }
         positions.set(symbol, state);
+      } else {
+        // Window-local fills may not include the original buy leg.
+        // Count sell trades using fill-level avgBuyPrice when available,
+        // so realized trade activity is not permanently stuck at zero.
+        const inferredAvgBuyPrice = asNumber(fill?.avgBuyPrice, null);
+        const netExit = amountKrw - (Number.isFinite(fee) ? fee : 0);
+        const inferredCost = inferredAvgBuyPrice !== null && inferredAvgBuyPrice > 0
+          ? inferredAvgBuyPrice * qty
+          : netExit;
+        const realized = netExit - inferredCost;
+
+        summary.realized.tradeCount += 1;
+        summary.realized.unmatchedSellCount += 1;
+        summary.realized.realizedPnlKrw += realized;
+        if (realized > 0) {
+          summary.realized.wins += 1;
+        } else if (realized < 0) {
+          summary.realized.losses += 1;
+        } else {
+          summary.realized.breakEven += 1;
+        }
       }
     }
   }
@@ -1264,6 +1371,67 @@ export class TradingSystem {
     });
   }
 
+  isAiOverrideConsumedOnce(key) {
+    if (!key) {
+      return false;
+    }
+    const state = this.store.snapshot();
+    const consumed = state?.settings?.aiOverrideConsumed;
+    return Boolean(consumed && Object.hasOwn(consumed, key));
+  }
+
+  async markAiOverrideConsumedOnce(key) {
+    if (!key) {
+      return;
+    }
+    await this.store.update((state) => {
+      const now = nowIso();
+      const consumed = state.settings.aiOverrideConsumed && typeof state.settings.aiOverrideConsumed === "object"
+        ? state.settings.aiOverrideConsumed
+        : {};
+      consumed[key] = now;
+
+      const entries = Object.entries(consumed)
+        .sort((a, b) => Date.parse(a[1] || 0) - Date.parse(b[1] || 0));
+      const maxKeep = 200;
+      while (entries.length > maxKeep) {
+        const [oldestKey] = entries.shift();
+        delete consumed[oldestKey];
+      }
+
+      state.settings.aiOverrideConsumed = consumed;
+      return state;
+    });
+  }
+
+  hasRecentProtectiveExit(symbol, cooldownSec = 0) {
+    const windowMs = Math.max(0, Math.floor(asNumber(cooldownSec, 0) * 1000));
+    if (!symbol || windowMs <= 0) {
+      return false;
+    }
+    const state = this.store.snapshot();
+    const events = Array.isArray(state?.riskEvents) ? state.riskEvents : [];
+    if (events.length === 0) {
+      return false;
+    }
+    const nowMs = Date.now();
+    for (let idx = events.length - 1; idx >= 0; idx -= 1) {
+      const row = events[idx];
+      if (row?.type !== "protective_exit") {
+        continue;
+      }
+      if (normalizeSymbol(row?.symbol) !== normalizeSymbol(symbol)) {
+        continue;
+      }
+      const ts = Date.parse(row?.at || "");
+      if (!Number.isFinite(ts)) {
+        continue;
+      }
+      return nowMs - ts <= windowMs;
+    }
+    return false;
+  }
+
   async resolveProtectiveExit({ symbol, currentPrice }) {
     const normalizedSymbol = normalizeSymbol(symbol || this.config.strategy.defaultSymbol);
     const [baseCurrency] = normalizedSymbol.split("_");
@@ -1284,9 +1452,36 @@ export class TradingSystem {
       return null;
     }
 
+    const holdingNotionalKrw = holdingQty * price;
+    const dustFloorKrw = asNumber(this.config?.risk?.chanceMinTotalKrw, 5_000);
+    if (Number.isFinite(holdingNotionalKrw) && holdingNotionalKrw > 0 && holdingNotionalKrw < dustFloorKrw) {
+      return null;
+    }
+
     const pnlRatio = price / avgBuyPrice - 1;
     const stopLossPct = asNumber(this.config.risk.maxHoldingLossPct, 0);
     const takeProfitPct = asNumber(this.config.risk.maxHoldingTakeProfitPct, 0);
+    const trailingStopPct = asNumber(this.config.risk.trailingStopPct, 0);
+    const trailingArmPct = asNumber(this.config.risk.trailingArmPct, 0);
+
+    const state = this.store.snapshot();
+    const peaks = state?.system?.holdingPeaks && typeof state.system.holdingPeaks === "object"
+      ? state.system.holdingPeaks
+      : {};
+    const prevPeak = Math.max(asNumber(peaks[normalizedSymbol], 0), avgBuyPrice);
+    const nextPeak = Math.max(prevPeak, price);
+    if (nextPeak > prevPeak) {
+      await this.store.update((draft) => {
+        if (!draft.system) {
+          draft.system = {};
+        }
+        if (!draft.system.holdingPeaks || typeof draft.system.holdingPeaks !== "object") {
+          draft.system.holdingPeaks = {};
+        }
+        draft.system.holdingPeaks[normalizedSymbol] = nextPeak;
+        return draft;
+      });
+    }
 
     if (Number.isFinite(stopLossPct) && stopLossPct > 0 && pnlRatio <= -Math.abs(stopLossPct) / 100) {
       return {
@@ -1307,6 +1502,29 @@ export class TradingSystem {
         pnlRatio,
         avgBuyPrice,
         currentPrice: price,
+      };
+    }
+
+    const armed = Number.isFinite(trailingArmPct) && trailingArmPct > 0
+      ? pnlRatio >= Math.abs(trailingArmPct) / 100
+      : pnlRatio > 0;
+    const trailDropPct = nextPeak > 0 ? ((nextPeak - price) / nextPeak) * 100 : 0;
+
+    if (
+      armed
+      && Number.isFinite(trailingStopPct)
+      && trailingStopPct > 0
+      && trailDropPct >= trailingStopPct
+    ) {
+      return {
+        shouldExit: true,
+        action: "SELL",
+        reason: "protective_trailing_stop",
+        pnlRatio,
+        avgBuyPrice,
+        currentPrice: price,
+        peakPrice: nextPeak,
+        trailDropPct,
       };
     }
 
@@ -1536,6 +1754,15 @@ export class TradingSystem {
     const aiPolicy = normalizeExecutionPolicy(executionPolicy, {
       autoSellEnabled,
     });
+    const effectiveForceOnce = aiPolicy.mode === "override" ? true : aiPolicy.forceOnce;
+    const overrideConsumeKey = aiPolicy.mode === "override" && effectiveForceOnce && aiPolicy.forceAction
+      ? [
+        normalizedSymbol,
+        aiPolicy.forceAction,
+        asPositiveNumber(aiPolicy.forceAmountKrw, 0) || 0,
+        String(aiPolicy.note || ""),
+      ].join("|")
+      : null;
 
     await this.store.update((state) => {
       state.strategyRuns.push({
@@ -1582,11 +1809,15 @@ export class TradingSystem {
     let streamHandle = null;
     let timer = null;
     let processing = Promise.resolve();
-    let overrideActionConsumed = false;
+    let overrideActionConsumed = this.isAiOverrideConsumedOnce(overrideConsumeKey);
+    let overrideActionsAttempted = 0;
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
 
     try {
+      // Determinism guard: keep one overlay snapshot per realtime window.
+      const windowOverlay = await this.resolveOverlay();
+
       streamHandle = await this.wsClient.openTickerStream({
         symbols: [normalizedSymbol],
         onTicker: (tick) => {
@@ -1624,7 +1855,8 @@ export class TradingSystem {
               const canUseOverride =
                 aiPolicy.mode === "override" &&
                 aiPolicy.forceAction &&
-                !(aiPolicy.forceOnce && overrideActionConsumed);
+                !(effectiveForceOnce && overrideActionConsumed) &&
+                overrideActionsAttempted < 1;
 
               if (forcedExit) {
                 selectedAction = protectiveExit.action;
@@ -1634,7 +1866,23 @@ export class TradingSystem {
                 selectedSource = "ai_override";
               } else if (signal.action === "BUY") {
                 if (aiPolicy.allowBuy) {
-                  selectedAction = "BUY";
+                  const postExitCooldownSec = asNumber(this.config?.risk?.postExitBuyCooldownSec, 0);
+                  const inPostExitCooldown = this.hasRecentProtectiveExit(normalizedSymbol, postExitCooldownSec);
+                  if (inPostExitCooldown) {
+                    selectedReason = "post_exit_buy_cooldown";
+                  } else {
+                    const useReboundGate = String(this.config?.strategy?.name || "").toLowerCase() === "risk_managed_momentum";
+                    if (!useReboundGate) {
+                      selectedAction = "BUY";
+                    } else {
+                      const reboundGate = evaluateReboundGate(candlesSnapshot, this.config.strategy?.rebound || {});
+                      if (reboundGate.ok) {
+                        selectedAction = "BUY";
+                      } else {
+                        selectedReason = reboundGate.reason || "rebound_gate_block";
+                      }
+                    }
+                  }
                 } else {
                   selectedReason = "ai_filter_block_buy";
                 }
@@ -1687,7 +1935,7 @@ export class TradingSystem {
                 return;
               }
 
-              const overlay = await this.resolveOverlay();
+              const overlay = windowOverlay;
               const aiOverrideAmount =
                 selectedSource === "ai_override" ? asPositiveNumber(aiPolicy.forceAmountKrw, null) : null;
               const baseAmount =
@@ -1729,7 +1977,15 @@ export class TradingSystem {
                   fallbackAmountKrw: cappedAmount,
                 });
                 orderAmountKrw = asNumber(sellPlan.amountKrw, cappedAmount);
-                orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
+
+                const sellAllPlan = sellPlan?.source === "sell_all_available_qty";
+                const protectiveSell = selectedSource === "protective_exit";
+                const allowFullSellAmount = sellAllPlan || protectiveSell;
+
+                if (!allowFullSellAmount) {
+                  orderAmountKrw = Math.min(orderAmountKrw, cappedAmount);
+                }
+
                 if (!Number.isFinite(orderAmountKrw) || orderAmountKrw <= 0) {
                   if (forcedExit) {
                     await this.recordRiskEvent({
@@ -1757,9 +2013,69 @@ export class TradingSystem {
                   }
                   return;
                 }
+
+                const minSellNotionalKrw = Math.max(asNumber(this.config?.risk?.chanceMinTotalKrw, 5000), 5000);
+                if (orderAmountKrw < minSellNotionalKrw) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "sell_notional_below_min",
+                    orderAmountKrw,
+                    minSellNotionalKrw,
+                    sellPlanSource: sellPlan?.source || null,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
+              } else {
+                const accountContext = await this.loadAccountContext();
+                const availableCashKrw = asNumber(accountContext?.metrics?.availableCashKrw, null);
+                const cashKnown = Number.isFinite(availableCashKrw);
+
+                if (cashKnown && availableCashKrw + 1e-9 < orderAmountKrw) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "buy_insufficient_cash_gate",
+                    availableCashKrw,
+                    requiredOrderKrw: orderAmountKrw,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
+
+                if (!cashKnown) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    note: "cash_unknown_gate_bypassed",
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                }
               }
 
               attemptedOrders += 1;
+              if (selectedSource === "ai_override") {
+                overrideActionsAttempted += 1;
+              }
               if (forcedExit) {
                 await this.recordRiskEvent({
                   type: "protective_exit",
@@ -1782,13 +2098,13 @@ export class TradingSystem {
                 dryRun,
                 reason: `strategy:${this.config.strategy.name}:realtime:${selectedReason}`,
               });
-              if (!dryRun && selectedSource === "ai_override" && aiPolicy.forceOnce) {
-                overrideActionConsumed = true;
-              }
-
               if (order.ok) {
                 successfulOrders += 1;
                 lastOrderAtMs = nowMs;
+                if (!dryRun && selectedSource === "ai_override" && effectiveForceOnce) {
+                  overrideActionConsumed = true;
+                  await this.markAiOverrideConsumedOnce(overrideConsumeKey);
+                }
               }
 
               decisions.push({
@@ -2479,12 +2795,32 @@ export class TradingSystem {
       const context = await this.evaluateRiskForOrder(orderInput, { chanceMinTotalKrw });
       if (!context.risk.allowed) {
         const reasons = Array.isArray(context.risk.reasons) ? context.risk.reasons : [];
+        const reasonRules = reasons.map((reason) => String(reason?.rule || "")).filter(Boolean);
         const hitDailyLossLimit = reasons.some((reason) => reason?.rule === "MAX_DAILY_LOSS_KRW");
-        const streak = await this.bumpRiskRejectStreak({
-          symbol: orderInput.symbol,
-          reasons,
-          metrics: context.risk.metrics,
-        });
+
+        const nonEscalatingRejectRules = new Set([
+          "MIN_ORDER_NOTIONAL_KRW",
+          "INSUFFICIENT_CASH",
+          "SELL_EXCEEDS_HOLDING",
+          "NO_SELLABLE_HOLDING",
+          "KILL_SWITCH_ACTIVE",
+        ]);
+        // Hotfix: reject-streak 승격은 '실행 불가능한 거절'에는 적용하지 않는다.
+        // KILL_SWITCH_ACTIVE가 함께 섞여 들어온 경우도 non-escalating으로 처리한다.
+        const isNonEscalatingReject = reasonRules.length > 0
+          && reasonRules.every((rule) => nonEscalatingRejectRules.has(rule));
+        const isKillSwitchEchoReject = reasonRules.length > 0
+          && reasonRules.every((rule) => rule === "KILL_SWITCH_ACTIVE");
+
+        const shouldEscalateRejectStreak = !isNonEscalatingReject && !isKillSwitchEchoReject;
+        const streak = shouldEscalateRejectStreak
+          ? await this.bumpRiskRejectStreak({
+            symbol: orderInput.symbol,
+            reasons,
+            metrics: context.risk.metrics,
+          })
+          : asNumber(this.store.snapshot().settings?.riskReject?.streak, 0);
+
         await this.recordRiskEvent({
           type: "order_rejected",
           source: "risk_engine",
@@ -2492,6 +2828,7 @@ export class TradingSystem {
           reasons,
           metrics: context.risk.metrics,
           streak,
+          nonEscalating: !shouldEscalateRejectStreak,
         });
 
         if (hitDailyLossLimit && !this.store.snapshot().settings.killSwitch) {
@@ -2505,7 +2842,10 @@ export class TradingSystem {
         }
 
         const maxRiskRejectStreak = asNumber(this.config.risk.maxConsecutiveRiskRejects, 0);
-        if (maxRiskRejectStreak > 0 && streak >= maxRiskRejectStreak && !this.store.snapshot().settings.killSwitch) {
+        if (shouldEscalateRejectStreak
+          && maxRiskRejectStreak > 0
+          && streak >= maxRiskRejectStreak
+          && !this.store.snapshot().settings.killSwitch) {
           await this.setKillSwitch(true, "max_consecutive_risk_rejects");
           this.logger.error("kill switch auto-activated by risk-reject streak", {
             symbol: orderInput.symbol,
@@ -2540,6 +2880,49 @@ export class TradingSystem {
               metrics: context.accountContext.metrics,
             },
             expectedPrice,
+          },
+        };
+      }
+
+      const duplicateWindowMs = Math.max(5_000, Math.floor(asNumber(this.config?.runtime?.duplicateOrderWindowMs, 90_000)));
+      const nowMs = Date.now();
+      const stateSnapshot = this.store.snapshot();
+      const orders = Array.isArray(stateSnapshot?.orders) ? stateSnapshot.orders : [];
+      const openStates = openOrderStates();
+      const duplicate = orders.find((row) => {
+        if (!row) return false;
+        if (normalizeSymbol(row.symbol) !== normalizeSymbol(orderInput.symbol)) return false;
+        if (String(row.side || "").toLowerCase() !== String(orderInput.side || "").toLowerCase()) return false;
+        const ts = Date.parse(row.placedAt || row.createdAt || "");
+        if (!Number.isFinite(ts) || nowMs - ts > duplicateWindowMs) return false;
+
+        const state = String(row.state || "").toUpperCase();
+        if (!openStates.has(state) && state !== "DONE") return false;
+
+        const prevAmount = asNumber(row.amountKrw, null);
+        const nextAmount = asNumber(orderInput.amountKrw, null);
+        if (!Number.isFinite(prevAmount) || !Number.isFinite(nextAmount)) return true;
+        const diff = Math.abs(prevAmount - nextAmount);
+        return diff <= Math.max(500, nextAmount * 0.03);
+      });
+
+      if (duplicate) {
+        await this.recordRiskEvent({
+          type: "order_rejected",
+          source: "duplicate_order_guard",
+          symbol: orderInput.symbol,
+          reasons: [{ rule: "DUPLICATE_ORDER_WINDOW", detail: "duplicate_order_guard" }],
+          metrics: { duplicateWindowMs },
+          streak: asNumber(this.store.snapshot().settings?.riskReject?.streak, 0),
+          nonEscalating: true,
+        });
+        return {
+          ok: false,
+          code: EXIT_CODES.RISK_REJECTED,
+          error: {
+            message: "Duplicate order blocked by guard",
+            reasons: [{ rule: "DUPLICATE_ORDER_WINDOW", detail: "duplicate_order_guard" }],
+            duplicateOrderId: duplicate.id || duplicate.exchangeOrderId || duplicate.clientOrderKey || null,
           },
         };
       }

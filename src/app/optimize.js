@@ -882,9 +882,18 @@ export async function optimizeAndApplyBest({
   await writeJson(runtimeConfig.optimizer.reportFile, report);
   let applied = false;
   let applyResult = null;
+  const bestIsSafe = optimization.best?.safe === true;
   if (apply) {
-    applyResult = await applyBestToAiSettings(runtimeConfig, optimization.best, logger);
-    applied = true;
+    if (!bestIsSafe) {
+      logger.warn("optimizer skipped apply: best candidate is not safe", {
+        symbol: optimization.best?.symbol || null,
+        checks: optimization.best?.safety?.checks || null,
+        safeCandidates,
+      });
+    } else {
+      applyResult = await applyBestToAiSettings(runtimeConfig, optimization.best, logger);
+      applied = true;
+    }
   }
 
   return {

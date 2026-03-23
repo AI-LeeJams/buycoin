@@ -135,7 +135,7 @@ function buildMomentumGrid(config = {}) {
     : [72, 96, 120, 144];
   const entryBpsCandidates = Array.isArray(config.entryBpsCandidates) && config.entryBpsCandidates.length > 0
     ? config.entryBpsCandidates
-    : [10, 16, 24, 32];
+    : [8, 10, 12, 16, 20, 24];
   const exitBpsCandidates = Array.isArray(config.exitBpsCandidates) && config.exitBpsCandidates.length > 0
     ? config.exitBpsCandidates
     : [6, 10, 14, 20];

@@ -6,11 +6,11 @@ import { nowIso } from "../lib/time.js";
 const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout"]);
 
 // Safe ranges for strategy parameters per README AI Operator Contract.
-// Values outside these ranges silently break strategy behavior (e.g. momentumEntryBps>30 disables buying).
+// Values outside these ranges can silently degrade behavior; high momentumEntryBps over-filters buy entries.
 const STRATEGY_SAFE_RANGES = {
   momentumLookback:         { min: 12,   max: 72   },
   volatilityLookback:       { min: 48,   max: 144  },
-  momentumEntryBps:         { min: 6,    max: 30   },
+  momentumEntryBps:         { min: 6,    max: 24   },
   momentumExitBps:          { min: 4,    max: 20   },
   targetVolatilityPct:      { min: 0.30, max: 1.20 },
   riskManagedMinMultiplier: { min: 0.40, max: 1.00 },
@@ -235,6 +235,75 @@ function normalizeDecision(raw = {}, fallback = {}) {
   return decision;
 }
 
+const SETTINGS_FILE_STABILITY_ATTEMPTS = 3;
+const SETTINGS_FILE_STABILITY_DELAY_MS = 60;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function writeJsonAtomic(filePath, payload) {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tempFile = path.join(
+    dir,
+    `${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), "utf8");
+  await fs.rename(tempFile, filePath);
+}
+
+async function readJsonWithWriteStabilityGuard(filePath) {
+  for (let attempt = 1; attempt <= SETTINGS_FILE_STABILITY_ATTEMPTS; attempt += 1) {
+    let beforeStat;
+    try {
+      beforeStat = await fs.stat(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    let rawText;
+    try {
+      rawText = await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    let afterStat;
+    try {
+      afterStat = await fs.stat(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return {};
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    if (beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) return {};
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      continue;
+    }
+
+    const trimmed = rawText.trim();
+    if (!trimmed) return {};
+    try {
+      return JSON.parse(trimmed);
+    } catch (error) {
+      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
+      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+    }
+  }
+
+  return {};
+}
+
 function normalizeRuntimeMeta(raw = {}) {
   const meta = raw && typeof raw === "object" ? raw : null;
   if (!meta) {
@@ -393,7 +462,7 @@ export class AiSettingsSource {
       }
 
       const template = this.defaultTemplate();
-      await fs.writeFile(this.settingsFile, JSON.stringify(template, null, 2), "utf8");
+      await writeJsonAtomic(this.settingsFile, template);
       this.logger.info("ai settings template created", {
         file: this.settingsFile,
       });
@@ -552,8 +621,7 @@ export class AiSettingsSource {
     }
 
     try {
-      const rawText = await fs.readFile(this.settingsFile, "utf8");
-      const parsed = rawText.trim() ? JSON.parse(rawText) : {};
+      const parsed = await readJsonWithWriteStabilityGuard(this.settingsFile);
       this.lastError = null;
       return this.normalize(parsed);
     } catch (error) {

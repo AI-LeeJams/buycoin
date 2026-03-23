@@ -190,6 +190,16 @@ function resolveDecisionForSymbol(decision, symbol) {
   };
 }
 
+function isLiquidationDirective(decision = {}) {
+  if (!decision || typeof decision !== "object") {
+    return false;
+  }
+  return decision.mode === "override"
+    && String(decision.forceAction || "").toUpperCase() === "SELL"
+    && decision.allowBuy === false
+    && decision.allowSell === true;
+}
+
 function normalizeAiRefreshRange(aiConfig = {}) {
   const fixedRaw = Number(aiConfig?.refreshFixedSec);
   const fixedSec = Number.isFinite(fixedRaw) && fixedRaw > 0 ? Math.floor(fixedRaw) : 0;
@@ -304,6 +314,7 @@ function summarizeExecutionKpiSamples(samples = []) {
     realizedWins: 0,
     realizedLosses: 0,
     realizedBreakEven: 0,
+    realizedUnmatchedSellCount: 0,
     realizedPnlKrw: 0,
     attemptedOrders: 0,
     successfulOrders: 0,
@@ -336,6 +347,7 @@ function summarizeExecutionKpiSamples(samples = []) {
     totals.realizedLosses += Number(sample.realized?.losses || 0);
     totals.realizedBreakEven += Number(sample.realized?.breakEven || 0);
     totals.realizedPnlKrw += Number(sample.realized?.realizedPnlKrw || 0);
+    totals.realizedUnmatchedSellCount += Number(sample.realized?.unmatchedSellCount || 0);
     totals.attemptedOrders += Number(sample.orders?.attemptedOrders || 0);
     totals.successfulOrders += Number(sample.orders?.successfulOrders || 0);
     totals.failedWindowCount += sample.failures?.count ? 1 : 0;
@@ -369,6 +381,7 @@ function summarizeExecutionKpiSamples(samples = []) {
       wins: totals.realizedWins,
       losses: totals.realizedLosses,
       breakEven: totals.realizedBreakEven,
+      unmatchedSellCount: totals.realizedUnmatchedSellCount,
       winRatePct: tradeCount > 0 ? roundNum(totals.realizedWins / tradeCount * 100, 4) : 0,
       expectancyKrw: tradeCount > 0 ? roundNum(totals.realizedPnlKrw / tradeCount, 2) : 0,
       realizedPnlKrw: roundNum(totals.realizedPnlKrw, 2),
@@ -673,6 +686,7 @@ export async function runExecutionService({
 
     let lastOverlayHash = null;
     let lastKillSwitch = null;
+    let pendingKillSwitchApply = false;
     let lastStrategyHash = null;
     let lastDecisionHash = null;
     let lastFilteredSymbolsHash = null;
@@ -822,16 +836,30 @@ export async function runExecutionService({
         }
       }
 
-      if (typeof aiRuntimeForExecution.controls.killSwitch === "boolean"
-        && aiRuntimeForExecution.controls.killSwitch !== lastKillSwitch) {
-        const killSwitchResult = await trader.setKillSwitch(
-          aiRuntimeForExecution.controls.killSwitch,
-          "ai_settings_control",
-        );
+      const requestedKillSwitch = typeof aiRuntimeForExecution.controls.killSwitch === "boolean"
+        ? aiRuntimeForExecution.controls.killSwitch
+        : null;
+      const liquidationDirective = isLiquidationDirective(aiRuntimeForExecution.decision);
+
+      if (requestedKillSwitch === true) {
+        if (pendingKillSwitchApply || requestedKillSwitch !== lastKillSwitch) {
+          const killSwitchResult = await trader.setKillSwitch(true, "ai_settings_control");
+          if (killSwitchResult.ok) {
+            pendingKillSwitchApply = false;
+            lastKillSwitch = true;
+            logger.warn("kill switch updated from ai settings", {
+              enabled: true,
+              liquidationDirective,
+            });
+          }
+        }
+      } else if (requestedKillSwitch === false && requestedKillSwitch !== lastKillSwitch) {
+        const killSwitchResult = await trader.setKillSwitch(false, "ai_settings_control");
         if (killSwitchResult.ok) {
-          lastKillSwitch = aiRuntimeForExecution.controls.killSwitch;
+          pendingKillSwitchApply = false;
+          lastKillSwitch = false;
           logger.warn("kill switch updated from ai settings", {
-            enabled: aiRuntimeForExecution.controls.killSwitch,
+            enabled: false,
           });
         }
       }
@@ -964,29 +992,36 @@ export async function runExecutionService({
           maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
         });
       }
+
+      const dedupedSymbolsToRun = Array.from(new Set(symbolsToRun));
+      if (dedupedSymbolsToRun.length !== symbolsToRun.length) {
+        logger.warn("execution symbols deduplicated for safety", {
+          window: windows,
+          source: aiRuntimeForExecution.source,
+          symbolsToRun,
+          dedupedSymbolsToRun,
+        });
+      }
       const configuredMaxOrderAttemptsPerWindow = asPositiveInt(
         effective.maxOrderAttemptsPerWindow,
         runtimeConfig.execution.maxOrderAttemptsPerWindow,
       );
 
-      const perSymbolResults = await Promise.all(
-        symbolsToRun.map(async (targetSymbol) => {
-          const executionPolicy = resolveDecisionForSymbol(aiRuntimeForExecution.decision, targetSymbol);
-          const result = await trader.runStrategyRealtime({
-            symbol: targetSymbol,
-            amount: effective.orderAmountKrw,
-            durationSec: effective.windowSec,
-            cooldownSec: effective.cooldownSec,
-            dryRun: executionDryRun,
-            executionPolicy,
-            maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
-          });
-          return {
-            symbol: targetSymbol,
-            result,
-          };
-        }),
-      );
+      const perSymbolResults = [];
+      for (const targetSymbol of dedupedSymbolsToRun) {
+        const executionPolicy = resolveDecisionForSymbol(aiRuntimeForExecution.decision, targetSymbol);
+        // Run symbols sequentially to avoid shared-state cross contamination and duplicate submissions.
+        const result = await trader.runStrategyRealtime({
+          symbol: targetSymbol,
+          amount: effective.orderAmountKrw,
+          durationSec: effective.windowSec,
+          cooldownSec: effective.cooldownSec,
+          dryRun: executionDryRun,
+          executionPolicy,
+          maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
+        });
+        perSymbolResults.push({ symbol: targetSymbol, result });
+      }
 
       const aggregated = aggregateWindowResults(perSymbolResults);
       const kpiUntilMs = Date.now();
@@ -1039,8 +1074,8 @@ export async function runExecutionService({
         window: windows,
         source: aiRuntimeForExecution.source,
         mode: executionDryRun ? "dry_run" : "live",
-        symbols: symbolsToRun,
-        symbolCount: symbolsToRun.length,
+        symbols: dedupedSymbolsToRun,
+        symbolCount: dedupedSymbolsToRun.length,
         maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
         maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
         amountKrw: effective.orderAmountKrw,
@@ -1065,6 +1100,7 @@ export async function runExecutionService({
             wins: safeExecutionKpiRealized.wins || 0,
             losses: safeExecutionKpiRealized.losses || 0,
             breakEven: safeExecutionKpiRealized.breakEven || 0,
+            unmatchedSellCount: safeExecutionKpiRealized.unmatchedSellCount || 0,
             winRatePct: roundNum(safeExecutionKpiRealized.winRatePct, 4),
             expectancyKrw: roundNum(safeExecutionKpiRealized.expectancyKrw, 2),
             realizedPnlKrw: roundNum(safeExecutionKpiRealized.realizedPnlKrw, 2),
@@ -1079,7 +1115,7 @@ export async function runExecutionService({
         sampledAtMs: kpiUntilMs,
         window: windows,
         source: aiRuntimeForExecution.source,
-        symbolCount: symbolsToRun.length,
+        symbolCount: dedupedSymbolsToRun.length,
         fills: {
             count: safeExecutionKpiFills.count || 0,
             buyCount: safeExecutionKpiFills.buyCount || 0,
@@ -1095,6 +1131,7 @@ export async function runExecutionService({
             wins: safeExecutionKpiRealized.wins || 0,
             losses: safeExecutionKpiRealized.losses || 0,
             breakEven: safeExecutionKpiRealized.breakEven || 0,
+            unmatchedSellCount: safeExecutionKpiRealized.unmatchedSellCount || 0,
             realizedPnlKrw: safeExecutionKpiRealized.realizedPnlKrw || 0,
             expectancyKrw: safeExecutionKpiRealized.expectancyKrw || 0,
           },
@@ -1182,7 +1219,7 @@ export async function runExecutionService({
         logger.error("execution kpi guard stop triggered", {
           window: windows,
           source: aiRuntimeForExecution.source,
-          symbol: symbolsToRun,
+          symbol: dedupedSymbolsToRun,
           kpiGuard,
         });
         if (typeof trader.setKillSwitch === "function") {
