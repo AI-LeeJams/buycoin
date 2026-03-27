@@ -250,8 +250,8 @@ test("strategy sell uses available position amount when sell-all exit is enabled
   assert.equal(exchange.placeCalls.length, 1);
   assert.equal(exchange.placeCalls[0].side, "sell");
   assert.equal(exchange.placeCalls[0].type, "market");
-  assert.equal(exchange.placeCalls[0].qty, 250);
-  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 20000);
+  assert.equal(exchange.placeCalls[0].qty, 125);
+  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 10000);
 });
 
 test("stream ticker collects realtime ticks from websocket client", async () => {
@@ -352,7 +352,7 @@ test("strategy realtime can execute policy override decision without signal trig
   assert.equal(result.data.attemptedOrders, 1);
   assert.equal(exchange.placeCalls.length, 1);
   assert.equal(exchange.placeCalls[0].side, "buy");
-  assert.equal(exchange.placeCalls[0].amountKrw, 20000);
+  assert.equal(exchange.placeCalls[0].amountKrw, 10000);
   assert.equal(result.data.decisions[0].actionSource, "policy_override");
 });
 

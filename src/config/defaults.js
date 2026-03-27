@@ -135,15 +135,7 @@ export function fromBithumbMarket(market) {
 export function loadConfig(env = process.env) {
   const defaultSymbol = normalizeSymbol(env.STRATEGY_SYMBOL || env.TRADER_DEFAULT_SYMBOL || "BTC_KRW");
   const optimizerDefaultSymbols = Array.from(new Set([defaultSymbol, "ETH_KRW", "USDT_KRW"]));
-  const universeDefaultIncludes = Array.from(new Set([
-    "BTC_KRW",
-    "ETH_KRW",
-    "XRP_KRW",
-    "SOL_KRW",
-    "DOGE_KRW",
-    "USDT_KRW",
-    defaultSymbol,
-  ]));
+  const universeDefaultIncludes = [];
 
   return {
     runtime: {
@@ -196,7 +188,7 @@ export function loadConfig(env = process.env) {
       name: String(env.STRATEGY_NAME || "risk_managed_momentum").toLowerCase(),
       defaultSymbol,
       candleInterval: String(env.STRATEGY_CANDLE_INTERVAL || "15m").toLowerCase(),
-      candleCount: toPositiveInt(env.STRATEGY_CANDLE_COUNT, 120),
+      candleCount: toPositiveInt(env.STRATEGY_CANDLE_COUNT, 180),
       breakoutLookback: toPositiveInt(env.STRATEGY_BREAKOUT_LOOKBACK, 20),
       breakoutBufferBps: toNonNegativeNumber(env.STRATEGY_BREAKOUT_BUFFER_BPS, 5),
       momentumLookback: toPositiveInt(env.STRATEGY_MOMENTUM_LOOKBACK, 24),
@@ -212,7 +204,7 @@ export function loadConfig(env = process.env) {
       autoSellEnabled: toBoolean(env.STRATEGY_AUTO_SELL_ENABLED, true),
       sellAllOnExit: toBoolean(env.STRATEGY_SELL_ALL_ON_EXIT, true),
       sellAllQtyPrecision: toPositiveInt(env.STRATEGY_SELL_ALL_QTY_PRECISION, 8),
-      baseOrderAmountKrw: toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 20_000),
+      baseOrderAmountKrw: toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 12_000),
       rebound: {
         enabled: toBoolean(env.REBOUND_ENABLED, true),
         dropLookback: toPositiveInt(env.REBOUND_DROP_LOOKBACK, 8),
@@ -239,7 +231,7 @@ export function loadConfig(env = process.env) {
       reoptIntervalSec: toPositiveInt(env.OPTIMIZER_REOPT_INTERVAL_SEC, 3600),
       reportFile: env.OPTIMIZER_REPORT_FILE || path.join(process.cwd(), ".trader", "optimizer-report.json"),
       symbols: toCsvSymbols(env.OPTIMIZER_SYMBOLS, optimizerDefaultSymbols),
-      maxLiveSymbols: toPositiveInt(env.OPTIMIZER_MAX_LIVE_SYMBOLS, 1),
+      maxLiveSymbols: toPositiveInt(env.OPTIMIZER_MAX_LIVE_SYMBOLS, 2),
       minHistoryCandles: toPositiveInt(
         env.OPTIMIZER_MIN_HISTORY_CANDLES,
         toPositiveInt(env.OPTIMIZER_CANDLE_COUNT, 200),
@@ -255,15 +247,15 @@ export function loadConfig(env = process.env) {
       candleCount: toPositiveInt(env.OPTIMIZER_CANDLE_COUNT, 200),
       initialCashKrw: toPositiveNumber(
         env.OPTIMIZER_INITIAL_CASH_KRW,
-        1_000_000,
+        100_000,
       ),
       baseOrderAmountKrw: toPositiveNumber(
         env.OPTIMIZER_BASE_ORDER_AMOUNT_KRW,
-        toPositiveNumber(env.EXECUTION_ORDER_AMOUNT_KRW, 20_000),
+        toPositiveNumber(env.EXECUTION_ORDER_AMOUNT_KRW, 12_000),
       ),
       minOrderNotionalKrw: toPositiveNumber(
         env.OPTIMIZER_MIN_ORDER_NOTIONAL_KRW,
-        toPositiveNumber(env.RISK_MIN_ORDER_NOTIONAL_KRW, 20_000),
+        toPositiveNumber(env.RISK_MIN_ORDER_NOTIONAL_KRW, 10_000),
       ),
       feeBps: toPositiveNumber(env.OPTIMIZER_FEE_BPS, 5),
       backtestSlippageBps: toPositiveNumber(env.OPTIMIZER_BACKTEST_SLIPPAGE_BPS, 0),
@@ -298,12 +290,12 @@ export function loadConfig(env = process.env) {
       rmMaxMultiplierCandidates: toCsvPositiveNumbers(env.OPTIMIZER_RM_MAX_MULTIPLIER, [1.6, 1.8]),
     },
     risk: {
-      minOrderNotionalKrw: toPositiveNumber(env.RISK_MIN_ORDER_NOTIONAL_KRW, 20_000),
-      maxOrderNotionalKrw: toPositiveNumber(env.RISK_MAX_ORDER_NOTIONAL_KRW, 300_000),
-      maxOpenOrders: toPositiveInt(env.RISK_MAX_OPEN_ORDERS, 5),
+      minOrderNotionalKrw: toPositiveNumber(env.RISK_MIN_ORDER_NOTIONAL_KRW, 10_000),
+      maxOrderNotionalKrw: toPositiveNumber(env.RISK_MAX_ORDER_NOTIONAL_KRW, 18_000),
+      maxOpenOrders: toPositiveInt(env.RISK_MAX_OPEN_ORDERS, 2),
       maxOpenOrdersPerSymbol: toPositiveInt(env.RISK_MAX_OPEN_ORDERS_PER_SYMBOL, 1),
-      maxExposureKrw: toPositiveNumber(env.RISK_MAX_EXPOSURE_KRW, 2_000_000),
-      maxDailyLossKrw: toPositiveNumber(env.RISK_MAX_DAILY_LOSS_KRW, 500_000),
+      maxExposureKrw: toPositiveNumber(env.RISK_MAX_EXPOSURE_KRW, 65_000),
+      maxDailyLossKrw: toPositiveNumber(env.RISK_MAX_DAILY_LOSS_KRW, 10_000),
       maxHoldingLossPct: toNumber(env.RISK_MAX_HOLDING_LOSS_PCT, 4.8),
       maxHoldingTakeProfitPct: toNumber(env.RISK_MAX_HOLDING_TAKE_PROFIT_PCT, 2.2),
       trailingStopPct: toPositiveNumber(env.RISK_TRAILING_STOP_PCT, 1.2),
@@ -347,9 +339,9 @@ export function loadConfig(env = process.env) {
     marketUniverse: {
       enabled: toBoolean(env.MARKET_UNIVERSE_ENABLED, true),
       quote: String(env.MARKET_UNIVERSE_QUOTE || "KRW").trim().toUpperCase(),
-      minAccTradeValue24hKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_ACC_TRADE_VALUE_24H_KRW, 20_000_000_000),
+      minAccTradeValue24hKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_ACC_TRADE_VALUE_24H_KRW, 3_500_000_000),
       minPriceKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_PRICE_KRW, 1),
-      maxSymbols: toPositiveInt(env.MARKET_UNIVERSE_MAX_SYMBOLS, 20),
+      maxSymbols: toPositiveInt(env.MARKET_UNIVERSE_MAX_SYMBOLS, 80),
       includeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_INCLUDE_SYMBOLS, universeDefaultIncludes),
       excludeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_EXCLUDE_SYMBOLS, []),
       minBaseAssetLength: toPositiveInt(env.MARKET_UNIVERSE_MIN_BASE_ASSET_LENGTH, 2),
@@ -367,11 +359,11 @@ export function loadConfig(env = process.env) {
       ),
       orderAmountKrw: toPositiveNumber(
         env.EXECUTION_ORDER_AMOUNT_KRW,
-        toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 20_000),
+        toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 12_000),
       ),
       windowSec: toPositiveInt(env.EXECUTION_WINDOW_SEC, 300),
       cooldownSec: toPositiveInt(env.EXECUTION_COOLDOWN_SEC, 30),
-      maxSymbolsPerWindow: toPositiveInt(env.EXECUTION_MAX_SYMBOLS_PER_WINDOW, 1),
+      maxSymbolsPerWindow: toPositiveInt(env.EXECUTION_MAX_SYMBOLS_PER_WINDOW, 2),
       maxOrderAttemptsPerWindow: toPositiveInt(env.EXECUTION_MAX_ORDER_ATTEMPTS_PER_WINDOW, 1),
       dryRun: toBoolean(env.EXECUTION_DRY_RUN, false),
       kpiGuardEnabled: toBoolean(env.EXECUTION_KPI_GUARD_ENABLED, true),

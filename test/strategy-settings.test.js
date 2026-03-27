@@ -71,7 +71,7 @@ test("strategy settings source reads execution overrides and mean reversion stra
 
   assert.equal(result.execution.symbol, "USDT_KRW");
   assert.deepEqual(result.execution.symbols, ["USDT_KRW", "ETH_KRW"]);
-  assert.equal(result.execution.orderAmountKrw, 20000);
+  assert.equal(result.execution.orderAmountKrw, 10000);
   assert.equal(result.execution.windowSec, 120);
   assert.equal(result.execution.cooldownSec, 15);
   assert.equal(result.strategy.name, "mean_reversion");

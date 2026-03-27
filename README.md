@@ -33,9 +33,9 @@
 - 시장 유니버스: `.trader/market-universe.json` 기반 필터 적용
 
 현재 기본 운용 프로파일(품질 우선):
-- live symbols: 기본 1심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=1`) 보수 운용
+- live symbols: 기본 2심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=2`) 보수 운용
 - 탐색 유니버스: `MARKET_UNIVERSE_MAX_SYMBOLS`를 넓게 두고, 신규 코인은 `OPTIMIZER_MIN_HISTORY_CANDLES`로 차단
-- `maxSymbolsPerWindow`: 1~3
+- `maxSymbolsPerWindow`: 기본 2
 - `maxOrderAttemptsPerWindow`: 1~2
 - `orderAmountKrw`: 동적(현금 기준) 또는 20,000 고정
 
@@ -128,7 +128,8 @@ pm2 status
 
 - Node.js 20+
 - Bithumb API Key/Secret
-- `.env` 설정 필수 (`BITHUMB_*`, `TRADER_*`, `RISK_*`, `OPTIMIZER_*`, `STRATEGY_*` 등)
+- `.env`는 최소 운영값만 두는 것을 권장 (`BITHUMB_ACCESS_KEY`, `BITHUMB_SECRET_KEY`, `TZ`, `TRADER_INITIAL_CAPITAL_KRW`)
+- 매매 튜닝 대부분은 코드 기본값과 optimizer가 담당
 
 ---
 

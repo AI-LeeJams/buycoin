@@ -20,11 +20,12 @@ npm install
 ```
 
 `.env.example`를 기준으로 `.env`를 설정하세요.
+기본 운영은 최소값만 `.env`에 두고, 매매 튜닝은 코드 기본값과 optimizer에 맡기는 구성을 권장합니다.
 
 ## 실행
 
 - 실행형 서비스: `npm start`
-- 기본 unattended 운용은 단일 live 심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=1`) 기준입니다.
+- 기본 unattended 운용은 2개 live 심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=2`) 기준입니다.
 - 실행 중 유동성/품질 필터를 통과한 종목 목록이 `.trader/market-universe.json`에 저장됩니다.
 
 ## 전략 설정 연동(자동매매 설정 입력점)

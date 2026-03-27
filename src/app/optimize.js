@@ -384,9 +384,20 @@ async function applyBestToStrategySettings(runtimeConfig, optimization, logger) 
 async function fetchCandlesBySymbol(config, logger, symbols) {
   const client = new BithumbClient(config, logger);
   const marketData = new MarketDataService(config, client);
+  const requestedCandleCount = Math.max(1, Number(config.optimizer?.candleCount || 200));
+  const fetchCandleCount = Math.min(200, requestedCandleCount);
+  if (fetchCandleCount !== requestedCandleCount) {
+    logger.warn("optimizer candle count capped to exchange limit", {
+      requestedCandleCount,
+      fetchCandleCount,
+    });
+  }
   const minHistoryCandles = Math.max(
     30,
-    Number(config.optimizer?.minHistoryCandles || config.optimizer?.candleCount || 200),
+    Math.min(
+      fetchCandleCount,
+      Number(config.optimizer?.minHistoryCandles || config.optimizer?.candleCount || 200),
+    ),
   );
 
   const candlesBySymbol = {};
@@ -397,7 +408,7 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
       const response = await marketData.getCandles({
         symbol,
         interval: config.optimizer.interval,
-        count: config.optimizer.candleCount,
+        count: fetchCandleCount,
       });
       const candles = Array.isArray(response.candles) ? response.candles : [];
       if (candles.length < minHistoryCandles) {
