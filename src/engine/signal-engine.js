@@ -25,6 +25,13 @@ function stddev(values = []) {
   return Math.sqrt(Math.max(0, variance));
 }
 
+function mean(values = []) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return 0;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
 function normalizeCandles(candles = []) {
   if (!Array.isArray(candles)) {
     return [];
@@ -205,10 +212,132 @@ export class RiskManagedMomentumSignalEngine {
   }
 }
 
+export class MeanReversionSignalEngine {
+  constructor(config) {
+    this.lookback = Math.max(
+      5,
+      Number(
+        config?.strategy?.meanLookback
+        ?? config?.strategy?.meanReversionLookback
+        ?? 20,
+      ),
+    );
+    this.entryDeviationBps = Math.max(
+      0,
+      Number(
+        config?.strategy?.meanEntryBps
+        ?? config?.strategy?.meanReversionEntryBps
+        ?? 80,
+      ),
+    );
+    this.exitDeviationBps = Math.max(
+      0,
+      Number(
+        config?.strategy?.meanExitBps
+        ?? config?.strategy?.meanReversionExitBps
+        ?? 24,
+      ),
+    );
+  }
+
+  evaluate(candles = []) {
+    const rows = normalizeCandles(candles);
+    const required = this.lookback + 1;
+    if (rows.length < required) {
+      return {
+        action: "HOLD",
+        reason: "insufficient_candles",
+        metrics: {
+          required,
+          received: rows.length,
+        },
+      };
+    }
+
+    const closes = rows.map((row) => row.close);
+    const currentClose = closes.at(-1);
+    const history = closes.slice(-(this.lookback + 1), -1);
+    const meanPrice = mean(history);
+    if (!Number.isFinite(currentClose) || !Number.isFinite(meanPrice) || meanPrice <= 0) {
+      return {
+        action: "HOLD",
+        reason: "invalid_prices",
+        metrics: {
+          currentClose,
+          meanPrice,
+        },
+      };
+    }
+
+    const deviation = currentClose / meanPrice - 1;
+    const returns = [];
+    for (let i = 1; i < history.length; i += 1) {
+      const prev = history[i - 1];
+      const curr = history[i];
+      if (Number.isFinite(prev) && prev > 0 && Number.isFinite(curr) && curr > 0) {
+        returns.push(curr / prev - 1);
+      }
+    }
+
+    const entryThreshold = this.entryDeviationBps / 10_000;
+    const exitThreshold = this.exitDeviationBps / 10_000;
+    const volatilityPct = stddev(returns) * 100;
+
+    if (deviation <= -entryThreshold) {
+      return {
+        action: "BUY",
+        reason: "mean_reversion_buy",
+        metrics: {
+          currentClose,
+          meanPrice,
+          deviationBps: deviation * 10_000,
+          lookback: this.lookback,
+          entryDeviationBps: this.entryDeviationBps,
+          exitDeviationBps: this.exitDeviationBps,
+          volatilityPct,
+        },
+      };
+    }
+
+    if (deviation >= exitThreshold) {
+      return {
+        action: "SELL",
+        reason: "mean_reversion_sell",
+        metrics: {
+          currentClose,
+          meanPrice,
+          deviationBps: deviation * 10_000,
+          lookback: this.lookback,
+          entryDeviationBps: this.entryDeviationBps,
+          exitDeviationBps: this.exitDeviationBps,
+          volatilityPct,
+        },
+      };
+    }
+
+    return {
+      action: "HOLD",
+      reason: "mean_reversion_hold",
+      metrics: {
+        currentClose,
+        meanPrice,
+        deviationBps: deviation * 10_000,
+        lookback: this.lookback,
+        entryDeviationBps: this.entryDeviationBps,
+        exitDeviationBps: this.exitDeviationBps,
+        volatilityPct,
+      },
+    };
+  }
+}
+
 export function createSignalEngine(config) {
   const strategyName = String(config?.strategy?.name || "risk_managed_momentum").trim().toLowerCase();
   if (strategyName === "breakout") {
     return new BreakoutSignalEngine(config);
+  }
+  if (strategyName === "mean_reversion") {
+    return new MeanReversionSignalEngine(config);
   }
   return new RiskManagedMomentumSignalEngine(config);
 }

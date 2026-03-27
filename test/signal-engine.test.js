@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BreakoutSignalEngine, RiskManagedMomentumSignalEngine } from "../src/engine/signal-engine.js";
+import { BreakoutSignalEngine, MeanReversionSignalEngine, RiskManagedMomentumSignalEngine } from "../src/engine/signal-engine.js";
 
 const config = {
   strategy: {
@@ -57,4 +57,28 @@ test("risk-managed momentum returns BUY and risk multiplier in uptrend", () => {
   assert.equal(signal.reason, "momentum_up");
   assert.equal(Number.isFinite(signal.metrics.riskMultiplier), true);
   assert.equal(signal.metrics.riskMultiplier > 0, true);
+});
+
+test("mean reversion returns BUY when price is stretched below its mean", () => {
+  const engine = new MeanReversionSignalEngine({
+    strategy: {
+      meanLookback: 5,
+      meanEntryBps: 50,
+      meanExitBps: 20,
+    },
+  });
+
+  const candles = [
+    { timestamp: 1, high: 100, low: 100, close: 100 },
+    { timestamp: 2, high: 101, low: 99, close: 101 },
+    { timestamp: 3, high: 100, low: 98, close: 99 },
+    { timestamp: 4, high: 101, low: 99, close: 100 },
+    { timestamp: 5, high: 100, low: 99, close: 100 },
+    { timestamp: 6, high: 95, low: 94, close: 94 },
+  ];
+
+  const signal = engine.evaluate(candles);
+  assert.equal(signal.action, "BUY");
+  assert.equal(signal.reason, "mean_reversion_buy");
+  assert.equal(Number.isFinite(signal.metrics.deviationBps), true);
 });

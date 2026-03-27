@@ -10,7 +10,8 @@ import { TradingSystem } from "../core/trading-system.js";
 import { BithumbClient } from "../exchange/bithumb-client.js";
 import { HttpAuditLog } from "../lib/http-audit-log.js";
 import { logger } from "../lib/output.js";
-import { AiSettingsSource } from "./ai-settings.js";
+import { optimizeAndApplyBest } from "./optimize.js";
+import { StrategySettingsSource } from "./strategy-settings.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -140,68 +141,8 @@ function normalizeSymbolList(symbols, fallbackSymbol = "BTC_KRW") {
   return [normalizeSymbol(fallbackSymbol)];
 }
 
-function isOptimizerApprovedAiRuntime(aiRuntime = {}, requireOptimizerApproval = false) {
-  if (!requireOptimizerApproval) {
-    return true;
-  }
-  const meta = aiRuntime?.meta;
-  return meta
-    && meta.source === "optimizer"
-    && typeof meta.approvedBy === "string"
-    && meta.approvedBy.length > 0
-    && Number.isFinite(Number(meta.approvedAt))
-    && Number(meta.approvedAt) > 0;
-}
-
-function getRuntimeApprovalState(aiRuntime = {}, requireOptimizerApproval = false) {
-  return {
-    require: Boolean(requireOptimizerApproval),
-    approved: isOptimizerApprovedAiRuntime(aiRuntime, requireOptimizerApproval),
-  };
-}
-
-function resolveDecisionForSymbol(decision, symbol) {
-  if (!decision || typeof decision !== "object") {
-    return null;
-  }
-
-  const base = {
-    mode: decision.mode,
-    allowBuy: decision.allowBuy,
-    allowSell: decision.allowSell,
-    forceAction: decision.forceAction,
-    forceAmountKrw: decision.forceAmountKrw,
-    forceOnce: decision.forceOnce,
-    note: decision.note,
-  };
-
-  const normalizedSymbol = normalizeSymbol(symbol);
-  const perSymbol = decision.symbols && typeof decision.symbols === "object"
-    ? decision.symbols[normalizedSymbol]
-    : null;
-
-  if (!perSymbol || typeof perSymbol !== "object") {
-    return base;
-  }
-
-  return {
-    ...base,
-    ...perSymbol,
-  };
-}
-
-function isLiquidationDirective(decision = {}) {
-  if (!decision || typeof decision !== "object") {
-    return false;
-  }
-  return decision.mode === "override"
-    && String(decision.forceAction || "").toUpperCase() === "SELL"
-    && decision.allowBuy === false
-    && decision.allowSell === true;
-}
-
-function normalizeAiRefreshRange(aiConfig = {}) {
-  const fixedRaw = Number(aiConfig?.refreshFixedSec);
+function normalizeStrategySettingsRefreshRange(strategyConfig = {}) {
+  const fixedRaw = Number(strategyConfig?.refreshFixedSec);
   const fixedSec = Number.isFinite(fixedRaw) && fixedRaw > 0 ? Math.floor(fixedRaw) : 0;
   if (fixedSec > 0) {
     return {
@@ -210,8 +151,8 @@ function normalizeAiRefreshRange(aiConfig = {}) {
     };
   }
 
-  const minRaw = Number(aiConfig?.refreshMinSec);
-  const maxRaw = Number(aiConfig?.refreshMaxSec);
+  const minRaw = Number(strategyConfig?.refreshMinSec);
+  const maxRaw = Number(strategyConfig?.refreshMaxSec);
   const minSec = Number.isFinite(minRaw) && minRaw > 0 ? Math.floor(minRaw) : 1_800;
   const maxSec = Number.isFinite(maxRaw) && maxRaw > 0 ? Math.floor(maxRaw) : 3_600;
   return {
@@ -220,7 +161,7 @@ function normalizeAiRefreshRange(aiConfig = {}) {
   };
 }
 
-function nextAiRefreshDelay(range) {
+function nextStrategyRefreshDelay(range) {
   if (!range || range.maxSec <= range.minSec) {
     return {
       sec: range?.minSec || 1_800,
@@ -517,14 +458,88 @@ async function ensureLiveAccountPreflight(trader) {
     });
   }
 
+function isUsableStrategyRuntime(snapshot) {
+  return snapshot?.source === "strategy_settings_file";
+}
+
+function strategyRuntimeHash(snapshot) {
+  if (!isUsableStrategyRuntime(snapshot)) {
+    return null;
+  }
+  return JSON.stringify({
+    execution: snapshot.execution || null,
+    strategy: snapshot.strategy || null,
+    controls: snapshot.controls || null,
+    meta: snapshot.meta || null,
+  });
+}
+
+function nextReoptDelayMs(runtimeConfig = {}) {
+  const sec = asPositiveInt(runtimeConfig.optimizer?.reoptIntervalSec, 0);
+  if (!Number.isFinite(sec) || sec <= 0) {
+    return 0;
+  }
+  return sec * 1_000;
+}
+
+async function runOptimizerPass({
+  runtimeConfig,
+  logger: activeLogger,
+  marketUniverse,
+  optimizeFn,
+  reason,
+}) {
+  if (!runtimeConfig.optimizer?.enabled) {
+    return {
+      ok: false,
+      skipped: "optimizer_disabled",
+    };
+  }
+
+  if (marketUniverse?.enabled && typeof marketUniverse.maybeRefresh === "function") {
+    const refresh = await marketUniverse.maybeRefresh({ force: true, reason: `optimizer_${reason}` });
+    if (!refresh.ok) {
+      activeLogger.warn("market universe refresh before optimize failed", {
+        reason,
+        error: refresh.error?.message || "unknown",
+      });
+    }
+  }
+
+  const result = await optimizeFn({
+    config: runtimeConfig,
+    logger: activeLogger,
+    apply: runtimeConfig.optimizer.applyToStrategySettings !== false,
+  });
+
+  if (result.ok) {
+    activeLogger.info("optimizer pass completed", {
+      reason,
+      applied: result.data?.applied === true,
+      symbol: result.data?.best?.symbol || null,
+      selectedSymbols: result.data?.selectedSymbols || [],
+      strategy: result.data?.best?.strategy?.name || null,
+    });
+  } else {
+    activeLogger.warn("optimizer pass failed", {
+      reason,
+      error: result.error?.message || "unknown",
+      details: result.error?.details || null,
+    });
+  }
+
+  return result;
+}
+
 export async function runExecutionService({
   system = null,
   config = null,
   stopAfterWindows = 0,
   marketUniverseService = null,
+  optimizeFn = optimizeAndApplyBest,
 } = {}) {
   const runtimeConfig = config || loadConfig(process.env);
-  const aiRefreshRange = normalizeAiRefreshRange(runtimeConfig.ai);
+  const strategySettingsRefreshRange = normalizeStrategySettingsRefreshRange(runtimeConfig.strategySettings || {});
   const logOnlyOnActivity = runtimeConfig.execution?.logOnlyOnActivity !== false;
   const executionDryRun = Boolean(runtimeConfig.execution?.dryRun === true);
   const heartbeatWindowsRaw = Number(runtimeConfig.execution?.heartbeatWindows);
@@ -539,6 +554,15 @@ export async function runExecutionService({
     1,
   );
   const kpiMonitorSummaryMaxEntries = asPositiveInt(runtimeConfig.execution?.kpiMonitorSummaryMaxEntries, 720);
+  const strategyApplyCooldownMs = Math.max(
+    0,
+    asPositiveInt(runtimeConfig.strategySettings?.applyCooldownSec, 0) * 1_000,
+  );
+  const allowKillSwitchReset = runtimeConfig.strategySettings?.allowKillSwitchReset === true;
+  const runtimeOptimizerEnabled = !system && runtimeConfig.optimizer?.enabled === true;
+  const optimizerApplyOnStart = runtimeOptimizerEnabled && runtimeConfig.optimizer?.applyOnStart !== false;
+  const optimizerReoptEnabled = runtimeOptimizerEnabled && runtimeConfig.optimizer?.reoptEnabled === true;
+  const reoptDelayMs = nextReoptDelayMs(runtimeConfig);
   const kpiMonitorConfig = {
     alertWinRatePct: asNumber(runtimeConfig.execution?.kpiMonitorAlertWinRatePct, null),
     alertExpectancyKrw: asNumber(runtimeConfig.execution?.kpiMonitorAlertExpectancyKrw, null),
@@ -567,12 +591,12 @@ export async function runExecutionService({
       onRequestEvent: auditLog ? (event) => auditLog.write(event) : null,
     }),
   });
-  const aiSettings = new AiSettingsSource(runtimeConfig, logger);
+  const strategySettings = new StrategySettingsSource(runtimeConfig, logger);
   const marketUniverse = marketUniverseService || new CuratedMarketUniverse(runtimeConfig, logger, trader.marketData);
 
   try {
     await trader.init();
-    await aiSettings.init();
+    await strategySettings.init();
     await marketUniverse.init();
     if (!system && !executionDryRun) {
       ensureLiveCredentials(runtimeConfig);
@@ -613,10 +637,10 @@ export async function runExecutionService({
       cooldownSec: runtimeConfig.execution.cooldownSec,
       maxSymbolsPerWindow: runtimeConfig.execution.maxSymbolsPerWindow,
       maxOrderAttemptsPerWindow: runtimeConfig.execution.maxOrderAttemptsPerWindow,
-      aiSettingsEnabled: aiSettings.enabled,
-      aiSettingsFile: aiSettings.settingsFile,
-      aiSettingsRefreshMinSec: aiRefreshRange.minSec,
-      aiSettingsRefreshMaxSec: aiRefreshRange.maxSec,
+      strategySettingsEnabled: strategySettings.enabled,
+      strategySettingsFile: strategySettings.settingsFile,
+      strategySettingsRefreshMinSec: strategySettingsRefreshRange.minSec,
+      strategySettingsRefreshMaxSec: strategySettingsRefreshRange.maxSec,
       marketUniverseEnabled: marketUniverse.enabled,
       marketUniverseQuote: runtimeConfig.marketUniverse?.quote || null,
       marketUniverseFile: runtimeConfig.marketUniverse?.snapshotFile || null,
@@ -624,6 +648,11 @@ export async function runExecutionService({
       httpAuditFile: runtimeConfig.runtime.httpAuditFile,
       logOnlyOnActivity,
       heartbeatWindows,
+      strategyApplyCooldownMs,
+      allowKillSwitchReset,
+      optimizerApplyOnStart,
+      optimizerReoptEnabled,
+      reoptDelayMs,
       kpiMonitorWindowSec,
       kpiReportFile,
       kpiReportSummaryFile,
@@ -631,43 +660,23 @@ export async function runExecutionService({
     });
 
     let windows = 0;
-    let aiRuntime = await aiSettings.read();
-    const requireOptimizerApproval = Boolean(runtimeConfig.ai?.applyOnlyAfterOptimize);
-    const startupApproval = getRuntimeApprovalState(aiRuntime, requireOptimizerApproval);
-    if (!startupApproval.approved) {
-      logger.warn("execution startup uses pending ai snapshot because optimizer approval is required", {
-        source: aiRuntime.source,
-        meta: aiRuntime.meta || null,
-      });
-    }
-    let aiRuntimeForExecution = startupApproval.approved
-      ? aiRuntime
-      : aiSettings.defaultSnapshot("runtime_pending_skipped");
-    let aiRefresh = nextAiRefreshDelay(aiRefreshRange);
-    let nextAiRefreshAt = Date.now() + aiRefresh.ms;
+    let strategyRuntime = await strategySettings.read();
+    let strategyRuntimeForExecution = strategyRuntime;
+    let strategyRefresh = nextStrategyRefreshDelay(strategySettingsRefreshRange);
+    let nextStrategyRefreshAt = Date.now() + strategyRefresh.ms;
+    let nextReoptAt = optimizerReoptEnabled && reoptDelayMs > 0 ? Date.now() + reoptDelayMs : 0;
     let streamFailureStreak = 0;
     let lastRuntimeKillSwitch = null;
     let kpiSinceMs = Date.now();
-    const aiApplyCooldownMs = Math.max(
-      0,
-      Math.floor(asPositiveInt(runtimeConfig.ai?.applyCooldownSec, 0) * 1_000),
-    );
     const kpiGuardMaxConsecutiveViolations = asNonNegativeInt(
       runtimeConfig.execution?.kpiGuardMaxConsecutiveViolations,
       0,
     );
     let kpiGuardViolationStreak = 0;
-    let lastAiExecutionApplyAt = 0;
-
-    if (aiSettings.enabled) {
-      logger.info("ai settings snapshot loaded", {
-        source: aiRuntimeForExecution.source,
-        nextRefreshSec: aiRefresh.sec,
-        applyCooldownMs: aiApplyCooldownMs,
-        requireOptimizerApproval: startupApproval.require,
-        kpiGuardMaxConsecutiveViolations,
-      });
-    }
+    let lastStrategyHash = null;
+    let lastKillSwitchHash = null;
+    let lastStrategyRuntimeHash = strategyRuntimeHash(strategyRuntimeForExecution);
+    let lastStrategyRuntimeAppliedAt = 0;
 
     const universeStartup = await marketUniverse.maybeRefresh({ force: true, reason: "startup" });
     if (universeStartup.ok && universeStartup.data) {
@@ -684,78 +693,81 @@ export async function runExecutionService({
       });
     }
 
-    let lastOverlayHash = null;
-    let lastKillSwitch = null;
-    let pendingKillSwitchApply = false;
-    let lastStrategyHash = null;
-    let lastDecisionHash = null;
+    if (
+      optimizerApplyOnStart
+      && runtimeConfig.optimizer?.enabled
+      && (strategySettings.enabled || !isUsableStrategyRuntime(strategyRuntimeForExecution))
+    ) {
+        await runOptimizerPass({
+          runtimeConfig,
+          logger,
+          marketUniverse,
+          optimizeFn,
+          reason: "startup",
+        });
+      strategyRuntime = await strategySettings.read();
+      strategyRuntimeForExecution = strategyRuntime;
+      lastStrategyRuntimeHash = strategyRuntimeHash(strategyRuntimeForExecution);
+      nextStrategyRefreshAt = Date.now() + strategyRefresh.ms;
+      nextReoptAt = optimizerReoptEnabled && reoptDelayMs > 0 ? Date.now() + reoptDelayMs : 0;
+    }
+
+    if (strategySettings.enabled) {
+      logger.info("strategy settings snapshot loaded", {
+        source: strategyRuntimeForExecution.source,
+        nextRefreshSec: strategyRefresh.sec,
+        kpiGuardMaxConsecutiveViolations,
+      });
+    }
+
+    if (!executionDryRun && strategySettings.enabled && !isUsableStrategyRuntime(strategyRuntimeForExecution)) {
+      throw new Error("No valid optimizer-generated strategy settings snapshot is available");
+    }
+
     let lastFilteredSymbolsHash = null;
-    let lastSkippedAiApprovalHash = null;
     while (!stopRequested) {
       windows += 1;
-      const nowMs = Date.now();
 
-      if (aiSettings.enabled && Date.now() >= nextAiRefreshAt) {
-        const nextAiRuntime = await aiSettings.read();
-        aiRefresh = nextAiRefreshDelay(aiRefreshRange);
-        nextAiRefreshAt = Date.now() + aiRefresh.ms;
-        if (nextAiRuntime.source === "read_error_fallback") {
-          logger.warn("ai settings snapshot refresh skipped: using previous valid runtime", {
-            previousSource: aiRuntime.source,
-            nextSource: nextAiRuntime.source,
+      if (optimizerReoptEnabled && nextReoptAt > 0 && Date.now() >= nextReoptAt) {
+        await runOptimizerPass({
+          runtimeConfig,
+          logger,
+          marketUniverse,
+          optimizeFn,
+          reason: "periodic",
+        });
+        nextReoptAt = Date.now() + reoptDelayMs;
+        nextStrategyRefreshAt = Date.now();
+      }
+
+      if (strategySettings.enabled && Date.now() >= nextStrategyRefreshAt) {
+        const nextStrategyRuntime = await strategySettings.read();
+        strategyRefresh = nextStrategyRefreshDelay(strategySettingsRefreshRange);
+        nextStrategyRefreshAt = Date.now() + strategyRefresh.ms;
+
+        const nextRuntimeHash = strategyRuntimeHash(nextStrategyRuntime);
+        const canApplyNow = strategyApplyCooldownMs <= 0
+          || lastStrategyRuntimeAppliedAt === 0
+          || Date.now() - lastStrategyRuntimeAppliedAt >= strategyApplyCooldownMs;
+
+        if (!isUsableStrategyRuntime(nextStrategyRuntime)) {
+          logger.warn("strategy settings snapshot refresh skipped: using previous valid runtime", {
+            previousSource: strategyRuntime.source,
+            nextSource: nextStrategyRuntime.source,
+          });
+        } else if (!canApplyNow && nextRuntimeHash !== lastStrategyRuntimeHash) {
+          logger.warn("strategy settings snapshot deferred by apply cooldown", {
+            source: nextStrategyRuntime.source,
+            applyCooldownMs: strategyApplyCooldownMs,
           });
         } else {
-          aiRuntime = nextAiRuntime;
-          const approval = getRuntimeApprovalState(nextAiRuntime, requireOptimizerApproval);
-          const canApplyAiExecution = aiApplyCooldownMs <= 0
-            || lastAiExecutionApplyAt === 0
-            || nowMs - lastAiExecutionApplyAt >= aiApplyCooldownMs;
-          const isApprovedRuntime = approval.approved;
-          const skipHash = JSON.stringify({
-            approved: isApprovedRuntime,
-            source: nextAiRuntime?.source || null,
-            meta: nextAiRuntime?.meta || null,
-          });
-
-          if (!isApprovedRuntime) {
-            if (lastSkippedAiApprovalHash !== skipHash) {
-              logger.warn("ai settings snapshot ignored: waiting for optimizer-approved file", {
-                source: nextAiRuntime.source,
-                meta: nextAiRuntime.meta || null,
-              });
-              lastSkippedAiApprovalHash = skipHash;
-            }
-          }
-
-          if (!canApplyAiExecution) {
-            logger.warn("ai execution settings update deferred by cooldown", {
-              source: aiRuntimeForExecution.source,
-              applyCooldownMs: aiApplyCooldownMs,
-              waitMs: Math.max(0, aiApplyCooldownMs - (nowMs - lastAiExecutionApplyAt)),
-            });
-          } else if (!isApprovedRuntime) {
-            logger.warn("ai settings snapshot not optimized yet; skipping apply", {
-              source: nextAiRuntime.source,
-              meta: nextAiRuntime.meta || null,
-            });
-          } else if (
-            JSON.stringify(aiRuntimeForExecution.execution) !== JSON.stringify(nextAiRuntime.execution)
-            || JSON.stringify(aiRuntimeForExecution.strategy) !== JSON.stringify(nextAiRuntime.strategy)
-            || JSON.stringify(aiRuntimeForExecution.overlay) !== JSON.stringify(nextAiRuntime.overlay)
-            || JSON.stringify(aiRuntimeForExecution.decision) !== JSON.stringify(nextAiRuntime.decision)
-            || JSON.stringify(aiRuntimeForExecution.controls) !== JSON.stringify(nextAiRuntime.controls)
-          ) {
-            aiRuntimeForExecution = nextAiRuntime;
-            lastAiExecutionApplyAt = nowMs;
-          }
-          if (isApprovedRuntime) {
-            lastSkippedAiApprovalHash = null;
-          }
-
-          logger.info("ai settings snapshot refreshed", {
-            source: aiRuntimeForExecution.source,
-            approved: approval.approved,
-            nextRefreshSec: aiRefresh.sec,
+          strategyRuntime = nextStrategyRuntime;
+          strategyRuntimeForExecution = nextStrategyRuntime;
+          lastStrategyRuntimeHash = nextRuntimeHash;
+          lastStrategyRuntimeAppliedAt = Date.now();
+          logger.info("strategy settings snapshot refreshed", {
+            source: strategyRuntimeForExecution.source,
+            nextRefreshSec: strategyRefresh.sec,
           });
         }
       }
@@ -775,25 +787,25 @@ export async function runExecutionService({
         });
       }
 
-      const effective = aiRuntimeForExecution.execution;
+      const effective = strategyRuntimeForExecution.execution;
 
-      if (aiSettings.enabled && aiRuntimeForExecution.strategy) {
-        const strategyHash = JSON.stringify(aiRuntimeForExecution.strategy);
+      if (strategyRuntimeForExecution.strategy) {
+        const strategyHash = JSON.stringify(strategyRuntimeForExecution.strategy);
         if (strategyHash !== lastStrategyHash && typeof trader.applyStrategySettings === "function") {
           const strategyResult = await trader.applyStrategySettings(
-            aiRuntimeForExecution.strategy,
-            aiRuntimeForExecution.source,
+            strategyRuntimeForExecution.strategy,
+            strategyRuntimeForExecution.source,
           );
           if (strategyResult.ok) {
-            logger.info("strategy updated from ai settings", {
-              source: aiRuntimeForExecution.source,
+            logger.info("strategy updated from strategy settings", {
+              source: strategyRuntimeForExecution.source,
               strategy: strategyResult.data.name,
               symbol: strategyResult.data.defaultSymbol,
             });
             lastStrategyHash = strategyHash;
           } else {
-            logger.warn("failed to apply strategy from ai settings", {
-              source: aiRuntimeForExecution.source,
+            logger.warn("failed to apply strategy from strategy settings", {
+              source: strategyRuntimeForExecution.source,
               code: strategyResult.code,
               error: strategyResult.error?.message,
             });
@@ -801,73 +813,41 @@ export async function runExecutionService({
         }
       }
 
-      if (aiRuntimeForExecution.overlay) {
-        const hash = JSON.stringify(aiRuntimeForExecution.overlay);
-        if (hash !== lastOverlayHash) {
-          const overlayResult = await trader.overlaySet(aiRuntimeForExecution.overlay);
-          if (!overlayResult.ok) {
-            logger.warn("failed to apply overlay from ai settings", {
-              code: overlayResult.code,
-              error: overlayResult.error?.message,
-            });
-          } else {
-            logger.info("overlay updated from ai settings", {
-              source: aiRuntimeForExecution.source,
-              multiplier: overlayResult.data.multiplier,
-              regime: overlayResult.data.regime,
-            });
-            lastOverlayHash = hash;
-          }
-        }
-      }
-
-      if (aiSettings.enabled && aiRuntimeForExecution.decision) {
-        const decisionHash = JSON.stringify(aiRuntimeForExecution.decision);
-        if (decisionHash !== lastDecisionHash) {
-          logger.info("decision policy updated from ai settings", {
-            source: aiRuntimeForExecution.source,
-            mode: aiRuntimeForExecution.decision.mode,
-            allowBuy: aiRuntimeForExecution.decision.allowBuy,
-            allowSell: aiRuntimeForExecution.decision.allowSell,
-            forceAction: aiRuntimeForExecution.decision.forceAction,
-            symbolOverrides: Object.keys(aiRuntimeForExecution.decision.symbols || {}).length,
-          });
-          lastDecisionHash = decisionHash;
-        }
-      }
-
-      const requestedKillSwitch = typeof aiRuntimeForExecution.controls.killSwitch === "boolean"
-        ? aiRuntimeForExecution.controls.killSwitch
+      const killSwitchStatus = typeof trader.status === "function"
+        ? await trader.status()
+        : { data: { killSwitch: false, killSwitchReason: null } };
+      const requestedKillSwitch = typeof strategyRuntimeForExecution.controls?.killSwitch === "boolean"
+        ? strategyRuntimeForExecution.controls.killSwitch
         : null;
-      const liquidationDirective = isLiquidationDirective(aiRuntimeForExecution.decision);
-
-      if (requestedKillSwitch === true) {
-        if (pendingKillSwitchApply || requestedKillSwitch !== lastKillSwitch) {
-          const killSwitchResult = await trader.setKillSwitch(true, "ai_settings_control");
-          if (killSwitchResult.ok) {
-            pendingKillSwitchApply = false;
-            lastKillSwitch = true;
-            logger.warn("kill switch updated from ai settings", {
-              enabled: true,
-              liquidationDirective,
-            });
-          }
-        }
-      } else if (requestedKillSwitch === false && requestedKillSwitch !== lastKillSwitch) {
-        const killSwitchResult = await trader.setKillSwitch(false, "ai_settings_control");
+      const killSwitchHash = JSON.stringify({ requestedKillSwitch });
+      if (requestedKillSwitch === true && killSwitchHash !== lastKillSwitchHash) {
+        const killSwitchResult = await trader.setKillSwitch(true, "strategy_settings_control");
         if (killSwitchResult.ok) {
-          pendingKillSwitchApply = false;
-          lastKillSwitch = false;
-          logger.warn("kill switch updated from ai settings", {
+          lastKillSwitchHash = killSwitchHash;
+          logger.warn("kill switch updated from strategy settings", {
+            enabled: true,
+          });
+        }
+      } else if (
+        requestedKillSwitch === false
+        && allowKillSwitchReset
+        && killSwitchHash !== lastKillSwitchHash
+        && killSwitchStatus?.data?.killSwitch === true
+        && killSwitchStatus?.data?.killSwitchReason === "strategy_settings_control"
+      ) {
+        const killSwitchResult = await trader.setKillSwitch(false, "strategy_settings_control");
+        if (killSwitchResult.ok) {
+          lastKillSwitchHash = killSwitchHash;
+          logger.warn("kill switch reset from strategy settings", {
             enabled: false,
           });
         }
       }
 
       if (!effective.enabled) {
-        logger.warn("execution window skipped by ai settings", {
+        logger.warn("execution window skipped by strategy settings", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
         });
         kpiSinceMs = Math.max(kpiSinceMs, Date.now());
         const windowDelayMs = calculateWindowDelayMs(runtimeConfig.execution, streamFailureStreak);
@@ -896,7 +876,7 @@ export async function runExecutionService({
         if (filteredHash !== lastFilteredSymbolsHash) {
           logger.warn("execution symbols filtered by market universe", {
             window: windows,
-            source: aiRuntimeForExecution.source,
+            source: strategyRuntimeForExecution.source,
             requestedSymbols,
             acceptedSymbols: targetSymbols,
             rejectedSymbols: filteredSymbols.filteredOut,
@@ -916,7 +896,7 @@ export async function runExecutionService({
         if (runtimeKillSwitch) {
           logger.warn("execution window skipped: kill switch active", {
             window: windows,
-            source: aiRuntimeForExecution.source,
+            source: strategyRuntimeForExecution.source,
             reason: executionStatus?.data?.killSwitchReason || "runtime_risk_control",
           });
         }
@@ -959,7 +939,7 @@ export async function runExecutionService({
       if (targetSymbols.length === 0) {
         logger.warn("execution window skipped: no symbols passed market universe filter", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           requestedSymbols,
           allowedCount: filteredSymbols.allowedCount,
         });
@@ -986,7 +966,7 @@ export async function runExecutionService({
       if (symbolsToRun.length !== targetSymbols.length) {
         logger.warn("execution symbol count capped per window", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           requestedCount: targetSymbols.length,
           cappedCount: symbolsToRun.length,
           maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
@@ -997,7 +977,7 @@ export async function runExecutionService({
       if (dedupedSymbolsToRun.length !== symbolsToRun.length) {
         logger.warn("execution symbols deduplicated for safety", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           symbolsToRun,
           dedupedSymbolsToRun,
         });
@@ -1009,7 +989,6 @@ export async function runExecutionService({
 
       const perSymbolResults = [];
       for (const targetSymbol of dedupedSymbolsToRun) {
-        const executionPolicy = resolveDecisionForSymbol(aiRuntimeForExecution.decision, targetSymbol);
         // Run symbols sequentially to avoid shared-state cross contamination and duplicate submissions.
         const result = await trader.runStrategyRealtime({
           symbol: targetSymbol,
@@ -1017,7 +996,6 @@ export async function runExecutionService({
           durationSec: effective.windowSec,
           cooldownSec: effective.cooldownSec,
           dryRun: executionDryRun,
-          executionPolicy,
           maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
         });
         perSymbolResults.push({ symbol: targetSymbol, result });
@@ -1060,7 +1038,7 @@ export async function runExecutionService({
       if (kpiGuard.enabled && kpiGuard.triggered && !executionDryRun) {
         logger.warn("execution kpi guard threshold check", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           threshold: {
             triggered: kpiGuard.triggered,
             reasons: kpiGuard.reasons,
@@ -1072,7 +1050,7 @@ export async function runExecutionService({
 
       const windowSummary = {
         window: windows,
-        source: aiRuntimeForExecution.source,
+        source: strategyRuntimeForExecution.source,
         mode: executionDryRun ? "dry_run" : "live",
         symbols: dedupedSymbolsToRun,
         symbolCount: dedupedSymbolsToRun.length,
@@ -1114,7 +1092,7 @@ export async function runExecutionService({
       const kpiMonitorSample = {
         sampledAtMs: kpiUntilMs,
         window: windows,
-        source: aiRuntimeForExecution.source,
+        source: strategyRuntimeForExecution.source,
         symbolCount: dedupedSymbolsToRun.length,
         fills: {
             count: safeExecutionKpiFills.count || 0,
@@ -1188,7 +1166,7 @@ export async function runExecutionService({
           sampledAt: new Date(kpiUntilMs).toISOString(),
           sampledAtMs: kpiUntilMs,
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           type: "execution_kpi_monitor",
           summary: monitorSummary,
           evaluation: monitorEvaluation,
@@ -1201,7 +1179,7 @@ export async function runExecutionService({
         if (monitorEvaluation.enabled && monitorEvaluation.triggered) {
           logger.warn("execution kpi monitor alert", {
             window: windows,
-            source: aiRuntimeForExecution.source,
+            source: strategyRuntimeForExecution.source,
             reason: monitorEvaluation.reasons,
             thresholds: monitorEvaluation.thresholds,
             metrics: monitorEvaluation.metrics,
@@ -1218,7 +1196,7 @@ export async function runExecutionService({
       ) {
         logger.error("execution kpi guard stop triggered", {
           window: windows,
-          source: aiRuntimeForExecution.source,
+          source: strategyRuntimeForExecution.source,
           symbol: dedupedSymbolsToRun,
           kpiGuard,
         });

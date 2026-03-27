@@ -3,20 +3,7 @@ import path from "node:path";
 import { normalizeSymbol } from "../config/defaults.js";
 import { nowIso } from "../lib/time.js";
 
-const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout"]);
-
-// Safe ranges for strategy parameters per README AI Operator Contract.
-// Values outside these ranges can silently degrade behavior; high momentumEntryBps over-filters buy entries.
-const STRATEGY_SAFE_RANGES = {
-  momentumLookback:         { min: 12,   max: 72   },
-  volatilityLookback:       { min: 48,   max: 144  },
-  momentumEntryBps:         { min: 6,    max: 24   },
-  momentumExitBps:          { min: 4,    max: 20   },
-  targetVolatilityPct:      { min: 0.30, max: 1.20 },
-  riskManagedMinMultiplier: { min: 0.40, max: 1.00 },
-  riskManagedMaxMultiplier: { min: 1.20, max: 2.50 },
-};
-
+const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout", "mean_reversion"]);
 const ALLOWED_INTERVALS = new Set([
   "1m",
   "3m",
@@ -30,7 +17,19 @@ const ALLOWED_INTERVALS = new Set([
   "week",
   "month",
 ]);
-const ALLOWED_DECISION_MODES = new Set(["rule", "filter", "override"]);
+
+const STRATEGY_SAFE_RANGES = {
+  momentumLookback: { min: 12, max: 72 },
+  volatilityLookback: { min: 48, max: 144 },
+  momentumEntryBps: { min: 6, max: 24 },
+  momentumExitBps: { min: 4, max: 20 },
+  meanLookback: { min: 8, max: 72 },
+  meanEntryBps: { min: 20, max: 240 },
+  meanExitBps: { min: 0, max: 120 },
+  targetVolatilityPct: { min: 0.3, max: 1.2 },
+  riskManagedMinMultiplier: { min: 0.4, max: 1.0 },
+  riskManagedMaxMultiplier: { min: 1.2, max: 2.5 },
+};
 
 function clampRange(value, min, max, fallback, label, logger = null) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -41,7 +40,7 @@ function clampRange(value, min, max, fallback, label, logger = null) {
   }
   const clamped = Math.min(Math.max(value, min), max);
   if (clamped !== value && logger) {
-    logger.warn("ai settings: value clamped", {
+    logger.warn("strategy settings: value clamped", {
       field: label,
       received: value,
       clamped,
@@ -77,6 +76,17 @@ function toPositiveNumber(value, fallback) {
   return parsed;
 }
 
+function toNonNegativeNumber(value, fallback) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function toPositiveInt(value, fallback) {
   const parsed = toPositiveNumber(value, fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -94,22 +104,6 @@ function toNonNegativeInt(value, fallback) {
     return fallback;
   }
   return Math.floor(parsed);
-}
-
-function toNullableNumber(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function toNullablePositiveNumber(value) {
-  const parsed = toNullableNumber(value);
-  if (parsed === null || parsed <= 0) {
-    return null;
-  }
-  return parsed;
 }
 
 function normalizeStrategyName(value, fallback) {
@@ -143,100 +137,48 @@ function toSymbolArray(value, fallback = []) {
   return base.length > 0 ? Array.from(new Set(base.map((item) => normalizeSymbol(item)).filter(Boolean))) : [];
 }
 
-function normalizeOverlay(overlayRaw) {
-  if (!overlayRaw || typeof overlayRaw !== "object") {
+function normalizeRuntimeMeta(raw = {}) {
+  const meta = raw && typeof raw === "object" ? raw : null;
+  if (!meta) {
     return null;
   }
 
-  const multiplier = toNullablePositiveNumber(overlayRaw.multiplier);
-  const score = toNullableNumber(overlayRaw.score);
-  const regime = overlayRaw.regime ? String(overlayRaw.regime) : null;
-  const note = overlayRaw.note ? String(overlayRaw.note) : null;
+  const source = typeof meta.source === "string" && meta.source.trim() !== ""
+    ? String(meta.source).trim()
+    : null;
+  const runId = meta.runId !== undefined && meta.runId !== null ? String(meta.runId) : null;
+  const version = typeof meta.version === "string" && meta.version.trim() !== ""
+    ? String(meta.version).trim()
+    : null;
 
-  if (multiplier === null && score === null) {
+  if (source === null && runId === null && version === null) {
     return null;
   }
 
   return {
-    multiplier,
-    score,
-    regime,
-    note,
+    source,
+    runId,
+    version,
   };
 }
 
-function normalizeDecisionMode(value, fallback = "filter") {
-  const token = String(value || fallback || "filter")
-    .trim()
-    .toLowerCase();
-  return ALLOWED_DECISION_MODES.has(token) ? token : fallback;
+function normalizeKillSwitch(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  return toBoolean(value, null);
 }
 
-function normalizeDecisionAction(value) {
-  const token = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (["buy", "bid"].includes(token)) {
-    return "BUY";
+function parseTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
   }
-  if (["sell", "ask"].includes(token)) {
-    return "SELL";
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
 }
-
-function normalizeDecisionBase(raw = {}, fallback = {}) {
-  const source = raw && typeof raw === "object" ? raw : {};
-  const base = fallback && typeof fallback === "object" ? fallback : {};
-  return {
-    mode: normalizeDecisionMode(source.mode, normalizeDecisionMode(base.mode, "filter")),
-    allowBuy: toBoolean(source.allowBuy, toBoolean(base.allowBuy, true)),
-    allowSell: toBoolean(source.allowSell, toBoolean(base.allowSell, true)),
-    forceAction: normalizeDecisionAction(
-      source.forceAction ?? source.action ?? base.forceAction ?? null,
-    ),
-    forceAmountKrw: toNullablePositiveNumber(
-      source.forceAmountKrw ?? source.amountKrw ?? base.forceAmountKrw ?? null,
-    ),
-    forceOnce: toBoolean(source.forceOnce, toBoolean(base.forceOnce, true)),
-    note: source.note ? String(source.note) : (base.note ? String(base.note) : null),
-  };
-}
-
-function normalizeDecision(raw = {}, fallback = {}) {
-  const defaults = normalizeDecisionBase(fallback, {
-    mode: "filter",
-    allowBuy: true,
-    allowSell: true,
-    forceAction: null,
-    forceAmountKrw: null,
-    forceOnce: true,
-    note: null,
-  });
-
-  const top = normalizeDecisionBase(raw, defaults);
-  const decision = {
-    ...top,
-    symbols: {},
-  };
-
-  const symbolsRaw = raw?.symbols;
-  if (!symbolsRaw || typeof symbolsRaw !== "object" || Array.isArray(symbolsRaw)) {
-    return decision;
-  }
-
-  for (const [symbolRaw, row] of Object.entries(symbolsRaw)) {
-    const symbol = normalizeSymbol(symbolRaw);
-    if (!symbol) {
-      continue;
-    }
-    decision.symbols[symbol] = normalizeDecisionBase(row, top);
-  }
-  return decision;
-}
-
-const SETTINGS_FILE_STABILITY_ATTEMPTS = 3;
-const SETTINGS_FILE_STABILITY_DELAY_MS = 60;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -254,14 +196,21 @@ async function writeJsonAtomic(filePath, payload) {
 }
 
 async function readJsonWithWriteStabilityGuard(filePath) {
-  for (let attempt = 1; attempt <= SETTINGS_FILE_STABILITY_ATTEMPTS; attempt += 1) {
+  const attempts = 3;
+  const delayMs = 60;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     let beforeStat;
     try {
       beforeStat = await fs.stat(filePath);
     } catch (error) {
-      if (error.code === "ENOENT") return {};
-      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
-      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      if (error.code === "ENOENT") {
+        return {};
+      }
+      if (attempt >= attempts) {
+        throw error;
+      }
+      await sleep(delayMs);
       continue;
     }
 
@@ -269,9 +218,13 @@ async function readJsonWithWriteStabilityGuard(filePath) {
     try {
       rawText = await fs.readFile(filePath, "utf8");
     } catch (error) {
-      if (error.code === "ENOENT") return {};
-      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
-      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      if (error.code === "ENOENT") {
+        return {};
+      }
+      if (attempt >= attempts) {
+        throw error;
+      }
+      await sleep(delayMs);
       continue;
     }
 
@@ -279,65 +232,42 @@ async function readJsonWithWriteStabilityGuard(filePath) {
     try {
       afterStat = await fs.stat(filePath);
     } catch (error) {
-      if (error.code === "ENOENT") return {};
-      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
-      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      if (error.code === "ENOENT") {
+        return {};
+      }
+      if (attempt >= attempts) {
+        throw error;
+      }
+      await sleep(delayMs);
       continue;
     }
 
     if (beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
-      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) return {};
-      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      if (attempt >= attempts) {
+        return {};
+      }
+      await sleep(delayMs);
       continue;
     }
 
     const trimmed = rawText.trim();
-    if (!trimmed) return {};
+    if (!trimmed) {
+      return {};
+    }
     try {
       return JSON.parse(trimmed);
     } catch (error) {
-      if (attempt >= SETTINGS_FILE_STABILITY_ATTEMPTS) throw error;
-      await sleep(SETTINGS_FILE_STABILITY_DELAY_MS);
+      if (attempt >= attempts) {
+        throw error;
+      }
+      await sleep(delayMs);
     }
   }
 
   return {};
 }
 
-function normalizeRuntimeMeta(raw = {}) {
-  const meta = raw && typeof raw === "object" ? raw : null;
-  if (!meta) {
-    return null;
-  }
-
-  const source = typeof meta.source === "string" && meta.source.trim() !== ""
-    ? String(meta.source).trim()
-    : null;
-  const approvedBy = typeof meta.approvedBy === "string" && meta.approvedBy.trim() !== ""
-    ? String(meta.approvedBy).trim()
-    : null;
-  const runId = meta.runId !== undefined && meta.runId !== null
-    ? String(meta.runId)
-    : null;
-  const approvedAt = toNullableNumber(meta.approvedAt);
-  const version = typeof meta.version === "string" && meta.version.trim() !== ""
-    ? String(meta.version).trim()
-    : null;
-
-  if (source === null && approvedBy === null && runId === null && approvedAt === null && version === null) {
-    return null;
-  }
-
-  return {
-    source,
-    approvedBy,
-    runId,
-    approvedAt,
-    version,
-  };
-}
-
-export class AiSettingsSource {
+export class StrategySettingsSource {
   constructor(config, logger) {
     this.config = config;
     this.logger = logger || {
@@ -345,32 +275,29 @@ export class AiSettingsSource {
       warn() {},
     };
 
-    this.enabled = Boolean(config.ai?.enabled);
-    this.settingsFile = config.ai?.settingsFile || null;
-    this.applyOverlay = Boolean(config.ai?.applyOverlay);
-    this.applyKillSwitch = Boolean(config.ai?.applyKillSwitch);
+    this.enabled = config.strategySettings?.enabled === undefined
+      ? true
+      : Boolean(config.strategySettings.enabled);
+    this.settingsFile = config.strategySettings?.settingsFile
+      || path.join(process.cwd(), ".trader", "strategy-settings.json");
+    this.maxAgeSec = toPositiveInt(config.strategySettings?.maxAgeSec, 7_200);
+    this.requireOptimizerSource = config.strategySettings?.requireOptimizerSource !== false;
     this.lastError = null;
   }
 
-  defaultExecution() {
+  defaultExecution(executionEnabled = null) {
     const defaultSymbol = normalizeSymbol(this.config.execution.symbol);
     const configuredSymbols = toSymbolArray(this.config.execution.symbols, [defaultSymbol]);
     const symbols = configuredSymbols.length > 0 ? configuredSymbols : [defaultSymbol];
     return {
-      enabled: Boolean(this.config.execution.enabled),
+      enabled: executionEnabled === null ? Boolean(this.config.execution.enabled) : Boolean(executionEnabled),
       symbol: symbols[0],
       symbols,
       orderAmountKrw: this.config.execution.orderAmountKrw,
       windowSec: this.config.execution.windowSec,
       cooldownSec: this.config.execution.cooldownSec,
-      maxSymbolsPerWindow: toPositiveInt(
-        this.config.execution.maxSymbolsPerWindow,
-        3,
-      ),
-      maxOrderAttemptsPerWindow: toPositiveInt(
-        this.config.execution.maxOrderAttemptsPerWindow,
-        1,
-      ),
+      maxSymbolsPerWindow: toPositiveInt(this.config.execution.maxSymbolsPerWindow, 1),
+      maxOrderAttemptsPerWindow: toPositiveInt(this.config.execution.maxOrderAttemptsPerWindow, 1),
     };
   }
 
@@ -387,6 +314,9 @@ export class AiSettingsSource {
       volatilityLookback: toPositiveInt(base.volatilityLookback, 72),
       momentumEntryBps: toPositiveNumber(base.momentumEntryBps, 12),
       momentumExitBps: toPositiveNumber(base.momentumExitBps, 8),
+      meanLookback: toPositiveInt(base.meanLookback ?? base.meanReversionLookback, 20),
+      meanEntryBps: toPositiveNumber(base.meanEntryBps ?? base.meanReversionEntryBps, 60),
+      meanExitBps: toNonNegativeNumber(base.meanExitBps ?? base.meanReversionExitBps, 10),
       targetVolatilityPct: toPositiveNumber(base.targetVolatilityPct, 0.6),
       riskManagedMinMultiplier: toPositiveNumber(base.riskManagedMinMultiplier, 0.6),
       riskManagedMaxMultiplier: toPositiveNumber(base.riskManagedMaxMultiplier, 2.2),
@@ -397,54 +327,37 @@ export class AiSettingsSource {
     };
   }
 
-  defaultDecision() {
+  defaultControls() {
     return {
-      mode: "filter",
-      allowBuy: true,
-      allowSell: true,
-      forceAction: null,
-      forceAmountKrw: null,
-      forceOnce: true,
-      note: null,
-      symbols: {},
+      killSwitch: null,
     };
   }
 
-  defaultSnapshot(source = "defaults") {
+  defaultSnapshot(source = "defaults", executionEnabled = null) {
+    const defaultEnabled = source === "disabled"
+      ? Boolean(this.config.execution.enabled)
+      : false;
     return {
       source,
       loadedAt: nowIso(),
       meta: null,
-      execution: this.defaultExecution(),
+      execution: this.defaultExecution(executionEnabled === null ? defaultEnabled : executionEnabled),
       strategy: this.defaultStrategy(),
-      decision: this.defaultDecision(),
-      overlay: null,
-      controls: {
-        killSwitch: null,
-      },
+      controls: this.defaultControls(),
     };
   }
 
   defaultTemplate() {
-    const defaultMultiplier = Number.isFinite(Number(this.config.overlay?.defaultMultiplier))
-      ? Number(this.config.overlay.defaultMultiplier)
-      : 1;
     return {
       version: 1,
       updatedAt: nowIso(),
-      meta: null,
-      execution: this.defaultExecution(),
+      meta: {
+        source: "template",
+        version: "strategy-settings/v1",
+      },
+      execution: this.defaultExecution(false),
       strategy: this.defaultStrategy(),
-      decision: this.defaultDecision(),
-      overlay: {
-        multiplier: defaultMultiplier,
-        score: null,
-        regime: null,
-        note: "set by ai",
-      },
-      controls: {
-        killSwitch: false,
-      },
+      controls: this.defaultControls(),
     };
   }
 
@@ -463,10 +376,49 @@ export class AiSettingsSource {
 
       const template = this.defaultTemplate();
       await writeJsonAtomic(this.settingsFile, template);
-      this.logger.info("ai settings template created", {
+      this.logger.info("strategy settings template created", {
         file: this.settingsFile,
       });
     }
+  }
+
+  validateContract(raw = {}) {
+    const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+    if (!source) {
+      return { ok: false, reason: "invalid_root_payload" };
+    }
+
+    if (source.version !== undefined && source.version !== 1 && source.version !== "1") {
+      return { ok: false, reason: "invalid_version" };
+    }
+
+    if (source.updatedAt !== undefined && parseTimestamp(source.updatedAt) === null) {
+      return { ok: false, reason: "invalid_updated_at" };
+    }
+
+    if (this.requireOptimizerSource) {
+      const metaSource = typeof source?.meta?.source === "string"
+        ? String(source.meta.source).trim()
+        : null;
+      if (metaSource !== "optimizer") {
+        return { ok: false, reason: "missing_optimizer_source" };
+      }
+    }
+
+    return { ok: true, reason: null };
+  }
+
+  isStale(raw = {}) {
+    if (!Number.isFinite(this.maxAgeSec) || this.maxAgeSec <= 0) {
+      return false;
+    }
+    const updatedAt = parseTimestamp(raw.updatedAt)
+      ?? parseTimestamp(raw?.meta?.updatedAt)
+      ?? parseTimestamp(raw?.meta?.approvedAt);
+    if (!Number.isFinite(updatedAt)) {
+      return true;
+    }
+    return Date.now() - updatedAt > this.maxAgeSec * 1_000;
   }
 
   normalize(raw = {}) {
@@ -474,8 +426,6 @@ export class AiSettingsSource {
     const defaults = this.defaultExecution();
     const strategyRaw = raw.strategy || {};
     const strategyDefaults = this.defaultStrategy();
-    const decisionRaw = raw.decision || {};
-    const decisionDefaults = this.defaultDecision();
 
     const execution = {
       enabled: toBoolean(executionRaw.enabled, defaults.enabled),
@@ -487,6 +437,7 @@ export class AiSettingsSource {
       maxSymbolsPerWindow: toPositiveInt(executionRaw.maxSymbolsPerWindow, defaults.maxSymbolsPerWindow),
       maxOrderAttemptsPerWindow: toPositiveInt(executionRaw.maxOrderAttemptsPerWindow, defaults.maxOrderAttemptsPerWindow),
     };
+
     const riskMinOrder = toPositiveNumber(this.config?.risk?.minOrderNotionalKrw, 20_000);
     const riskMaxOrder = toPositiveNumber(this.config?.risk?.maxOrderNotionalKrw, 300_000);
     execution.orderAmountKrw = clampRange(
@@ -529,13 +480,12 @@ export class AiSettingsSource {
       "execution.maxOrderAttemptsPerWindow",
       this.logger,
     );
-    const hasExplicitSymbol = executionRaw.symbol !== undefined && executionRaw.symbol !== null && String(executionRaw.symbol).trim() !== "";
-    const explicitSymbol = hasExplicitSymbol
-      ? normalizeSymbol(executionRaw.symbol)
-      : null;
-    const symbolFallback = explicitSymbol
-      ? [explicitSymbol]
-      : defaults.symbols || [execution.symbol];
+
+    const hasExplicitSymbol = executionRaw.symbol !== undefined
+      && executionRaw.symbol !== null
+      && String(executionRaw.symbol).trim() !== "";
+    const explicitSymbol = hasExplicitSymbol ? normalizeSymbol(executionRaw.symbol) : null;
+    const symbolFallback = explicitSymbol ? [explicitSymbol] : defaults.symbols || [execution.symbol];
     const symbols = toSymbolArray(executionRaw.symbols, symbolFallback);
     if (hasExplicitSymbol && explicitSymbol && !symbols.includes(explicitSymbol)) {
       symbols.unshift(explicitSymbol);
@@ -554,6 +504,12 @@ export class AiSettingsSource {
       volatilityLookback: toPositiveInt(strategyRaw.volatilityLookback, strategyDefaults.volatilityLookback),
       momentumEntryBps: toPositiveNumber(strategyRaw.momentumEntryBps, strategyDefaults.momentumEntryBps),
       momentumExitBps: toPositiveNumber(strategyRaw.momentumExitBps, strategyDefaults.momentumExitBps),
+      meanLookback: toPositiveInt(strategyRaw.meanLookback ?? strategyRaw.meanReversionLookback, strategyDefaults.meanLookback),
+      meanEntryBps: toPositiveNumber(strategyRaw.meanEntryBps ?? strategyRaw.meanReversionEntryBps, strategyDefaults.meanEntryBps),
+      meanExitBps: toNonNegativeNumber(
+        strategyRaw.meanExitBps ?? strategyRaw.meanReversionExitBps,
+        strategyDefaults.meanExitBps,
+      ),
       targetVolatilityPct: toPositiveNumber(strategyRaw.targetVolatilityPct, strategyDefaults.targetVolatilityPct),
       riskManagedMinMultiplier: toPositiveNumber(
         strategyRaw.riskManagedMinMultiplier,
@@ -571,10 +527,12 @@ export class AiSettingsSource {
 
     for (const [field, range] of Object.entries(STRATEGY_SAFE_RANGES)) {
       const value = strategy[field];
-      if (typeof value !== "number") continue;
+      if (typeof value !== "number") {
+        continue;
+      }
       const clamped = Math.max(range.min, Math.min(range.max, value));
       if (clamped !== value) {
-        this.logger.warn("ai settings: strategy parameter out of safe range, clamping", {
+        this.logger.warn("strategy settings: strategy parameter out of safe range, clamping", {
           field,
           received: value,
           clamped,
@@ -586,31 +544,16 @@ export class AiSettingsSource {
     }
 
     const controls = {
-      killSwitch: this.applyKillSwitch ? toBoolean(raw?.controls?.killSwitch, null) : null,
+      killSwitch: normalizeKillSwitch(raw?.controls?.killSwitch),
     };
-
-    const overlay = this.applyOverlay ? normalizeOverlay(raw.overlay) : null;
-    const decision = normalizeDecision(decisionRaw, decisionDefaults);
     const meta = normalizeRuntimeMeta(raw.meta);
-    if (decision.forceAmountKrw !== null) {
-      decision.forceAmountKrw = clampRange(
-        decision.forceAmountKrw,
-        Math.max(riskMinOrder, execution.orderAmountKrw * 0.1),
-        execution.orderAmountKrw * 50,
-        decision.forceAmountKrw,
-        "decision.forceAmountKrw",
-        this.logger,
-      );
-    }
 
     return {
-      source: "ai_settings_file",
+      source: "strategy_settings_file",
       loadedAt: nowIso(),
       meta,
       execution,
       strategy,
-      decision,
-      overlay,
       controls,
     };
   }
@@ -622,12 +565,33 @@ export class AiSettingsSource {
 
     try {
       const parsed = await readJsonWithWriteStabilityGuard(this.settingsFile);
+      const contract = this.validateContract(parsed);
+      if (!contract.ok) {
+        if (this.lastError !== contract.reason) {
+          this.lastError = contract.reason;
+          this.logger.warn("invalid strategy settings snapshot; fallback to defaults", {
+            file: this.settingsFile,
+            reason: contract.reason,
+          });
+        }
+        return this.defaultSnapshot("invalid_contract_fallback");
+      }
+      if (this.isStale(parsed)) {
+        if (this.lastError !== "stale_snapshot") {
+          this.lastError = "stale_snapshot";
+          this.logger.warn("stale strategy settings snapshot; fallback to defaults", {
+            file: this.settingsFile,
+            maxAgeSec: this.maxAgeSec,
+          });
+        }
+        return this.defaultSnapshot("stale_snapshot_fallback");
+      }
       this.lastError = null;
       return this.normalize(parsed);
     } catch (error) {
       if (this.lastError !== error.message) {
         this.lastError = error.message;
-        this.logger.warn("failed to read ai settings; fallback to defaults", {
+        this.logger.warn("failed to read strategy settings; fallback to defaults", {
           file: this.settingsFile,
           reason: error.message,
         });

@@ -21,9 +21,12 @@ class SystemMock {
       init: 0,
       realtime: 0,
       strategyApply: 0,
+      killSwitch: 0,
       args: [],
       strategyArgs: [],
+      killSwitchArgs: [],
     };
+    this.killSwitch = false;
   }
 
   async init() {
@@ -45,6 +48,29 @@ class SystemMock {
       data: args,
     };
   }
+
+  async setKillSwitch(enabled, reason = null) {
+    this.calls.killSwitch += 1;
+    this.calls.killSwitchArgs.push({ enabled, reason });
+    this.killSwitch = Boolean(enabled);
+    return {
+      ok: true,
+      code: 0,
+      data: {
+        killSwitch: this.killSwitch,
+        reason,
+      },
+    };
+  }
+
+  async status() {
+    return {
+      data: {
+        killSwitch: this.killSwitch,
+        killSwitchReason: this.killSwitch ? "mock_kill_switch" : null,
+      },
+    };
+  }
 }
 
 function baseConfig() {
@@ -54,11 +80,18 @@ function baseConfig() {
       accessKey: "",
       secretKey: "",
     },
-    ai: {
+    strategy: {
+      name: "risk_managed_momentum",
+      defaultSymbol: "BTC_KRW",
+      candleInterval: "15m",
+      candleCount: 120,
+      baseOrderAmountKrw: 20000,
+      autoSellEnabled: true,
+    },
+    strategySettings: {
       enabled: false,
       settingsFile: null,
-      applyOverlay: true,
-      applyKillSwitch: true,
+      requireOptimizerSource: false,
       refreshMinSec: 1800,
       refreshMaxSec: 3600,
     },
@@ -69,6 +102,7 @@ function baseConfig() {
       orderAmountKrw: 20000,
       windowSec: 1,
       cooldownSec: 1,
+      maxSymbolsPerWindow: 3,
       restartDelayMs: 1,
     },
   };
@@ -109,9 +143,9 @@ test("execution service exits immediately when disabled", async () => {
   assert.equal(system.calls.realtime, 0);
 });
 
-test("execution service applies ai execution settings per window", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-ai-"));
-  const settingsFile = path.join(baseDir, "ai-settings.json");
+test("execution service applies strategy settings per window", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
   const payload = {
     version: 1,
     updatedAt: new Date().toISOString(),
@@ -144,8 +178,8 @@ test("execution service applies ai execution settings per window", async () => {
   await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
 
   const config = baseConfig();
-  config.ai.enabled = true;
-  config.ai.settingsFile = settingsFile;
+  config.strategySettings.enabled = true;
+  config.strategySettings.settingsFile = settingsFile;
 
   const system = new SystemMock();
   const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
@@ -161,9 +195,9 @@ test("execution service applies ai execution settings per window", async () => {
   assert.equal(system.calls.args[0].dryRun, false);
 });
 
-test("execution service runs multiple symbols in one window when ai settings provide symbols", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-ai-multi-"));
-  const settingsFile = path.join(baseDir, "ai-settings.json");
+test("execution service runs multiple symbols in one window when strategy settings provide symbols", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-multi-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
   const payload = {
     version: 1,
     updatedAt: new Date().toISOString(),
@@ -175,24 +209,12 @@ test("execution service runs multiple symbols in one window when ai settings pro
       windowSec: 2,
       cooldownSec: 0,
     },
-    decision: {
-      mode: "override",
-      forceAction: "buy",
-      forceAmountKrw: 6500,
-      symbols: {
-        "ETH_KRW": {
-          mode: "filter",
-          allowBuy: false,
-          allowSell: true,
-        },
-      },
-    },
   };
   await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
 
   const config = baseConfig();
-  config.ai.enabled = true;
-  config.ai.settingsFile = settingsFile;
+  config.strategySettings.enabled = true;
+  config.strategySettings.settingsFile = settingsFile;
 
   const system = new SystemMock();
   const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
@@ -202,18 +224,11 @@ test("execution service runs multiple symbols in one window when ai settings pro
   assert.equal(system.calls.realtime, 3);
   const symbols = system.calls.args.map((row) => row.symbol).sort();
   assert.deepEqual(symbols, ["BTC_KRW", "ETH_KRW", "USDT_KRW"]);
-  const bySymbol = Object.fromEntries(system.calls.args.map((row) => [row.symbol, row.executionPolicy]));
-  assert.equal(bySymbol.BTC_KRW.mode, "override");
-  assert.equal(bySymbol.BTC_KRW.forceAction, "BUY");
-  assert.equal(bySymbol.BTC_KRW.forceAmountKrw, 20000);
-  assert.equal(bySymbol.ETH_KRW.mode, "filter");
-  assert.equal(bySymbol.ETH_KRW.allowBuy, false);
-  assert.equal(bySymbol.ETH_KRW.allowSell, true);
 });
 
-test("execution service keeps ai snapshot until refresh window", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-ai-refresh-"));
-  const settingsFile = path.join(baseDir, "ai-settings.json");
+test("execution service keeps strategy snapshot until refresh window", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-refresh-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
   const firstPayload = {
     version: 1,
     updatedAt: new Date().toISOString(),
@@ -252,10 +267,10 @@ test("execution service keeps ai snapshot until refresh window", async () => {
   }
 
   const config = baseConfig();
-  config.ai.enabled = true;
-  config.ai.settingsFile = settingsFile;
-  config.ai.refreshMinSec = 3600;
-  config.ai.refreshMaxSec = 3600;
+  config.strategySettings.enabled = true;
+  config.strategySettings.settingsFile = settingsFile;
+  config.strategySettings.refreshMinSec = 3600;
+  config.strategySettings.refreshMaxSec = 3600;
 
   const system = new MutatingSystemMock();
   const result = await runExecutionService({ system, config, stopAfterWindows: 2 });
@@ -267,6 +282,66 @@ test("execution service keeps ai snapshot until refresh window", async () => {
   assert.equal(system.calls.args[1].symbol, "USDT_KRW");
   assert.equal(system.calls.args[0].amount, 20000);
   assert.equal(system.calls.args[1].amount, 20000);
+});
+
+test("execution service applies kill switch from strategy settings", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-kill-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    controls: {
+      killSwitch: true,
+    },
+  };
+  await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const config = baseConfig();
+  config.strategySettings.enabled = true;
+  config.strategySettings.settingsFile = settingsFile;
+
+  const system = new SystemMock();
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.windows, 1);
+  assert.equal(system.calls.killSwitch, 1);
+  assert.equal(system.calls.realtime, 0);
+  assert.equal(system.calls.killSwitchArgs[0].enabled, true);
+});
+
+test("execution service does not clear runtime kill switch unless explicitly allowed", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-kill-reset-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    meta: {
+      source: "optimizer",
+    },
+    execution: {
+      enabled: true,
+      symbol: "BTC_KRW",
+      symbols: ["BTC_KRW"],
+    },
+    controls: {
+      killSwitch: false,
+    },
+  };
+  await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const config = baseConfig();
+  config.strategySettings.enabled = true;
+  config.strategySettings.settingsFile = settingsFile;
+
+  const system = new SystemMock();
+  system.killSwitch = true;
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.killSwitch, 0);
+  assert.equal(system.killSwitch, true);
+  assert.equal(system.calls.realtime, 0);
 });
 
 test("execution service applies market universe filter to requested symbols", async () => {

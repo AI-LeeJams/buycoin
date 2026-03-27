@@ -12,7 +12,7 @@ import { ExecutionEngine } from "../engine/execution-engine.js";
 import { clientOrderKey as buildClientOrderKey, uuid } from "../lib/ids.js";
 import { nowIso } from "../lib/time.js";
 
-const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout"]);
+const ALLOWED_STRATEGY_NAMES = new Set(["risk_managed_momentum", "breakout", "mean_reversion"]);
 const ALLOWED_INTERVALS = new Set([
   "1m",
   "3m",
@@ -47,6 +47,14 @@ function asPositiveInt(value, fallback) {
 function asPositiveNumber(value, fallback) {
   const parsed = asNumber(value, fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function asNonNegativeNumber(value, fallback) {
+  const parsed = asNumber(value, fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) {
     return fallback;
   }
   return parsed;
@@ -216,6 +224,12 @@ function requiredCandleWindow(config) {
   const strategyName = String(config?.strategy?.name || "risk_managed_momentum").toLowerCase();
   if (strategyName === "breakout") {
     return Math.max(2, Math.floor(asNumber(config?.strategy?.breakoutLookback, 20)) + 1);
+  }
+  if (strategyName === "mean_reversion") {
+    return Math.max(
+      3,
+      Math.floor(asNumber(config?.strategy?.meanLookback ?? config?.strategy?.meanReversionLookback, 20)) + 1,
+    );
   }
   const momentum = Math.floor(asNumber(config?.strategy?.momentumLookback, 24));
   const volatility = Math.floor(asNumber(config?.strategy?.volatilityLookback, 72));
@@ -847,6 +861,18 @@ function normalizeRuntimeStrategy(input = {}, fallback = {}) {
     volatilityLookback: asPositiveInt(strategy.volatilityLookback, asPositiveInt(base.volatilityLookback, 72)),
     momentumEntryBps: asPositiveNumber(strategy.momentumEntryBps, asPositiveNumber(base.momentumEntryBps, 12)),
     momentumExitBps: asPositiveNumber(strategy.momentumExitBps, asPositiveNumber(base.momentumExitBps, 8)),
+    meanLookback: asPositiveInt(
+      strategy.meanLookback ?? strategy.meanReversionLookback,
+      asPositiveInt(base.meanLookback ?? base.meanReversionLookback, 20),
+    ),
+    meanEntryBps: asPositiveNumber(
+      strategy.meanEntryBps ?? strategy.meanReversionEntryBps,
+      asPositiveNumber(base.meanEntryBps ?? base.meanReversionEntryBps, 60),
+    ),
+    meanExitBps: asNonNegativeNumber(
+      strategy.meanExitBps ?? strategy.meanReversionExitBps,
+      asNonNegativeNumber(base.meanExitBps ?? base.meanReversionExitBps, 10),
+    ),
     targetVolatilityPct: asPositiveNumber(strategy.targetVolatilityPct, asPositiveNumber(base.targetVolatilityPct, 0.6)),
     riskManagedMinMultiplier: asPositiveNumber(
       strategy.riskManagedMinMultiplier,
@@ -1371,23 +1397,24 @@ export class TradingSystem {
     });
   }
 
-  isAiOverrideConsumedOnce(key) {
+  isPolicyOverrideConsumedOnce(key) {
     if (!key) {
       return false;
     }
     const state = this.store.snapshot();
-    const consumed = state?.settings?.aiOverrideConsumed;
+    const consumed = state?.settings?.policyOverrideConsumed
+      ?? state?.settings?.aiOverrideConsumed;
     return Boolean(consumed && Object.hasOwn(consumed, key));
   }
 
-  async markAiOverrideConsumedOnce(key) {
+  async markPolicyOverrideConsumedOnce(key) {
     if (!key) {
       return;
     }
     await this.store.update((state) => {
       const now = nowIso();
-      const consumed = state.settings.aiOverrideConsumed && typeof state.settings.aiOverrideConsumed === "object"
-        ? state.settings.aiOverrideConsumed
+      const consumed = state.settings.policyOverrideConsumed && typeof state.settings.policyOverrideConsumed === "object"
+        ? state.settings.policyOverrideConsumed
         : {};
       consumed[key] = now;
 
@@ -1399,7 +1426,7 @@ export class TradingSystem {
         delete consumed[oldestKey];
       }
 
-      state.settings.aiOverrideConsumed = consumed;
+      state.settings.policyOverrideConsumed = consumed;
       return state;
     });
   }
@@ -1625,6 +1652,9 @@ export class TradingSystem {
       volatilityLookback: normalized.volatilityLookback,
       momentumEntryBps: normalized.momentumEntryBps,
       momentumExitBps: normalized.momentumExitBps,
+      meanLookback: normalized.meanLookback,
+      meanEntryBps: normalized.meanEntryBps,
+      meanExitBps: normalized.meanExitBps,
       sellAllOnExit: normalized.sellAllOnExit,
       sellAllQtyPrecision: normalized.sellAllQtyPrecision,
     });
@@ -1751,16 +1781,16 @@ export class TradingSystem {
     const cooldownMs = Math.max(0, Math.floor(Number(cooldownSec) * 1000));
     const durationMs = Number.isFinite(Number(durationSec)) ? Math.max(0, Math.floor(Number(durationSec)) * 1000) : 300_000;
     const autoSellEnabled = this.config.strategy.autoSellEnabled !== false;
-    const aiPolicy = normalizeExecutionPolicy(executionPolicy, {
+    const runtimePolicy = normalizeExecutionPolicy(executionPolicy, {
       autoSellEnabled,
     });
-    const effectiveForceOnce = aiPolicy.mode === "override" ? true : aiPolicy.forceOnce;
-    const overrideConsumeKey = aiPolicy.mode === "override" && effectiveForceOnce && aiPolicy.forceAction
+    const effectiveForceOnce = runtimePolicy.mode === "override" ? true : runtimePolicy.forceOnce;
+    const overrideConsumeKey = runtimePolicy.mode === "override" && effectiveForceOnce && runtimePolicy.forceAction
       ? [
         normalizedSymbol,
-        aiPolicy.forceAction,
-        asPositiveNumber(aiPolicy.forceAmountKrw, 0) || 0,
-        String(aiPolicy.note || ""),
+        runtimePolicy.forceAction,
+        asPositiveNumber(runtimePolicy.forceAmountKrw, 0) || 0,
+        String(runtimePolicy.note || ""),
       ].join("|")
       : null;
 
@@ -1809,7 +1839,7 @@ export class TradingSystem {
     let streamHandle = null;
     let timer = null;
     let processing = Promise.resolve();
-    let overrideActionConsumed = this.isAiOverrideConsumedOnce(overrideConsumeKey);
+    let overrideActionConsumed = this.isPolicyOverrideConsumedOnce(overrideConsumeKey);
     let overrideActionsAttempted = 0;
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
@@ -1853,19 +1883,19 @@ export class TradingSystem {
               let selectedReason = forcedExit ? (protectiveReason || signal.reason) : signal.reason;
               let selectedSource = forcedExit ? "protective_exit" : "rule_signal";
               const canUseOverride =
-                aiPolicy.mode === "override" &&
-                aiPolicy.forceAction &&
+                runtimePolicy.mode === "override" &&
+                runtimePolicy.forceAction &&
                 !(effectiveForceOnce && overrideActionConsumed) &&
                 overrideActionsAttempted < 1;
 
               if (forcedExit) {
                 selectedAction = protectiveExit.action;
               } else if (canUseOverride) {
-                selectedAction = aiPolicy.forceAction;
-                selectedReason = aiPolicy.note || "ai_override";
-                selectedSource = "ai_override";
+                selectedAction = runtimePolicy.forceAction;
+                selectedReason = runtimePolicy.note || "policy_override";
+                selectedSource = "policy_override";
               } else if (signal.action === "BUY") {
-                if (aiPolicy.allowBuy) {
+                if (runtimePolicy.allowBuy) {
                   const postExitCooldownSec = asNumber(this.config?.risk?.postExitBuyCooldownSec, 0);
                   const inPostExitCooldown = this.hasRecentProtectiveExit(normalizedSymbol, postExitCooldownSec);
                   if (inPostExitCooldown) {
@@ -1884,15 +1914,15 @@ export class TradingSystem {
                     }
                   }
                 } else {
-                  selectedReason = "ai_filter_block_buy";
+                  selectedReason = "policy_filter_block_buy";
                 }
               } else if (signal.action === "SELL") {
                 if (!autoSellEnabled) {
                   selectedReason = "auto_sell_disabled";
-                } else if (aiPolicy.allowSell) {
+                } else if (runtimePolicy.allowSell) {
                   selectedAction = "SELL";
                 } else {
-                  selectedReason = "ai_filter_block_sell";
+                  selectedReason = "policy_filter_block_sell";
                 }
               }
 
@@ -1936,14 +1966,14 @@ export class TradingSystem {
               }
 
               const overlay = windowOverlay;
-              const aiOverrideAmount =
-                selectedSource === "ai_override" ? asPositiveNumber(aiPolicy.forceAmountKrw, null) : null;
+              const policyOverrideAmount =
+                selectedSource === "policy_override" ? asPositiveNumber(runtimePolicy.forceAmountKrw, null) : null;
               const baseAmount =
-                aiOverrideAmount ?? asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
+                policyOverrideAmount ?? asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
               const signalMultiplier =
-                selectedSource === "ai_override" ? 1 : signalRiskMultiplier(signal, this.config);
+                selectedSource === "policy_override" ? 1 : signalRiskMultiplier(signal, this.config);
               const totalMultiplier =
-                selectedSource === "ai_override" && aiOverrideAmount !== null
+                selectedSource === "policy_override" && policyOverrideAmount !== null
                   ? 1
                   : Math.max(0.01, overlay.multiplier * signalMultiplier);
               const adjustedAmount = Math.max(1, Math.round(baseAmount * totalMultiplier));
@@ -2073,7 +2103,7 @@ export class TradingSystem {
               }
 
               attemptedOrders += 1;
-              if (selectedSource === "ai_override") {
+              if (selectedSource === "policy_override") {
                 overrideActionsAttempted += 1;
               }
               if (forcedExit) {
@@ -2101,9 +2131,9 @@ export class TradingSystem {
               if (order.ok) {
                 successfulOrders += 1;
                 lastOrderAtMs = nowMs;
-                if (!dryRun && selectedSource === "ai_override" && effectiveForceOnce) {
+                if (!dryRun && selectedSource === "policy_override" && effectiveForceOnce) {
                   overrideActionConsumed = true;
-                  await this.markAiOverrideConsumedOnce(overrideConsumeKey);
+                  await this.markPolicyOverrideConsumedOnce(overrideConsumeKey);
                 }
               }
 
@@ -2203,7 +2233,7 @@ export class TradingSystem {
         attemptedOrders,
         successfulOrders,
         dryRun: Boolean(dryRun),
-        executionPolicy: aiPolicy,
+        executionPolicy: runtimePolicy,
         decisions,
       };
 

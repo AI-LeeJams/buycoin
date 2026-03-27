@@ -39,6 +39,14 @@ function toPositiveNumber(value, fallback) {
   return parsed;
 }
 
+function toNonNegativeNumber(value, fallback) {
+  const parsed = toNumber(value, fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function toCsvList(value, fallback = []) {
   if (value === undefined || value === null || value === "") {
     return Array.isArray(fallback) ? fallback.slice() : [];
@@ -66,10 +74,26 @@ function toCsvPositiveNumbers(value, fallback = []) {
   return numbers.length > 0 ? numbers : fallback.slice();
 }
 
+function toCsvNonNegativeNumbers(value, fallback = []) {
+  const raw = toCsvList(value, fallback);
+  const numbers = raw
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item >= 0);
+  return numbers.length > 0 ? numbers : fallback.slice();
+}
+
 function toCsvSymbols(value, fallback = []) {
   const raw = toCsvList(value, fallback);
   const normalized = raw.map((item) => normalizeSymbol(item)).filter(Boolean);
   return normalized.length > 0 ? Array.from(new Set(normalized)) : fallback.slice();
+}
+
+function toCsvSymbolsOrNone(value, fallback = []) {
+  const token = String(value ?? "").trim().toUpperCase();
+  if (token === "NONE" || token === "EMPTY" || token === "-") {
+    return [];
+  }
+  return toCsvSymbols(value, fallback);
 }
 
 function toNullablePositiveNumber(value) {
@@ -174,11 +198,14 @@ export function loadConfig(env = process.env) {
       candleInterval: String(env.STRATEGY_CANDLE_INTERVAL || "15m").toLowerCase(),
       candleCount: toPositiveInt(env.STRATEGY_CANDLE_COUNT, 120),
       breakoutLookback: toPositiveInt(env.STRATEGY_BREAKOUT_LOOKBACK, 20),
-      breakoutBufferBps: toPositiveNumber(env.STRATEGY_BREAKOUT_BUFFER_BPS, 5),
+      breakoutBufferBps: toNonNegativeNumber(env.STRATEGY_BREAKOUT_BUFFER_BPS, 5),
       momentumLookback: toPositiveInt(env.STRATEGY_MOMENTUM_LOOKBACK, 24),
       volatilityLookback: toPositiveInt(env.STRATEGY_VOLATILITY_LOOKBACK, 72),
       momentumEntryBps: toPositiveNumber(env.STRATEGY_MOMENTUM_ENTRY_BPS, 12),
       momentumExitBps: toPositiveNumber(env.STRATEGY_MOMENTUM_EXIT_BPS, 8),
+      meanLookback: toPositiveInt(env.STRATEGY_MEAN_LOOKBACK, 20),
+      meanEntryBps: toPositiveNumber(env.STRATEGY_MEAN_ENTRY_BPS, 60),
+      meanExitBps: toNonNegativeNumber(env.STRATEGY_MEAN_EXIT_BPS, 10),
       targetVolatilityPct: toPositiveNumber(env.STRATEGY_TARGET_VOLATILITY_PCT, 0.6),
       riskManagedMinMultiplier: toPositiveNumber(env.STRATEGY_RM_MIN_MULTIPLIER, 0.6),
       riskManagedMaxMultiplier: toPositiveNumber(env.STRATEGY_RM_MAX_MULTIPLIER, 2.2),
@@ -201,14 +228,29 @@ export function loadConfig(env = process.env) {
     },
     optimizer: {
       enabled: toBoolean(env.OPTIMIZER_ENABLED, true),
-      applyOnStart: toBoolean(env.OPTIMIZER_APPLY_ON_START, false),
-      applyToAiSettings: toBoolean(env.OPTIMIZER_APPLY_TO_AI_SETTINGS, true),
+      applyOnStart: toBoolean(env.OPTIMIZER_APPLY_ON_START, true),
+      applyToStrategySettings: toBoolean(
+        env.OPTIMIZER_APPLY_TO_STRATEGY_SETTINGS ?? env.OPTIMIZER_APPLY_TO_AI_SETTINGS,
+        true,
+      ),
       lockFile: env.OPTIMIZER_LOCK_FILE || path.join(process.cwd(), ".trader", "optimize.lock"),
       lockTtlSec: toPositiveInt(env.OPTIMIZER_LOCK_TTL_SEC, 900),
       reoptEnabled: toBoolean(env.OPTIMIZER_REOPT_ENABLED, true),
       reoptIntervalSec: toPositiveInt(env.OPTIMIZER_REOPT_INTERVAL_SEC, 3600),
       reportFile: env.OPTIMIZER_REPORT_FILE || path.join(process.cwd(), ".trader", "optimizer-report.json"),
       symbols: toCsvSymbols(env.OPTIMIZER_SYMBOLS, optimizerDefaultSymbols),
+      maxLiveSymbols: toPositiveInt(env.OPTIMIZER_MAX_LIVE_SYMBOLS, 1),
+      minHistoryCandles: toPositiveInt(
+        env.OPTIMIZER_MIN_HISTORY_CANDLES,
+        toPositiveInt(env.OPTIMIZER_CANDLE_COUNT, 200),
+      ),
+      strategies: Array.from(new Set(
+        toCsvList(env.OPTIMIZER_STRATEGIES, [
+          "risk_managed_momentum",
+          "breakout",
+          "mean_reversion",
+        ]).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean),
+      )),
       interval: String(env.OPTIMIZER_INTERVAL || env.STRATEGY_CANDLE_INTERVAL || "15m").toLowerCase(),
       candleCount: toPositiveInt(env.OPTIMIZER_CANDLE_COUNT, 200),
       initialCashKrw: toPositiveNumber(
@@ -246,6 +288,11 @@ export function loadConfig(env = process.env) {
       volatilityLookbacks: toCsvPositiveInts(env.OPTIMIZER_VOLATILITY_LOOKBACKS, [72, 96, 120, 144]),
       entryBpsCandidates: toCsvPositiveNumbers(env.OPTIMIZER_ENTRY_BPS, [10, 16, 24, 32]),
       exitBpsCandidates: toCsvPositiveNumbers(env.OPTIMIZER_EXIT_BPS, [6, 10, 14, 20]),
+      breakoutLookbacks: toCsvPositiveInts(env.OPTIMIZER_BREAKOUT_LOOKBACKS, [10, 20, 30, 55]),
+      breakoutBufferBpsCandidates: toCsvNonNegativeNumbers(env.OPTIMIZER_BREAKOUT_BUFFER_BPS, [0, 5, 10, 15]),
+      meanLookbacks: toCsvPositiveInts(env.OPTIMIZER_MEAN_LOOKBACKS, [12, 20, 30, 48]),
+      meanEntryBpsCandidates: toCsvPositiveNumbers(env.OPTIMIZER_MEAN_ENTRY_BPS, [40, 60, 90, 120]),
+      meanExitBpsCandidates: toCsvNonNegativeNumbers(env.OPTIMIZER_MEAN_EXIT_BPS, [0, 10, 20, 30]),
       targetVolatilityPctCandidates: toCsvPositiveNumbers(env.OPTIMIZER_TARGET_VOLATILITY_PCT, [0.35, 0.5]),
       rmMinMultiplierCandidates: toCsvPositiveNumbers(env.OPTIMIZER_RM_MIN_MULTIPLIER, [0.4]),
       rmMaxMultiplierCandidates: toCsvPositiveNumbers(env.OPTIMIZER_RM_MAX_MULTIPLIER, [1.6, 1.8]),
@@ -270,7 +317,7 @@ export function loadConfig(env = process.env) {
       initialCapitalKrw: toNullablePositiveNumber(env.TRADER_INITIAL_CAPITAL_KRW),
     },
     overlay: {
-      enabled: toBoolean(env.OVERLAY_ENABLED, true),
+      enabled: toBoolean(env.OVERLAY_ENABLED, false),
       timeoutMs: toPositiveInt(env.OVERLAY_TIMEOUT_MS, 500),
       defaultMultiplier: toPositiveNumber(env.OVERLAY_DEFAULT_MULTIPLIER, 1),
       fallbackMultiplier: toPositiveNumber(env.OVERLAY_FALLBACK_MULTIPLIER, 1),
@@ -278,18 +325,24 @@ export function loadConfig(env = process.env) {
       maxMultiplier: toPositiveNumber(env.OVERLAY_MAX_MULTIPLIER, 1.5),
       maxStalenessSec: toPositiveInt(env.OVERLAY_MAX_STALENESS_SEC, 600),
     },
-    ai: {
-      enabled: toBoolean(env.AI_SETTINGS_ENABLED, true),
-      settingsFile: env.AI_SETTINGS_FILE || path.join(process.cwd(), ".trader", "ai-settings.json"),
-      runtimeSettingsFile: env.AI_RUNTIME_SETTINGS_FILE || path.join(process.cwd(), ".trader", "ai-runtime.json"),
-      runtimeSettingsMaxAgeSec: toPositiveInt(env.AI_RUNTIME_SETTINGS_MAX_AGE_SEC, 7200),
-      applyOnlyAfterOptimize: toBoolean(env.AI_SETTINGS_REQUIRE_OPTIMIZER_APPROVAL, false),
-      applyOverlay: toBoolean(env.AI_SETTINGS_APPLY_OVERLAY, true),
-      applyKillSwitch: toBoolean(env.AI_SETTINGS_APPLY_KILL_SWITCH, true),
-      applyCooldownSec: toPositiveInt(env.AI_SETTINGS_APPLY_COOLDOWN_SEC, 180),
-      refreshFixedSec: toPositiveInt(env.AI_SETTINGS_REFRESH_FIXED_SEC, 0),
-      refreshMinSec: toPositiveInt(env.AI_SETTINGS_REFRESH_MIN_SEC, 1_800),
-      refreshMaxSec: toPositiveInt(env.AI_SETTINGS_REFRESH_MAX_SEC, 3_600),
+    strategySettings: {
+      enabled: toBoolean(env.STRATEGY_SETTINGS_ENABLED ?? env.AI_SETTINGS_ENABLED, true),
+      settingsFile: env.STRATEGY_SETTINGS_FILE
+        || env.AI_SETTINGS_FILE
+        || path.join(process.cwd(), ".trader", "strategy-settings.json"),
+      maxAgeSec: toPositiveInt(
+        env.STRATEGY_SETTINGS_MAX_AGE_SEC,
+        Math.max(7_200, toPositiveInt(env.OPTIMIZER_REOPT_INTERVAL_SEC, 3_600) * 2),
+      ),
+      requireOptimizerSource: toBoolean(env.STRATEGY_SETTINGS_REQUIRE_OPTIMIZER_SOURCE, true),
+      allowKillSwitchReset: toBoolean(env.STRATEGY_SETTINGS_ALLOW_KILL_SWITCH_RESET, false),
+      applyCooldownSec: toPositiveInt(
+        env.STRATEGY_SETTINGS_APPLY_COOLDOWN_SEC ?? env.AI_SETTINGS_APPLY_COOLDOWN_SEC,
+        180,
+      ),
+      refreshFixedSec: toPositiveInt(env.STRATEGY_SETTINGS_REFRESH_FIXED_SEC ?? env.AI_SETTINGS_REFRESH_FIXED_SEC, 0),
+      refreshMinSec: toPositiveInt(env.STRATEGY_SETTINGS_REFRESH_MIN_SEC ?? env.AI_SETTINGS_REFRESH_MIN_SEC, 1_800),
+      refreshMaxSec: toPositiveInt(env.STRATEGY_SETTINGS_REFRESH_MAX_SEC ?? env.AI_SETTINGS_REFRESH_MAX_SEC, 3_600),
     },
     marketUniverse: {
       enabled: toBoolean(env.MARKET_UNIVERSE_ENABLED, true),
@@ -297,8 +350,8 @@ export function loadConfig(env = process.env) {
       minAccTradeValue24hKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_ACC_TRADE_VALUE_24H_KRW, 20_000_000_000),
       minPriceKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_PRICE_KRW, 1),
       maxSymbols: toPositiveInt(env.MARKET_UNIVERSE_MAX_SYMBOLS, 20),
-      includeSymbols: toCsvSymbols(env.MARKET_UNIVERSE_INCLUDE_SYMBOLS, universeDefaultIncludes),
-      excludeSymbols: toCsvSymbols(env.MARKET_UNIVERSE_EXCLUDE_SYMBOLS, []),
+      includeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_INCLUDE_SYMBOLS, universeDefaultIncludes),
+      excludeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_EXCLUDE_SYMBOLS, []),
       minBaseAssetLength: toPositiveInt(env.MARKET_UNIVERSE_MIN_BASE_ASSET_LENGTH, 2),
       refreshMinSec: toPositiveInt(env.MARKET_UNIVERSE_REFRESH_MIN_SEC, 1_800),
       refreshMaxSec: toPositiveInt(env.MARKET_UNIVERSE_REFRESH_MAX_SEC, 3_600),
@@ -318,7 +371,7 @@ export function loadConfig(env = process.env) {
       ),
       windowSec: toPositiveInt(env.EXECUTION_WINDOW_SEC, 300),
       cooldownSec: toPositiveInt(env.EXECUTION_COOLDOWN_SEC, 30),
-      maxSymbolsPerWindow: toPositiveInt(env.EXECUTION_MAX_SYMBOLS_PER_WINDOW, 3),
+      maxSymbolsPerWindow: toPositiveInt(env.EXECUTION_MAX_SYMBOLS_PER_WINDOW, 1),
       maxOrderAttemptsPerWindow: toPositiveInt(env.EXECUTION_MAX_ORDER_ATTEMPTS_PER_WINDOW, 1),
       dryRun: toBoolean(env.EXECUTION_DRY_RUN, false),
       kpiGuardEnabled: toBoolean(env.EXECUTION_KPI_GUARD_ENABLED, true),

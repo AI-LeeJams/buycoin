@@ -1,14 +1,14 @@
 {
   "name": "buycoin-trader",
   "version": "0.1.0",
-  "description": "Execution-first orthodox crypto trading system for Bithumb (rule-based realtime engine, AI overlay cache)",
+  "description": "Execution-first orthodox crypto trading system for Bithumb (rule-based realtime engine with strategy optimization)",
   "type": "module",
   "scripts": {
     "start": "node ./src/app/run.js",
     "optimize": "node ./src/app/optimize.js",
     "kpi-report": "node ./src/app/kpi-report.js",
     "test": "node --test",
-    "lint": "eslint src test scripts test-utils"
+    "lint": "eslint src test test-utils"
   },
   "engines": {
     "node": ">=20"

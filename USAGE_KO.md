@@ -9,8 +9,8 @@
 3. 리스크 검증
 4. 즉시 주문 실행
 
-AI/ML은 포지션 배율(overlay cache) 용도로만 사용합니다.
-AI/ML이 실시간 트리거/체결 타이밍을 결정하지 않습니다.
+추론/외부 제어 경로는 제거되었습니다.
+이제 전략 탐색 결과를 `strategy-settings.json`에 반영하고, 실시간 실행은 규칙 기반 시그널과 리스크 정책만 사용합니다.
 
 ## 설치
 
@@ -24,22 +24,23 @@ npm install
 ## 실행
 
 - 실행형 서비스: `npm start`
-- 기본 다중 종목은 `.env`의 `EXECUTION_SYMBOLS=BTC_KRW,ETH_KRW,...` 로 지정 가능합니다.
+- 기본 unattended 운용은 단일 live 심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=1`) 기준입니다.
 - 실행 중 유동성/품질 필터를 통과한 종목 목록이 `.trader/market-universe.json`에 저장됩니다.
 
-## AI 설정 연동(자동매매 설정 입력점)
+## 전략 설정 연동(자동매매 설정 입력점)
 
-- 기본 입력 파일: `.trader/ai-runtime.json` (AI가 작성)
-- 실행 반영 파일: `.trader/ai-settings.json` (optimize 출력)
-- 실행 루프는 AI 스냅샷 갱신 주기(기본 30~60분, `AI_SETTINGS_REFRESH_MIN_SEC=1800`, `AI_SETTINGS_REFRESH_MAX_SEC=3600`)로 동작합니다.
-- AI 설정 변경은 `run.js`에서 다음 AI refresh 시점에만 반영됩니다(체결 루프 1틱마다 즉시 반영되지 않음).
-- AI의 상세 제어 규칙은 `docs/AI_OPERATOR_GUIDE.md` v1.3을 준수합니다.
-- `AI_SETTINGS_REQUIRE_OPTIMIZER_APPROVAL=true`면 `optimize`가 스탬프한 스냅샷만 실제 거래에 반영됩니다.
-- `npm run optimize`는 AI 지시 파일(`.trader/ai-runtime.json`)의 `execution.symbols`가 있으면 최적화 대상 심볼로 사용합니다.
+- 기본 출력 파일: `.trader/strategy-settings.json`
+- `npm run optimize`가 시장 데이터와 현재 설정을 기반으로 전략 후보를 평가합니다.
+- `npm start`는 시작 시 자동 최적화를 1회 수행하고, `OPTIMIZER_REOPT_INTERVAL_SEC` 기준으로 주기 재최적화를 수행할 수 있습니다.
+- 실행 루프는 전략 설정 스냅샷 갱신 주기 기준으로 동작합니다.
+- 전략 설정 변경은 `run.js`에서 다음 refresh 시점에만 반영됩니다(체결 루프 1틱마다 즉시 반영되지 않음).
+- `optimize`는 현재 `market-universe` 스냅샷과 `OPTIMIZER_SYMBOLS`를 우선 사용해 탐색 대상을 구성합니다.
+- 신규 코인 회피는 별도 수동 blacklist보다 `OPTIMIZER_MIN_HISTORY_CANDLES` 기준으로 처리하는 것이 기본입니다.
 - 동시 다중 종목 실행은 `execution.symbols` 배열(또는 콤마 문자열)로 지정합니다.
 - 요청 종목은 `.trader/market-universe.json`과 교집합으로 실행됩니다(저유동/이상 종목 자동 제외).
 - 필터 강도는 `.env`의 `MARKET_UNIVERSE_*` 값으로 조정합니다.
-- 권장 운용: AI는 30~60분 주기로 시장 점검 후 변경 필요 시에만 `ai-runtime.json` 갱신
+- `MARKET_UNIVERSE_INCLUDE_SYMBOLS=NONE`이면 수동 강제 포함 없이 유동성 필터 기준으로만 탐색합니다.
+- 권장 운용: `npm start` 단독으로도 동작하지만, 전략 유니버스가 충분히 넓은지 `MARKET_UNIVERSE_*`, `OPTIMIZER_SYMBOLS`를 함께 조정하는 것이 좋습니다.
 - 권장 필수 체크 입력: `.trader/state.json`, `.trader/market-universe.json`, `.trader/http-audit.jsonl`(활성 시), 런타임 로그, `.trader/optimizer-report.json`(있을 때).
 
 예시:
@@ -53,39 +54,38 @@ npm install
     "symbols": ["BTC_KRW", "ETH_KRW", "USDT_KRW"],
     "orderAmountKrw": 20000
   },
-  "decision": {
-    "mode": "filter",
-    "allowBuy": true,
-    "allowSell": true,
-    "forceAction": null,
-    "forceAmountKrw": null,
-    "forceOnce": true,
-    "symbols": {
-      "BTC_KRW": {
-        "mode": "override",
-        "forceAction": "BUY",
-        "forceAmountKrw": 20000
-      }
-    }
-  },
-  "overlay": {
-    "multiplier": 0.8,
-    "score": -0.3,
-    "regime": "risk_off",
-    "note": "macro risk"
+  "strategy": {
+    "name": "risk_managed_momentum",
+    "defaultSymbol": "BTC_KRW",
+    "candleInterval": "15m",
+    "candleCount": 160,
+    "momentumLookback": 36,
+    "volatilityLookback": 96,
+    "momentumEntryBps": 16,
+    "momentumExitBps": 10,
+    "targetVolatilityPct": 0.5,
+    "riskManagedMinMultiplier": 0.4,
+    "riskManagedMaxMultiplier": 1.8,
+    "autoSellEnabled": true,
+    "baseOrderAmountKrw": 20000
   },
   "controls": {
     "killSwitch": false
+  },
+  "meta": {
+    "source": "optimizer",
+    "runId": "1707955200000-12345"
   }
 }
 ```
 
-AI 입력 파일 포맷 규칙:
+전략 설정 포맷 규칙:
 
-- `AI_RUNTIME_SETTINGS_FILE`은 원자적 쓰기(`tmp` 파일 작성 후 `rename`)로 갱신해야 합니다.
+- `strategy-settings.json`은 원자적 쓰기(`tmp` 파일 작성 후 `rename`)로 갱신하는 것이 안전합니다.
 - `updatedAt`(`ISO` 또는 epoch ms)와 `version`(`1`)을 반드시 포함합니다.
-- `AI_RUNTIME_SETTINGS_MAX_AGE_SEC`를 설정하면 만료된 지시를 자동 무시합니다.
-- `strategy.*`는 `optimize` 담당이며 AI가 직접 작성하면 안 됩니다.
+- unattended 운용 기본값은 `meta.source=optimizer` 스냅샷만 live에 반영하는 것입니다.
+- stale 스냅샷은 live에 반영되지 않습니다(`STRATEGY_SETTINGS_MAX_AGE_SEC`).
+- `controls.killSwitch=false`는 runtime 리스크 정책이 올린 kill-switch를 자동 해제하지 않습니다.
 
 ## 실행 명령
 
@@ -93,21 +93,14 @@ AI 입력 파일 포맷 규칙:
 npm start
 ```
 
-CLI 모드는 제거되었습니다. 설정/제어는 `.env`와 `AI_RUNTIME_SETTINGS_FILE`(`.trader/ai-runtime.json`) 기반으로 수행합니다.
+CLI 모드는 제거되었습니다. 설정/제어는 `.env`와 `strategy-settings.json` 기반으로 수행합니다.
 
 ## 실행 규칙
 
 - BUY 시그널: 즉시 시장가 매수 실행
 - SELL 시그널: `STRATEGY_AUTO_SELL_ENABLED=true`면 즉시 시장가 매도 실행
 - `STRATEGY_SELL_ALL_ON_EXIT=true`면 SELL은 고정 KRW 금액이 아니라 보유 가능한 수량 기준 전량 매도로 계산
-- AI 판단 정책:
-  - `decision.mode=filter`: AI가 BUY/SELL 허용 여부를 제어 (`allowBuy`, `allowSell`)
-  - `decision.mode=override`: AI가 윈도우당 강제 액션 가능 (`forceAction`, `forceAmountKrw`)
-  - 종목별 정책은 `decision.symbols.<SYMBOL>` 로 개별 오버라이드 가능
 - HOLD 시그널: 주문하지 않음
-- 오버레이는 수량이 아니라 주문금액 배율만 조정
-  - `조정금액 = 기본금액 * (시그널 리스크배율) * (AI 오버레이 배율)`
-- 오버레이가 지연/만료되면 fallback multiplier 사용
 - 실시간 티커 모드는 빗썸 Public WebSocket(`wss://ws-api.bithumb.com/websocket/v1`)을 사용
 - WebSocket 채널 지원:
   - public: `ticker`, `trade`, `orderbook`
@@ -120,6 +113,7 @@ CLI 모드는 제거되었습니다. 설정/제어는 `.env`와 `AI_RUNTIME_SETT
 - 최대 총 노출
 - 일 손실 한도
 - Kill Switch
+- risk policy가 활성화한 kill-switch는 운영자가 별도로 해제하기 전까지 유지되는 보수 모드입니다.
 
 ## HTTP 감사로그
 

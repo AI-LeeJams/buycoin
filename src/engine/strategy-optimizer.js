@@ -1,5 +1,5 @@
 import { normalizeSymbol } from "../config/defaults.js";
-import { RiskManagedMomentumSignalEngine } from "./signal-engine.js";
+import { createSignalEngine } from "./signal-engine.js";
 
 function asNumber(value, fallback = null) {
   const parsed = Number(value);
@@ -188,6 +188,88 @@ function buildMomentumGrid(config = {}) {
   return grid;
 }
 
+function buildBreakoutGrid(config = {}) {
+  const breakoutLookbacks = Array.isArray(config.breakoutLookbacks) && config.breakoutLookbacks.length > 0
+    ? config.breakoutLookbacks
+    : [12, 16, 20, 24, 30];
+  const breakoutBufferBpsCandidates = Array.isArray(config.breakoutBufferBpsCandidates) && config.breakoutBufferBpsCandidates.length > 0
+    ? config.breakoutBufferBpsCandidates
+    : [0, 3, 5, 8, 12];
+
+  const grid = [];
+  for (const breakoutLookback of breakoutLookbacks) {
+    for (const breakoutBufferBps of breakoutBufferBpsCandidates) {
+      grid.push({
+        breakoutLookback,
+        breakoutBufferBps,
+      });
+    }
+  }
+  return grid;
+}
+
+function buildMeanReversionGrid(config = {}) {
+  const meanReversionLookbacks = Array.isArray(config.meanLookbacks) && config.meanLookbacks.length > 0
+    ? config.meanLookbacks
+    : Array.isArray(config.meanReversionLookbacks) && config.meanReversionLookbacks.length > 0
+      ? config.meanReversionLookbacks
+    : [12, 16, 20, 30];
+  const entryDeviationBpsCandidates =
+    Array.isArray(config.meanEntryBpsCandidates) && config.meanEntryBpsCandidates.length > 0
+      ? config.meanEntryBpsCandidates
+      : Array.isArray(config.meanReversionEntryDeviationBpsCandidates) && config.meanReversionEntryDeviationBpsCandidates.length > 0
+        ? config.meanReversionEntryDeviationBpsCandidates
+      : [40, 60, 80, 120];
+  const exitDeviationBpsCandidates =
+    Array.isArray(config.meanExitBpsCandidates) && config.meanExitBpsCandidates.length > 0
+      ? config.meanExitBpsCandidates
+      : Array.isArray(config.meanReversionExitDeviationBpsCandidates) && config.meanReversionExitDeviationBpsCandidates.length > 0
+        ? config.meanReversionExitDeviationBpsCandidates
+      : [12, 20, 30, 40];
+
+  const grid = [];
+  for (const meanReversionLookback of meanReversionLookbacks) {
+    for (const meanReversionEntryBps of entryDeviationBpsCandidates) {
+      for (const meanReversionExitBps of exitDeviationBpsCandidates) {
+        if (meanReversionExitBps >= meanReversionEntryBps) {
+          continue;
+        }
+        grid.push({
+          meanLookback: meanReversionLookback,
+          meanEntryBps: meanReversionEntryBps,
+          meanExitBps: meanReversionExitBps,
+        });
+      }
+    }
+  }
+  return grid;
+}
+
+function normalizeStrategyName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function resolveStrategyNames(gridConfig = {}) {
+  const defaultNames = ["risk_managed_momentum", "breakout", "mean_reversion"];
+  const requested = Array.isArray(gridConfig.strategyNames) && gridConfig.strategyNames.length > 0
+    ? gridConfig.strategyNames
+    : defaultNames;
+  const names = requested
+    .map((item) => normalizeStrategyName(item))
+    .filter((item) => defaultNames.includes(item));
+  return names.length > 0 ? Array.from(new Set(names)) : defaultNames;
+}
+
+function buildStrategyGrid(strategyName, gridConfig = {}) {
+  if (strategyName === "breakout") {
+    return buildBreakoutGrid(gridConfig);
+  }
+  if (strategyName === "mean_reversion") {
+    return buildMeanReversionGrid(gridConfig);
+  }
+  return buildMomentumGrid(gridConfig);
+}
+
 function scoreCandidate(metrics) {
   const totalReturnPct = asNumber(metrics.totalReturnPct, 0) ?? 0;
   const maxDdPct = asNumber(metrics.maxDrawdownPct, 0) ?? 0;
@@ -229,7 +311,7 @@ function safetyCheck(metrics, constraints = {}) {
   return { safe, checks };
 }
 
-export function simulateRiskManagedMomentum({
+function simulateStrategyPerformance({
   candles = [],
   strategy = {},
   interval = "15m",
@@ -250,7 +332,7 @@ export function simulateRiskManagedMomentum({
   }
 
   const feeRate = Math.max(0, (asNumber(feeBps, 0) ?? 0) / 10_000);
-  const engine = new RiskManagedMomentumSignalEngine({
+  const engine = createSignalEngine({
     strategy: {
       ...strategy,
     },
@@ -419,6 +501,10 @@ export function simulateRiskManagedMomentum({
   };
 }
 
+export function simulateRiskManagedMomentum(args = {}) {
+  return simulateStrategyPerformance(args);
+}
+
 export function simulateWalkForwardRiskManagedMomentum({
   candles = [],
   strategy = {},
@@ -465,7 +551,7 @@ export function simulateWalkForwardRiskManagedMomentum({
   for (const fold of folds) {
     const train = rows.slice(0, fold.trainEnd);
     const test = rows.slice(fold.testStart, fold.testEnd);
-    const testResult = simulateRiskManagedMomentum({
+    const testResult = simulateStrategyPerformance({
       candles: test,
       strategy,
       interval,
@@ -546,7 +632,7 @@ export function simulateWalkForwardRiskManagedMomentum({
   };
 }
 
-export function optimizeRiskManagedMomentum({
+function optimizeStrategies({
   candlesBySymbol = {},
   strategyBase = {},
   constraints = {},
@@ -554,9 +640,22 @@ export function optimizeRiskManagedMomentum({
   gridConfig = {},
   walkForward = {},
 } = {}) {
-  const grid = buildMomentumGrid(gridConfig);
+  const strategyNames = resolveStrategyNames(gridConfig);
+  const strategyGrids = new Map(
+    strategyNames.map((strategyName) => [strategyName, buildStrategyGrid(strategyName, gridConfig)]),
+  );
   const ranked = [];
   const symbols = Object.keys(candlesBySymbol).map((item) => normalizeSymbol(item));
+  const walkForwardEnabled = walkForward.enabled === true;
+  const walkForwardConfig = {
+    enabled: walkForwardEnabled,
+    trainWindow: asPositiveInt(walkForward.trainWindow, 80),
+    testWindow: asPositiveInt(walkForward.testWindow, 40),
+    stepWindow: asPositiveInt(walkForward.stepWindow, 30),
+    maxFolds: asPositiveInt(walkForward.maxFolds, 0),
+    scoreWeight: asNumber(walkForward.scoreWeight, 0.25),
+    minScore: asNumber(walkForward.minScore, -999999),
+  };
 
   for (const symbol of symbols) {
     const candles = normalizeCandles(candlesBySymbol[symbol] || []);
@@ -564,30 +663,16 @@ export function optimizeRiskManagedMomentum({
       continue;
     }
 
-    for (const candidate of grid) {
-      const strategy = {
-        name: "risk_managed_momentum",
-        ...strategyBase,
-        ...candidate,
-      };
+    for (const strategyName of strategyNames) {
+      const grid = strategyGrids.get(strategyName) || [];
+      for (const candidate of grid) {
+        const strategy = {
+          ...strategyBase,
+          ...candidate,
+          name: strategyName,
+        };
 
-      const simulationResult = simulateRiskManagedMomentum({
-        candles,
-        strategy,
-        interval: simulation.interval,
-        initialCashKrw: simulation.initialCashKrw,
-        baseOrderAmountKrw: simulation.baseOrderAmountKrw,
-        minOrderNotionalKrw: simulation.minOrderNotionalKrw,
-        feeBps: simulation.feeBps,
-        simulatedSlippageBps: simulation.simulatedSlippageBps,
-        autoSellEnabled: simulation.autoSellEnabled,
-      });
-      if (!simulationResult.ok) {
-        continue;
-      }
-
-      const walkForwardResult = walkForward.enabled
-        ? simulateWalkForwardRiskManagedMomentum({
+        const simulationResult = simulateStrategyPerformance({
           candles,
           strategy,
           interval: simulation.interval,
@@ -597,53 +682,66 @@ export function optimizeRiskManagedMomentum({
           feeBps: simulation.feeBps,
           simulatedSlippageBps: simulation.simulatedSlippageBps,
           autoSellEnabled: simulation.autoSellEnabled,
-          walkForward: {
-            trainWindow: walkForward.trainWindow,
-            testWindow: walkForward.testWindow,
-            stepWindow: walkForward.stepWindow,
-            maxFolds: walkForward.maxFolds,
-          },
-        })
-        : null;
+        });
+        if (!simulationResult.ok) {
+          continue;
+        }
 
-      const walkForwardScore = walkForward.enabled
-        ? walkForwardResult?.ok ? walkForwardResult.metrics?.score || 0 : -999999
-        : 0;
-      const score = scoreCandidate({
-        ...simulationResult.metrics,
-        walkForwardScore,
-      }) + walkForwardScore * (asNumber(walkForward.scoreWeight, 0.25) || 0.25);
+        const walkForwardResult = walkForwardEnabled
+          ? simulateWalkForwardRiskManagedMomentum({
+            candles,
+            strategy,
+            interval: simulation.interval,
+            initialCashKrw: simulation.initialCashKrw,
+            baseOrderAmountKrw: simulation.baseOrderAmountKrw,
+            minOrderNotionalKrw: simulation.minOrderNotionalKrw,
+            feeBps: simulation.feeBps,
+            simulatedSlippageBps: simulation.simulatedSlippageBps,
+            autoSellEnabled: simulation.autoSellEnabled,
+            walkForward: walkForwardConfig,
+          })
+          : null;
 
-      const safety = safetyCheck(
-        {
+        const walkForwardScore = walkForwardEnabled
+          ? walkForwardResult?.ok ? walkForwardResult.metrics?.score || 0 : -999999
+          : 0;
+        const score = scoreCandidate({
           ...simulationResult.metrics,
           walkForwardScore,
-          walkForwardFoldCount: walkForwardResult?.metrics?.foldCount || 0,
-          walkForwardPassRate: walkForwardResult?.metrics?.passRate || 0,
-        },
-        {
-          ...constraints,
-          walkForwardEnabled: walkForward.enabled === true,
-          minWalkForwardScore: walkForward.minScore,
-          minWalkForwardFoldCount: walkForward.minFoldCount,
-          minWalkForwardPassRate: walkForward.minPassRate,
-        },
-      );
-      ranked.push({
-        symbol,
-        strategy,
-        metrics: simulationResult.metrics,
-        walkForward: walkForwardResult
-          ? {
-              ok: walkForwardResult.ok,
-              error: walkForwardResult.error || null,
-              metrics: walkForwardResult.metrics,
-              folds: walkForwardResult.folds,
-            }
-          : null,
-        safety,
-        score,
-      });
+        }) + walkForwardScore * (walkForwardConfig.scoreWeight || 0.25);
+
+        const safety = safetyCheck(
+          {
+            ...simulationResult.metrics,
+            walkForwardScore,
+            walkForwardFoldCount: walkForwardResult?.metrics?.foldCount || 0,
+            walkForwardPassRate: walkForwardResult?.metrics?.passRate || 0,
+          },
+          {
+            ...constraints,
+            walkForwardEnabled,
+            minWalkForwardScore: walkForwardConfig.minScore,
+            minWalkForwardFoldCount: walkForward.minFoldCount,
+            minWalkForwardPassRate: walkForward.minPassRate,
+          },
+        );
+        ranked.push({
+          symbol,
+          strategy,
+          strategyName,
+          metrics: simulationResult.metrics,
+          walkForward: walkForwardResult
+            ? {
+                ok: walkForwardResult.ok,
+                error: walkForwardResult.error || null,
+                metrics: walkForwardResult.metrics,
+                folds: walkForwardResult.folds,
+              }
+            : null,
+          safety,
+          score,
+        });
+      }
     }
   }
 
@@ -659,23 +757,17 @@ export function optimizeRiskManagedMomentum({
 
   const safeRanked = ranked.filter((row) => row.safety.safe);
   const best = safeRanked[0] || ranked[0] || null;
+  const gridSize = Array.from(strategyGrids.values()).reduce((sum, grid) => sum + grid.length, 0);
 
   return {
     best,
     ranked,
     safeRanked,
-    walkForwardConfig: {
-      enabled: walkForward.enabled === true,
-    trainWindow: asPositiveInt(walkForward.trainWindow, 80),
-    testWindow: asPositiveInt(walkForward.testWindow, 40),
-    stepWindow: asPositiveInt(walkForward.stepWindow, 30),
-    maxFolds: asPositiveInt(walkForward.maxFolds, 0),
-    scoreWeight: asNumber(walkForward.scoreWeight, 0.25),
-    minScore: asNumber(walkForward.minScore, -999999),
-  },
+    strategyNames,
+    walkForwardConfig,
     evaluatedSymbols: symbols.length,
     evaluatedCandidates: ranked.length,
-    gridSize: grid.length,
+    gridSize,
     constraints: {
       maxDrawdownPctLimit: asNumber(constraints.maxDrawdownPctLimit, 12) ?? 12,
       minTrades: asNumber(constraints.minTrades, 4) ?? 4,
@@ -696,4 +788,12 @@ export function optimizeRiskManagedMomentum({
       },
     },
   };
+}
+
+export function optimizeTradingStrategies(args = {}) {
+  return optimizeStrategies(args);
+}
+
+export function optimizeRiskManagedMomentum(args = {}) {
+  return optimizeStrategies(args);
 }

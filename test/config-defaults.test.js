@@ -15,22 +15,27 @@ test("defaults include orthodox strategy and overlay settings", () => {
   assert.equal(config.strategy.candleInterval, "15m");
   assert.equal(config.strategy.momentumLookback, 24);
   assert.equal(config.strategy.volatilityLookback, 72);
+  assert.equal(config.strategy.meanLookback, 20);
+  assert.equal(config.strategy.meanEntryBps, 60);
+  assert.equal(config.strategy.meanExitBps, 10);
   assert.equal(config.strategy.autoSellEnabled, true);
   assert.equal(config.strategy.sellAllOnExit, true);
   assert.equal(config.strategy.sellAllQtyPrecision, 8);
   assert.equal(config.strategy.breakoutLookback, 20);
   assert.equal(config.overlay.timeoutMs, 500);
+  assert.equal(config.overlay.enabled, false);
   assert.equal(config.exchange.publicMaxPerSec, 150);
   assert.equal(config.exchange.privateMaxPerSec, 140);
   assert.equal(config.exchange.wsPublicUrl, "wss://ws-api.bithumb.com/websocket/v1");
   assert.equal(config.exchange.wsPrivateUrl, "wss://ws-api.bithumb.com/websocket/v1/private");
   assert.equal(config.exchange.wsConnectMaxPerSec, 5);
-  assert.equal(config.ai.enabled, true);
-  assert.equal(config.ai.settingsFile.endsWith(".trader/ai-settings.json"), true);
-  assert.equal(config.ai.applyOverlay, true);
-  assert.equal(config.ai.applyKillSwitch, true);
-  assert.equal(config.ai.refreshMinSec, 1800);
-  assert.equal(config.ai.refreshMaxSec, 3600);
+  assert.equal(config.strategySettings.enabled, true);
+  assert.equal(config.strategySettings.settingsFile.endsWith(".trader/strategy-settings.json"), true);
+  assert.equal(config.strategySettings.requireOptimizerSource, true);
+  assert.equal(config.strategySettings.maxAgeSec, 7200);
+  assert.equal(config.strategySettings.allowKillSwitchReset, false);
+  assert.equal(config.strategySettings.refreshMinSec, 1800);
+  assert.equal(config.strategySettings.refreshMaxSec, 3600);
   assert.equal(config.marketUniverse.enabled, true);
   assert.equal(config.marketUniverse.quote, "KRW");
   assert.equal(config.marketUniverse.minAccTradeValue24hKrw, 20_000_000_000);
@@ -47,16 +52,36 @@ test("defaults include orthodox strategy and overlay settings", () => {
   assert.equal(config.execution.orderAmountKrw, 20000);
   assert.equal(config.execution.windowSec, 300);
   assert.equal(config.execution.cooldownSec, 30);
+  assert.equal(config.execution.maxSymbolsPerWindow, 1);
   assert.equal(config.execution.dryRun, false);
   assert.equal(config.execution.maxWindows, 0);
   assert.equal(config.execution.logOnlyOnActivity, true);
   assert.equal(config.execution.heartbeatWindows, 12);
   assert.equal(config.optimizer.enabled, true);
+  assert.equal(config.optimizer.applyOnStart, true);
   assert.equal(config.optimizer.reoptEnabled, true);
   assert.equal(config.optimizer.reoptIntervalSec, 3600);
+  assert.equal(config.optimizer.applyToStrategySettings, true);
+  assert.equal(config.optimizer.maxLiveSymbols, 1);
+  assert.equal(config.optimizer.minHistoryCandles, 200);
+  assert.deepEqual(config.optimizer.strategies, ["risk_managed_momentum", "breakout", "mean_reversion"]);
+  assert.deepEqual(config.optimizer.breakoutBufferBpsCandidates, [0, 5, 10, 15]);
+  assert.deepEqual(config.optimizer.breakoutLookbacks, [10, 20, 30, 55]);
+  assert.deepEqual(config.optimizer.meanLookbacks, [12, 20, 30, 48]);
+  assert.deepEqual(config.optimizer.meanExitBpsCandidates, [0, 10, 20, 30]);
 });
 
 test("symbol conversion helpers work", () => {
   assert.equal(normalizeSymbol("usdt-krw"), "USDT_KRW");
   assert.equal(toBithumbMarket("USDT_KRW"), "KRW-USDT");
+});
+
+test("market universe include symbols can be explicitly disabled", () => {
+  const config = loadConfig({
+    MARKET_UNIVERSE_INCLUDE_SYMBOLS: "NONE",
+    OPTIMIZER_MIN_HISTORY_CANDLES: "160",
+  });
+
+  assert.deepEqual(config.marketUniverse.includeSymbols, []);
+  assert.equal(config.optimizer.minHistoryCandles, 160);
 });

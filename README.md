@@ -1,7 +1,7 @@
 # buycoin-trader
 
 실거래 전용 Bithumb 자동매매 시스템입니다.  
-현재 운영 방식은 **Execution-First**이며, AI는 주문 타이밍을 직접 실행하지 않고 **정책/설정 감독자**로 동작합니다.
+현재 운영 방식은 **Execution-First**이며, 룰 기반 전략 탐색과 리스크 제어로 수익률을 극대화하는 쪽에 초점을 둡니다.
 
 ---
 
@@ -11,14 +11,15 @@
 
 `MarketData -> SignalEngine -> RiskEngine -> ExecutionEngine`
 
-AI 역할:
-- `.trader/ai-runtime.json`에 정책 입력
-- `npm run optimize`가 정책을 검증/병합해 `.trader/ai-settings.json` 생성
-- 런타임(`npm start`)이 `ai-settings` 스냅샷을 주기적으로 반영
+전략 운영:
+- `npm run optimize`가 시장 데이터와 설정을 기반으로 전략 후보를 평가
+- 결과 스냅샷은 `.trader/strategy-settings.json`에 반영
+- 런타임(`npm start`)은 시작 시 자동 최적화를 1회 수행하고, 이후 주기적으로 재최적화/재적용
 
 핵심 원칙:
-- 틱 단위 AI 추론으로 주문하지 않음
-- 주문 실행은 규칙 기반으로 결정
+- 틱 단위 추론이나 임의 판단으로 주문하지 않음
+- 주문 실행은 규칙 기반 시그널과 리스크 조건으로 결정
+- 전략 탐색은 백테스트/워크포워드/실거래 제약을 함께 반영
 - 위험 제어가 수익 최적화보다 우선
 
 ---
@@ -27,12 +28,14 @@ AI 역할:
 
 - 런타임: **live-only** (`npm start`)
 - 실행 프로세스: PM2 상시 실행 권장
-- 설정 반영: 파일 기반 (`.trader/ai-runtime.json` → `optimize` → `.trader/ai-settings.json`)
+- 설정 반영: 파일 기반 (`optimize` → `.trader/strategy-settings.json`)
+- 자동 재최적화: `npm start`가 `OPTIMIZER_APPLY_ON_START`, `OPTIMIZER_REOPT_*` 기준으로 직접 수행
 - 시장 유니버스: `.trader/market-universe.json` 기반 필터 적용
 
 현재 기본 운용 프로파일(품질 우선):
-- symbols: `BTC_KRW`, `XRP_KRW` 중심 (상황에 따라 4심볼 프로파일 사용)
-- `maxSymbolsPerWindow`: 2~4
+- live symbols: 기본 1심볼(`OPTIMIZER_MAX_LIVE_SYMBOLS=1`) 보수 운용
+- 탐색 유니버스: `MARKET_UNIVERSE_MAX_SYMBOLS`를 넓게 두고, 신규 코인은 `OPTIMIZER_MIN_HISTORY_CANDLES`로 차단
+- `maxSymbolsPerWindow`: 1~3
 - `maxOrderAttemptsPerWindow`: 1~2
 - `orderAmountKrw`: 동적(현금 기준) 또는 20,000 고정
 
@@ -72,6 +75,7 @@ AI 역할:
 3. reject reason Top3(rule)
 4. 기준손익(`operator-baseline.json` 기준 baseline/equity/pnl)
 5. 포지션 변화
+6. 최근 전략 스냅샷 요약(`strategy-settings.json`)
 
 기준손익 파일:
 - `.trader/operator-baseline.json`
@@ -80,8 +84,7 @@ AI 역할:
 
 ## 5) 주요 파일
 
-- `.trader/ai-runtime.json` : AI 정책 입력
-- `.trader/ai-settings.json` : optimize 병합 결과(런타임 반영 대상)
+- `.trader/strategy-settings.json` : optimize 병합 결과(런타임 반영 대상)
 - `.trader/state.json` : 런타임 상태/주문/이벤트
 - `.trader/market-universe.json` : 거래 가능 심볼 스냅샷
 - `.trader/execution-kpi-summary.json` : KPI 요약
@@ -125,15 +128,17 @@ pm2 status
 
 - Node.js 20+
 - Bithumb API Key/Secret
-- `.env` 설정 필수 (`BITHUMB_*`, `TRADER_*`, `RISK_*`, `AI_SETTINGS_*` 등)
+- `.env` 설정 필수 (`BITHUMB_*`, `TRADER_*`, `RISK_*`, `OPTIMIZER_*`, `STRATEGY_*` 등)
 
 ---
 
 ## 8) 운영 주의사항
 
-- `npm start`는 상시 데몬으로 운영하고, cron에는 `optimize`/운영 점검 작업만 배치
-- settings 반영은 파일 스냅샷/refresh 주기 기반이므로 즉시 반영이 필요한 경우 optimize + 재시작 검증 수행
-- 이상 징후(성공률 급락/거절률 급등/정책-로그 불일치) 시 즉시 핫픽스 후 재검증
+- `npm start` 단독으로도 시작 시 최적화 + 주기 재최적화가 동작하도록 설계됨
+- `strategy-settings.json`은 `version=1`, `updatedAt`, `meta.source=optimizer`를 만족하고 max-age 정책을 통과해야 live에 반영됨
+- 리스크 정책이 올린 runtime kill-switch는 `strategy-settings.controls.killSwitch=false`로 자동 해제되지 않음
+- overlay는 기본 비활성화되어 과거 `.trader/overlay.json`이 주문 크기를 왜곡하지 않음
+- 이상 징후(성공률 급락/거절률 급등/전략-로그 불일치) 시 즉시 핫픽스 후 재검증
 
 ---
 

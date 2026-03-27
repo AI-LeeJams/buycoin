@@ -315,11 +315,11 @@ test("strategy realtime executes buy from websocket ticks", async () => {
   assert.equal(exchange.placeCalls.length >= 1, true);
 });
 
-test("strategy realtime can execute AI override decision without signal trigger", async () => {
+test("strategy realtime can execute policy override decision without signal trigger", async () => {
   const config = await createConfig();
   const exchange = new ExchangeMock();
   // HOLD_HISTORY has highest high = 105, so price 100 never triggers breakout-up.
-  // Only the AI override BUY should fire (once, then consumed).
+  // Only the policy override BUY should fire (once, then consumed).
   const wsClient = new WsClientMock([
     { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700000 },
     { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700001 },
@@ -353,7 +353,7 @@ test("strategy realtime can execute AI override decision without signal trigger"
   assert.equal(exchange.placeCalls.length, 1);
   assert.equal(exchange.placeCalls[0].side, "buy");
   assert.equal(exchange.placeCalls[0].amountKrw, 20000);
-  assert.equal(result.data.decisions[0].actionSource, "ai_override");
+  assert.equal(result.data.decisions[0].actionSource, "policy_override");
 });
 
 test("strategy realtime does not consume force-once override on non-actionable sell", async () => {
@@ -399,7 +399,7 @@ test("strategy realtime does not consume force-once override on non-actionable s
   // With pre-loaded history every tick is evaluated; all decisions are override SELL
   // skipped due to no position — confirming forceOnce is never consumed.
   assert.ok(result.data.decisions.length >= 1);
-  assert.equal(result.data.decisions.every((row) => row.actionSource === "ai_override"), true);
+  assert.equal(result.data.decisions.every((row) => row.actionSource === "policy_override"), true);
   assert.equal(result.data.decisions.every((row) => row.skipped === "no_position"), true);
 });
 
@@ -409,7 +409,7 @@ test("realtime respects open-order cap with stale ACCEPTED state", async () => {
   });
   const exchange = new ExchangeMock();
   // HOLD_HISTORY (highest=105) keeps the signal neutral for prices 95-98,
-  // so only the AI override BUY fires — it should succeed (ACCEPTED order is not open).
+  // so only the policy override BUY fires — it should succeed (ACCEPTED order is not open).
   const wsClient = new WsClientMock([
     { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 95, streamType: "REALTIME", timestamp: 2700000 },
     { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 96, streamType: "REALTIME", timestamp: 2700001 },

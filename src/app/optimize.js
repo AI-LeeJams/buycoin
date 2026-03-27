@@ -7,406 +7,17 @@ import { loadConfig, normalizeSymbol } from "../config/defaults.js";
 import { BithumbClient } from "../exchange/bithumb-client.js";
 import { logger as defaultLogger } from "../lib/output.js";
 import { nowIso } from "../lib/time.js";
+import { CuratedMarketUniverse } from "../core/market-universe.js";
 import { MarketDataService } from "../core/market-data.js";
-import { optimizeRiskManagedMomentum } from "../engine/strategy-optimizer.js";
-import { AiSettingsSource } from "./ai-settings.js";
+import { optimizeTradingStrategies } from "../engine/strategy-optimizer.js";
+import { StrategySettingsSource } from "./strategy-settings.js";
 
-const AI_RUNTIME_DIRECTIVE_KEYS = {
-  execution: [
-    "symbol",
-    "symbols",
-    "orderAmountKrw",
-    "maxSymbolsPerWindow",
-    "maxOrderAttemptsPerWindow",
-  ],
-  decision: [
-    "mode",
-    "allowBuy",
-    "allowSell",
-    "forceAction",
-    "forceAmountKrw",
-    "forceOnce",
-    "note",
-    "symbols",
-  ],
-  overlay: [
-    "multiplier",
-    "score",
-    "regime",
-    "note",
-  ],
-  controls: [
-    "killSwitch",
-  ],
-};
-const AI_RUNTIME_DIRECTIVE_ROOT_KEYS = new Set([
-  "version",
-  "updatedAt",
-  "meta",
-  "execution",
-  "decision",
-  "overlay",
-  "controls",
-]);
-const AI_RUNTIME_DIRECTIVE_FILE_STABILITY_ATTEMPTS = 3;
-const AI_RUNTIME_DIRECTIVE_FILE_STABILITY_DELAY_MS = 60;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function validateRuntimeDirectiveContract(raw = {}, logger, directiveFile) {
-  const source = asObject(raw);
-  if (!source) {
-    logger.warn("optimizer skipped AI runtime directive: invalid root payload", {
-      file: directiveFile,
-    });
-    return false;
-  }
-
-  const rawUpdatedAt = parseDirectiveTimestamp(source.updatedAt);
-  if (source.updatedAt !== undefined && !Number.isFinite(rawUpdatedAt)) {
-    logger.warn("optimizer skipped AI runtime directive: invalid updatedAt", {
-      file: directiveFile,
-    });
-    return false;
-  }
-
-  if (source.version !== undefined && source.version !== 1 && source.version !== "1") {
-    logger.warn("optimizer ignored unsupported AI_RUNTIME_SETTINGS_FILE.version (expected 1)", {
-      file: directiveFile,
-      version: source.version,
-    });
-  }
-
-  const unknownKeys = Object.keys(source).filter((key) => !AI_RUNTIME_DIRECTIVE_ROOT_KEYS.has(key));
-  if (unknownKeys.length > 0) {
-    logger.warn("optimizer ignored unsupported keys in AI_RUNTIME_SETTINGS_FILE", {
-      file: directiveFile,
-      ignored: unknownKeys,
-    });
-  }
-
-  return true;
-}
-
-function parseDirectiveTimestamp(value) {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return value;
-  }
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function isRuntimeDirectiveStale(raw = {}, config, logger, directiveFile) {
-  const maxAgeSec = Number(config?.ai?.runtimeSettingsMaxAgeSec || 0);
-  if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0) {
-    return false;
-  }
-
-  const updatedAt = parseDirectiveTimestamp(raw.updatedAt)
-    ?? parseDirectiveTimestamp(raw?.meta?.updatedAt)
-    ?? parseDirectiveTimestamp(raw?.meta?.generatedAt)
-    ?? parseDirectiveTimestamp(raw?.generatedAt);
-  if (!Number.isFinite(updatedAt)) {
-    logger.warn("optimizer skipped AI runtime directive: missing/invalid updatedAt while max age policy is enabled", {
-      file: directiveFile,
-      maxAgeSec,
-    });
-    return true;
-  }
-
-  const ageMs = Date.now() - Number(updatedAt);
-  const maxAgeMs = maxAgeSec * 1_000;
-  if (ageMs > maxAgeMs) {
-    logger.warn("optimizer skipped stale AI runtime directive", {
-      file: directiveFile,
-      updatedAt: new Date(updatedAt).toISOString(),
-      ageSec: Math.floor(ageMs / 1_000),
-      maxAgeSec,
-    });
-    return true;
-  }
-  if (ageMs < -60_000) {
-    logger.warn("optimizer noticed AI runtime directive updatedAt in future", {
-      file: directiveFile,
-      updatedAt: new Date(updatedAt).toISOString(),
-    });
-  }
-  return false;
-}
-
-function asObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
-}
-
-function pickObject(source, keys) {
-  if (!source) {
-    return {};
-  }
-  const result = {};
-  for (const key of keys) {
-    if (Object.hasOwn(source, key)) {
-      result[key] = source[key];
-    }
-  }
-  return result;
-}
-
-function normalizeSymbolArray(value) {
-  const source = Array.isArray(value)
-    ? value
-    : typeof value === "string"
-      ? value.split(",")
-      : [];
-
-  return Array.from(new Set(
-    source
-      .map((item) => normalizeSymbol(String(item).trim()))
-      .filter(Boolean),
-  ));
-}
-
-function normalizeAiRuntimeDirective(raw) {
-  const source = asObject(raw);
-  if (!source) {
+function roundNum(value, digits = 4) {
+  if (!Number.isFinite(Number(value))) {
     return null;
   }
-
-  const executionSource = asObject(source.execution) || {};
-  const directive = {};
-
-  const symbolCandidates = Object.hasOwn(executionSource, "symbols")
-    ? executionSource.symbols
-    : Object.hasOwn(source, "symbols")
-      ? source.symbols
-      : null;
-  const executionSymbols = normalizeSymbolArray(symbolCandidates);
-  const execution = pickObject(executionSource, AI_RUNTIME_DIRECTIVE_KEYS.execution);
-  if (executionSymbols.length > 0) {
-    execution.symbols = executionSymbols;
-    if (!execution.symbol) {
-      execution.symbol = executionSymbols[0];
-    }
-  }
-  if (typeof executionSource.symbol === "string") {
-    const symbol = normalizeSymbol(executionSource.symbol);
-    if (symbol) {
-      execution.symbol = symbol;
-      if (execution.symbols && execution.symbols.length > 0 && !execution.symbols.includes(symbol)) {
-        execution.symbols.unshift(symbol);
-      }
-    }
-  }
-  if (Object.keys(execution).length > 0) {
-    directive.execution = execution;
-  }
-
-  const decision = pickObject(asObject(source.decision), AI_RUNTIME_DIRECTIVE_KEYS.decision);
-  if (Object.keys(decision).length > 0) {
-    directive.decision = decision;
-  }
-
-  const overlay = pickObject(asObject(source.overlay), AI_RUNTIME_DIRECTIVE_KEYS.overlay);
-  if (Object.keys(overlay).length > 0) {
-    directive.overlay = overlay;
-  }
-
-  const controls = pickObject(asObject(source.controls), AI_RUNTIME_DIRECTIVE_KEYS.controls);
-  if (Object.keys(controls).length > 0) {
-    directive.controls = controls;
-  }
-
-  return Object.keys(directive).length > 0 ? directive : null;
-}
-
-async function loadAiRuntimeDirective(config, logger) {
-  const directiveFile = config.ai?.runtimeSettingsFile;
-  if (!directiveFile) {
-    return null;
-  }
-
-  try {
-    const raw = await loadJsonWithWriteStabilityGuard(directiveFile, logger);
-    if (!validateRuntimeDirectiveContract(raw, logger, directiveFile)) {
-      return null;
-    }
-    if (isRuntimeDirectiveStale(raw, config, logger, directiveFile)) {
-      return null;
-    }
-    return normalizeAiRuntimeDirective(raw);
-  } catch (error) {
-    logger.warn("optimizer failed to load external ai runtime file; fallback to existing optimizer symbol sources", {
-      file: directiveFile,
-      error: error.message,
-    });
-    return null;
-  }
-}
-
-async function loadJsonWithWriteStabilityGuard(filePath, logger) {
-  const maxAttempts = AI_RUNTIME_DIRECTIVE_FILE_STABILITY_ATTEMPTS;
-  const delayMs = AI_RUNTIME_DIRECTIVE_FILE_STABILITY_DELAY_MS;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    let beforeStat;
-    try {
-      beforeStat = await fs.stat(filePath);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return {};
-      }
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-      logger?.warn("optimizer failed to stat AI runtime directive file; retrying", {
-        file: filePath,
-        attempt,
-        maxAttempts,
-        error: error.message,
-      });
-      await sleep(delayMs);
-      continue;
-    }
-
-    let rawText;
-    try {
-      rawText = await fs.readFile(filePath, "utf8");
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return {};
-      }
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-      logger?.warn("optimizer retrying AI runtime directive read after read error", {
-        file: filePath,
-        attempt,
-        maxAttempts,
-        error: error.message,
-      });
-      await sleep(delayMs);
-      continue;
-    }
-
-    let afterStat;
-    try {
-      afterStat = await fs.stat(filePath);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return {};
-      }
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-      logger?.warn("optimizer retrying AI runtime directive read after second stat error", {
-        file: filePath,
-        attempt,
-        maxAttempts,
-        error: error.message,
-      });
-      await sleep(delayMs);
-      continue;
-    }
-
-    if (beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
-      if (attempt >= maxAttempts) {
-        logger.warn("optimizer skipped AI runtime directive due unstable write window", {
-          file: filePath,
-          beforeSize: beforeStat.size,
-          afterSize: afterStat.size,
-          beforeMtime: new Date(beforeStat.mtimeMs).toISOString(),
-          afterMtime: new Date(afterStat.mtimeMs).toISOString(),
-        });
-        return {};
-      }
-      logger?.warn("optimizer detected unstable AI runtime directive read; retrying", {
-        file: filePath,
-        attempt,
-        maxAttempts,
-      });
-      await sleep(delayMs);
-      continue;
-    }
-
-    const trimmed = rawText.trim();
-    if (!trimmed) {
-      return {};
-    }
-
-    try {
-      return JSON.parse(trimmed);
-    } catch (error) {
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-      logger?.warn("optimizer retrying AI runtime directive read after JSON parse failure", {
-        file: filePath,
-        attempt,
-        maxAttempts,
-        error: error.message,
-      });
-      await sleep(delayMs);
-    }
-  }
-
-  return {};
-}
-
-async function resolveOptimizerSymbols(config, logger) {
-  const fallbackSymbols = Array.isArray(config?.optimizer?.symbols)
-    ? config.optimizer.symbols
-    : [];
-
-  try {
-    const directive = await loadAiRuntimeDirective(config, logger);
-    const externalSymbols = Array.isArray(directive?.execution?.symbols)
-      ? directive.execution.symbols
-      : [];
-    if (externalSymbols.length > 0) {
-      logger.info("optimizer using external ai runtime symbols", {
-        count: externalSymbols.length,
-        symbols: externalSymbols,
-        source: config.ai?.runtimeSettingsFile || "runtime-directive",
-      });
-      return externalSymbols;
-    }
-  } catch (error) {
-    logger.warn("optimizer external ai runtime path failed; fallback to ai settings", {
-      error: error.message,
-    });
-  }
-
-  try {
-    const aiSource = new AiSettingsSource(config, logger);
-    await aiSource.init();
-    const aiRuntime = await aiSource.read();
-    const aiSymbols = Array.isArray(aiRuntime?.execution?.symbols)
-      ? aiRuntime.execution.symbols
-      : [];
-    const normalized = Array.from(new Set(
-      aiSymbols
-        .map((item) => normalizeSymbol(item))
-        .filter(Boolean),
-    ));
-    if (normalized.length > 0) {
-      logger.info("optimizer using ai-selected symbols", {
-        count: normalized.length,
-        symbols: normalized,
-        source: aiRuntime.source,
-      });
-      return normalized;
-    }
-  } catch (error) {
-    logger.warn("optimizer failed to load ai symbols; fallback to optimizer config symbols", {
-      error: error.message,
-    });
-  }
-
-  return fallbackSymbols;
+  const scale = 10 ** digits;
+  return Math.round(Number(value) * scale) / scale;
 }
 
 async function writeJson(filePath, payload) {
@@ -431,7 +42,7 @@ async function writeJson(filePath, payload) {
   }
 }
 
-async function loadAiSettingsSafe(filePath) {
+async function loadStrategySettingsSafe(filePath) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
     return raw.trim() ? JSON.parse(raw) : {};
@@ -441,14 +52,6 @@ async function loadAiSettingsSafe(filePath) {
     }
     throw error;
   }
-}
-
-function roundNum(value, digits = 4) {
-  if (!Number.isFinite(Number(value))) {
-    return null;
-  }
-  const scale = 10 ** digits;
-  return Math.round(Number(value) * scale) / scale;
 }
 
 async function acquireOptimizeLock(lockFile, ttlSec = 900, logger = defaultLogger) {
@@ -486,11 +89,11 @@ async function acquireOptimizeLock(lockFile, ttlSec = 900, logger = defaultLogge
           try {
             process.kill(lockPid, 0);
             return true;
-          } catch (error) {
-            if (error.code === "ESRCH") {
+          } catch (killError) {
+            if (killError.code === "ESRCH") {
               return false;
             }
-            if (error.code === "EPERM") {
+            if (killError.code === "EPERM") {
               return true;
             }
             return false;
@@ -521,7 +124,6 @@ async function acquireOptimizeLock(lockFile, ttlSec = 900, logger = defaultLogge
         lockMeta,
       });
       await fs.unlink(lockPath).catch(() => {});
-      continue;
     }
   }
 }
@@ -569,24 +171,24 @@ function compressCandidate(candidate) {
     symbol: candidate.symbol,
     strategy: candidate.strategy,
     score: roundNum(candidate.score, 4),
-    safe: candidate.safety.safe,
-    checks: candidate.safety.checks,
+    safe: candidate.safety?.safe === true,
+    checks: candidate.safety?.checks || {},
     metrics: {
-      totalReturnPct: roundNum(candidate.metrics.totalReturnPct, 4),
-      maxDrawdownPct: roundNum(candidate.metrics.maxDrawdownPct, 4),
-      sharpe: roundNum(candidate.metrics.sharpe, 4),
-      expectancyKrw: roundNum(candidate.metrics.expectancyKrw, 4),
-      expectancyPct: roundNum(candidate.metrics.expectancyPct, 4),
-      totalFeeKrw: roundNum(candidate.metrics.totalFeeKrw, 2),
-      avgSlippageBps: roundNum(candidate.metrics.avgSlippageBps, 4),
-      maxSlippageBps: roundNum(candidate.metrics.maxSlippageBps, 4),
-      winRatePct: roundNum(candidate.metrics.winRatePct, 4),
-      profitFactor: roundNum(candidate.metrics.profitFactor, 4),
-      tradeCount: candidate.metrics.tradeCount,
-      buyCount: candidate.metrics.buyCount,
-      sellCount: candidate.metrics.sellCount,
-      turnoverKrw: roundNum(candidate.metrics.turnoverKrw, 2),
-      finalEquityKrw: roundNum(candidate.metrics.finalEquityKrw, 2),
+      totalReturnPct: roundNum(candidate.metrics?.totalReturnPct, 4),
+      maxDrawdownPct: roundNum(candidate.metrics?.maxDrawdownPct, 4),
+      sharpe: roundNum(candidate.metrics?.sharpe, 4),
+      expectancyKrw: roundNum(candidate.metrics?.expectancyKrw, 2),
+      expectancyPct: roundNum(candidate.metrics?.expectancyPct, 4),
+      totalFeeKrw: roundNum(candidate.metrics?.totalFeeKrw, 2),
+      avgSlippageBps: roundNum(candidate.metrics?.avgSlippageBps, 4),
+      maxSlippageBps: roundNum(candidate.metrics?.maxSlippageBps, 4),
+      winRatePct: roundNum(candidate.metrics?.winRatePct, 4),
+      profitFactor: roundNum(candidate.metrics?.profitFactor, 4),
+      tradeCount: candidate.metrics?.tradeCount ?? 0,
+      buyCount: candidate.metrics?.buyCount ?? 0,
+      sellCount: candidate.metrics?.sellCount ?? 0,
+      turnoverKrw: roundNum(candidate.metrics?.turnoverKrw, 2),
+      finalEquityKrw: roundNum(candidate.metrics?.finalEquityKrw, 2),
       walkForward: walkForward
         ? {
             foldCount: walkForward.foldCount,
@@ -602,72 +204,190 @@ function compressCandidate(candidate) {
   };
 }
 
-async function applyBestToAiSettings(config, best, logger) {
-  const aiSource = new AiSettingsSource(config, logger);
-  await aiSource.init();
-  const template = aiSource.defaultTemplate();
-  const current = await loadAiSettingsSafe(config.ai.settingsFile);
-  const directive = await loadAiRuntimeDirective(config, logger);
-  const directiveExecution = directive?.execution || {};
-  const directiveDecision = directive?.decision || {};
-  const directiveOverlay = directive?.overlay || {};
-  const directiveControls = directive?.controls || {};
+function isSameStrategy(left = {}, right = {}) {
+  return JSON.stringify(left || {}) === JSON.stringify(right || {});
+}
+
+function pickRuntimeSymbols(optimization, runtimeConfig) {
+  const best = optimization?.best;
+  if (!best) {
+    return [];
+  }
+
+  const ranked = Array.isArray(optimization.safeRanked) && optimization.safeRanked.length > 0
+    ? optimization.safeRanked
+    : Array.isArray(optimization.ranked)
+      ? optimization.ranked
+      : [];
+
+  const matchingSymbols = [];
+  for (const candidate of ranked) {
+    if (!isSameStrategy(candidate.strategy, best.strategy)) {
+      continue;
+    }
+    if (!matchingSymbols.includes(candidate.symbol)) {
+      matchingSymbols.push(candidate.symbol);
+    }
+  }
+
+  const fallbackSymbols = [best.symbol]
+    .map((item) => normalizeSymbol(item))
+    .filter(Boolean);
+  for (const symbol of fallbackSymbols) {
+    if (!matchingSymbols.includes(symbol)) {
+      matchingSymbols.push(symbol);
+    }
+  }
+
+  const maxSymbols = Math.max(1, Number(runtimeConfig.optimizer?.maxLiveSymbols || 1));
+  return matchingSymbols.slice(0, maxSymbols);
+}
+
+async function loadMarketUniverseSymbols(config, logger) {
+  const snapshotFile = config.marketUniverse?.snapshotFile;
+  if (snapshotFile) {
+    try {
+      const raw = await fs.readFile(snapshotFile, "utf8");
+      const parsed = raw.trim() ? JSON.parse(raw) : {};
+      const symbols = Array.isArray(parsed?.symbols) ? parsed.symbols : [];
+      const normalized = Array.from(new Set(symbols.map((item) => normalizeSymbol(item)).filter(Boolean)));
+      if (normalized.length > 0) {
+        return normalized;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  if (!config.marketUniverse?.enabled) {
+    return [];
+  }
+
+  const client = new BithumbClient(config, logger);
+  const marketData = new MarketDataService(config, client);
+  const universe = new CuratedMarketUniverse(config, logger, marketData);
+  await universe.init();
+  const refresh = await universe.maybeRefresh({ force: true, reason: "optimizer_bootstrap" });
+  if (!refresh.ok || !refresh.data) {
+    return [];
+  }
+  return Array.isArray(refresh.data.symbols) ? refresh.data.symbols.map((item) => normalizeSymbol(item)).filter(Boolean) : [];
+}
+
+async function resolveOptimizerSymbols(config, logger) {
+  const fallbackSymbols = Array.isArray(config?.optimizer?.symbols)
+    ? config.optimizer.symbols.map((item) => normalizeSymbol(item)).filter(Boolean)
+    : [];
+
+  try {
+    const universeSymbols = await loadMarketUniverseSymbols(config, logger);
+    const mergedSymbols = Array.from(new Set([...universeSymbols, ...fallbackSymbols]));
+    if (mergedSymbols.length > 0) {
+      logger.info("optimizer using configured market universe symbols", {
+        count: mergedSymbols.length,
+        symbols: mergedSymbols,
+        source: config.marketUniverse?.snapshotFile || "optimizer_symbols",
+      });
+      return mergedSymbols;
+    }
+  } catch (error) {
+    logger.warn("optimizer failed to load market-universe snapshot; fallback to configured symbols", {
+      error: error.message,
+    });
+  }
+
+  try {
+    const source = new StrategySettingsSource(config, logger);
+    await source.init();
+    const current = await source.read();
+    const runtimeSymbols = Array.isArray(current?.execution?.symbols)
+      ? current.execution.symbols.map((item) => normalizeSymbol(item)).filter(Boolean)
+      : [];
+    if (runtimeSymbols.length > 0) {
+      logger.info("optimizer using runtime strategy symbols as fallback", {
+        count: runtimeSymbols.length,
+        symbols: runtimeSymbols,
+        source: current.source,
+      });
+      return runtimeSymbols;
+    }
+  } catch (error) {
+    logger.warn("optimizer failed to load current strategy settings; fallback to optimizer config symbols", {
+      error: error.message,
+    });
+  }
+
+  return fallbackSymbols;
+}
+
+async function applyBestToStrategySettings(runtimeConfig, optimization, logger) {
+  const source = new StrategySettingsSource(runtimeConfig, logger);
+  await source.init();
+
+  const current = await loadStrategySettingsSafe(runtimeConfig.strategySettings.settingsFile);
+  const template = source.defaultTemplate();
+  const best = optimization.best;
+  const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
   const runId = `${Date.now()}-${process.pid}`;
-  const now = Date.now();
 
   const next = {
     ...template,
     ...current,
+    version: 1,
+    updatedAt: nowIso(),
     meta: {
       ...(current.meta && typeof current.meta === "object" ? current.meta : {}),
       source: "optimizer",
-      approvedBy: "optimize.js",
       runId,
-      approvedAt: now,
+      evaluatedStrategies: optimization.strategyNames || [],
+      bestSymbol: best.symbol,
     },
-    version: 1,
-    updatedAt: nowIso(),
     execution: {
       ...template.execution,
       ...(current.execution || {}),
-      ...directiveExecution,
       enabled: true,
+      symbol: selectedSymbols[0] || best.symbol || template.execution.symbol,
+      symbols: selectedSymbols.length > 0
+        ? selectedSymbols
+        : [best.symbol || template.execution.symbol],
+      orderAmountKrw: Math.max(
+        1,
+        Number(best.strategy?.baseOrderAmountKrw || runtimeConfig.optimizer.baseOrderAmountKrw || template.execution.orderAmountKrw),
+      ),
+      maxSymbolsPerWindow: selectedSymbols.length > 0 ? selectedSymbols.length : 1,
     },
     strategy: {
       ...template.strategy,
       ...(current.strategy || {}),
       ...best.strategy,
-      name: "risk_managed_momentum",
-      candleInterval: config.optimizer.interval,
-      candleCount: config.optimizer.candleCount,
-    },
-    overlay: {
-      ...template.overlay,
-      ...(current.overlay || {}),
-      ...directiveOverlay,
-    },
-    decision: {
-      ...template.decision,
-      ...(current.decision || {}),
-      ...directiveDecision,
+      defaultSymbol: selectedSymbols[0] || best.symbol || template.strategy.defaultSymbol,
+      candleInterval: runtimeConfig.optimizer.interval,
+      candleCount: runtimeConfig.optimizer.candleCount,
     },
     controls: {
       ...template.controls,
       ...(current.controls || {}),
-      ...directiveControls,
     },
   };
 
-  await writeJson(config.ai.settingsFile, next);
+  await writeJson(runtimeConfig.strategySettings.settingsFile, next);
   return {
-    settingsFile: config.ai.settingsFile,
+    settingsFile: runtimeConfig.strategySettings.settingsFile,
     appliedAt: next.updatedAt,
+    symbols: next.execution.symbols,
+    strategy: next.strategy.name,
   };
 }
 
 async function fetchCandlesBySymbol(config, logger, symbols) {
   const client = new BithumbClient(config, logger);
   const marketData = new MarketDataService(config, client);
+  const minHistoryCandles = Math.max(
+    30,
+    Number(config.optimizer?.minHistoryCandles || config.optimizer?.candleCount || 200),
+  );
 
   const candlesBySymbol = {};
   const fetchErrors = [];
@@ -679,7 +399,21 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
         interval: config.optimizer.interval,
         count: config.optimizer.candleCount,
       });
-      candlesBySymbol[symbol] = response.candles || [];
+      const candles = Array.isArray(response.candles) ? response.candles : [];
+      if (candles.length < minHistoryCandles) {
+        fetchErrors.push({
+          symbol,
+          message: `insufficient_history:${candles.length} < ${minHistoryCandles}`,
+        });
+        logger.warn("optimizer skipped symbol with insufficient candle history", {
+          symbol,
+          interval: config.optimizer.interval,
+          candleCount: candles.length,
+          minHistoryCandles,
+        });
+        continue;
+      }
+      candlesBySymbol[symbol] = candles;
       logger.info("optimizer fetched candles", {
         symbol,
         interval: config.optimizer.interval,
@@ -712,6 +446,18 @@ export async function optimizeAndApplyBest({
     };
   }
 
+  if (runtimeConfig.marketUniverse?.enabled) {
+    try {
+      const universe = new CuratedMarketUniverse(runtimeConfig, logger);
+      await universe.init();
+      await universe.maybeRefresh({ force: true, reason: "optimizer" });
+    } catch (error) {
+      logger.warn("optimizer failed to refresh market universe; continuing with fallback symbol sources", {
+        error: error.message,
+      });
+    }
+  }
+
   const optimizerSymbols = await resolveOptimizerSymbols(runtimeConfig, logger);
   const { candlesBySymbol, fetchErrors } = await fetchCandlesBySymbol(runtimeConfig, logger, optimizerSymbols);
   if (Object.keys(candlesBySymbol).length === 0) {
@@ -724,7 +470,7 @@ export async function optimizeAndApplyBest({
     };
   }
 
-  const optimization = optimizeRiskManagedMomentum({
+  const optimization = optimizeTradingStrategies({
     candlesBySymbol,
     strategyBase: {
       autoSellEnabled: runtimeConfig.strategy.autoSellEnabled !== false,
@@ -750,10 +496,16 @@ export async function optimizeAndApplyBest({
       autoSellEnabled: runtimeConfig.strategy.autoSellEnabled !== false,
     },
     gridConfig: {
+      strategyNames: runtimeConfig.optimizer.strategies,
       momentumLookbacks: runtimeConfig.optimizer.momentumLookbacks,
       volatilityLookbacks: runtimeConfig.optimizer.volatilityLookbacks,
       entryBpsCandidates: runtimeConfig.optimizer.entryBpsCandidates,
       exitBpsCandidates: runtimeConfig.optimizer.exitBpsCandidates,
+      breakoutLookbacks: runtimeConfig.optimizer.breakoutLookbacks,
+      breakoutBufferBpsCandidates: runtimeConfig.optimizer.breakoutBufferBpsCandidates,
+      meanLookbacks: runtimeConfig.optimizer.meanLookbacks,
+      meanEntryBpsCandidates: runtimeConfig.optimizer.meanEntryBpsCandidates,
+      meanExitBpsCandidates: runtimeConfig.optimizer.meanExitBpsCandidates,
       targetVolatilityPctCandidates: runtimeConfig.optimizer.targetVolatilityPctCandidates,
       rmMinMultiplierCandidates: runtimeConfig.optimizer.rmMinMultiplierCandidates,
       rmMaxMultiplierCandidates: runtimeConfig.optimizer.rmMaxMultiplierCandidates,
@@ -778,79 +530,26 @@ export async function optimizeAndApplyBest({
     };
   }
 
-  const walkForwardEnabled = runtimeConfig.optimizer.walkForwardEnabled === true;
-  const walkForwardRows = walkForwardEnabled
-    ? optimization.ranked.filter((row) => row?.walkForward !== null && row?.walkForward !== undefined)
-    : [];
-  const walkForwardOkRows = walkForwardRows.filter((row) => row?.walkForward?.ok === true);
-  const walkForwardFoldCounts = walkForwardRows
-    .map((row) => Number(row.walkForward?.metrics?.foldCount))
-    .filter((value) => Number.isFinite(value));
-  const walkForwardPassRates = walkForwardRows
-    .map((row) => Number(row.walkForward?.metrics?.passRate))
-    .filter((value) => Number.isFinite(value));
-
-  if (optimization.best && optimization.best.safe !== true) {
-    logger.warn("optimizer best candidate did not satisfy safety constraints", {
-      symbol: optimization.best.symbol,
-      checks: optimization.best.safety?.checks || null,
-    });
-  }
-  if (runtimeConfig.optimizer.walkForwardEnabled && optimization.best?.walkForward && !optimization.best.walkForward.ok) {
-    logger.warn("optimizer best candidate failed walk-forward validation", {
-      symbol: optimization.best.symbol,
-      error: optimization.best.walkForward.error || null,
-      walkForwardChecks: {
-        foldCount: optimization.best.walkForward?.metrics?.foldCount ?? null,
-        passRate: optimization.best.walkForward?.metrics?.passRate ?? null,
-      },
-    });
-  }
-  if (walkForwardEnabled && walkForwardRows.length === 0) {
-    logger.warn("optimizer walk-forward evaluation produced no run results (insufficient fold windows)", {
-      symbolCandidates: walkForwardRows.length,
-      symbols: optimization.evaluatedSymbols,
-      walkForwardConfig: {
-        trainWindow: runtimeConfig.optimizer.walkForwardTrainWindow,
-        testWindow: runtimeConfig.optimizer.walkForwardTestWindow,
-        stepWindow: runtimeConfig.optimizer.walkForwardStepWindow,
-        maxFolds: runtimeConfig.optimizer.walkForwardMaxFolds,
-      },
-    });
-  } else if (walkForwardEnabled && walkForwardOkRows.length === 0) {
-    logger.warn("optimizer walk-forward validation rejected all candidates", {
-      evaluatedRows: walkForwardRows.length,
-      symbols: optimization.evaluatedSymbols,
-      minFoldCount: runtimeConfig.optimizer.walkForwardMinFoldCount,
-      minPassRate: runtimeConfig.optimizer.walkForwardMinPassRate,
-    });
-  } else if (walkForwardEnabled) {
-    logger.info("optimizer walk-forward summary", {
-      evaluatedRows: walkForwardRows.length,
-      okRows: walkForwardOkRows.length,
-      foldCountMin: walkForwardFoldCounts.length > 0 ? Math.min(...walkForwardFoldCounts) : null,
-      foldCountMax: walkForwardFoldCounts.length > 0 ? Math.max(...walkForwardFoldCounts) : null,
-      passRateMin: walkForwardPassRates.length > 0 ? Math.min(...walkForwardPassRates) : null,
-      passRateMax: walkForwardPassRates.length > 0 ? Math.max(...walkForwardPassRates) : null,
-    });
-  }
-
   const topN = Math.max(1, runtimeConfig.optimizer.topResults || 10);
   const evaluatedCandidates = Number(optimization.evaluatedCandidates || 0);
   const safeCandidates = Number(Array.isArray(optimization.safeRanked) ? optimization.safeRanked.length : 0);
   const safeRatio = evaluatedCandidates > 0 ? safeCandidates / evaluatedCandidates : 0;
+  const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
+
   const report = {
     generatedAt: nowIso(),
     source: "optimizer",
     mode: "live",
     interval: runtimeConfig.optimizer.interval,
     candleCount: runtimeConfig.optimizer.candleCount,
-    walkForward: optimization.walkForwardConfig || null,
+    strategyNames: optimization.strategyNames || [],
     symbols: Object.keys(candlesBySymbol),
+    selectedSymbols,
     evaluatedSymbols: optimization.evaluatedSymbols,
     evaluatedCandidates: optimization.evaluatedCandidates,
     gridSize: optimization.gridSize,
     constraints: optimization.constraints,
+    walkForward: optimization.walkForwardConfig || null,
     fetchErrors,
     riskSummary: {
       evaluatedSymbols: optimization.evaluatedSymbols,
@@ -858,40 +557,24 @@ export async function optimizeAndApplyBest({
       safeCandidates,
       safeRatio: roundNum(safeRatio, 4),
       walkForwardEnabled: runtimeConfig.optimizer.walkForwardEnabled,
-      walkForwardStats: {
-        candidatesWithWalkForward: walkForwardRows.length,
-        walkForwardOkCandidates: walkForwardOkRows.length,
-        walkForwardFoldCountMin: walkForwardFoldCounts.length > 0 ? Math.min(...walkForwardFoldCounts) : null,
-        walkForwardFoldCountMax: walkForwardFoldCounts.length > 0 ? Math.max(...walkForwardFoldCounts) : null,
-        walkForwardPassRateMin: walkForwardPassRates.length > 0 ? Math.min(...walkForwardPassRates) : null,
-        walkForwardPassRateMax: walkForwardPassRates.length > 0 ? Math.max(...walkForwardPassRates) : null,
-        minScore: optimization.constraints?.walkForwardMinScore || -999999,
-        minFoldCount: optimization.constraints?.walkForwardMinFoldCount || 0,
-        minPassRate: optimization.constraints?.walkForwardMinPassRate || 0,
-      },
-      walkForwardConfig: {
-        minScore: optimization.constraints?.walkForwardMinScore || -999999,
-        minFoldCount: optimization.constraints?.walkForwardMinFoldCount || 0,
-        minPassRate: optimization.constraints?.walkForwardMinPassRate || 0,
-      },
     },
     best: compressCandidate(optimization.best),
     top: optimization.ranked.slice(0, topN).map(compressCandidate),
   };
 
   await writeJson(runtimeConfig.optimizer.reportFile, report);
+
   let applied = false;
   let applyResult = null;
-  const bestIsSafe = optimization.best?.safe === true;
   if (apply) {
-    if (!bestIsSafe) {
+    if (optimization.best?.safety?.safe !== true) {
       logger.warn("optimizer skipped apply: best candidate is not safe", {
         symbol: optimization.best?.symbol || null,
         checks: optimization.best?.safety?.checks || null,
         safeCandidates,
       });
     } else {
-      applyResult = await applyBestToAiSettings(runtimeConfig, optimization.best, logger);
+      applyResult = await applyBestToStrategySettings(runtimeConfig, optimization, logger);
       applied = true;
     }
   }
@@ -903,8 +586,10 @@ export async function optimizeAndApplyBest({
       applied,
       applyResult,
       riskSummary: report.riskSummary,
-      best: compressCandidate(optimization.best),
+      best: report.best,
       top: report.top,
+      selectedSymbols,
+      strategyNames: report.strategyNames,
     },
   };
 }
@@ -931,7 +616,7 @@ async function main() {
     const result = await optimizeAndApplyBest({
       config,
       logger: defaultLogger,
-      apply: config.optimizer.applyToAiSettings !== false,
+      apply: config.optimizer.applyToStrategySettings !== false,
     });
 
     if (!result.ok) {
@@ -947,19 +632,19 @@ async function main() {
       reportFile: result.data.reportFile,
       applied: result.data.applied,
       symbol: result.data.best?.symbol || null,
+      selectedSymbols: result.data.selectedSymbols || [],
+      strategyNames: result.data.strategyNames || [],
       safeCandidates: result.data.riskSummary?.safeCandidates ?? null,
       safeRatioPct: result.data.riskSummary?.safeRatio != null
         ? roundNum(result.data.riskSummary.safeRatio * 100, 2)
         : null,
       returnPct: result.data.best?.metrics?.totalReturnPct ?? null,
       maxDrawdownPct: result.data.best?.metrics?.maxDrawdownPct ?? null,
-      walkForwardEnabled: result.data.riskSummary?.walkForwardEnabled ?? false,
       strategy: result.data.best?.strategy || null,
     });
   } finally {
     await releaseOptimizeLock(lock.lockPath);
   }
-
 }
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

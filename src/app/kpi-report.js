@@ -191,6 +191,40 @@ function buildSituationPlan({ attempted = 0, successful = 0, buySignals = 0, rej
   return "체결 품질 유지: 과매매 억제하며 수익 구간 추적";
 }
 
+function summarizeStrategySettings(strategySettings = {}) {
+  const strategy = strategySettings?.strategy || {};
+  const execution = strategySettings?.execution || {};
+  const controls = strategySettings?.controls || {};
+  const meta = strategySettings?.meta || {};
+  const parts = [];
+
+  if (strategy.name) {
+    parts.push(`strategy=${strategy.name}`);
+  }
+  if (strategy.defaultSymbol) {
+    parts.push(`symbol=${strategy.defaultSymbol}`);
+  }
+  if (strategy.candleInterval) {
+    parts.push(`interval=${strategy.candleInterval}`);
+  }
+  if (Number.isFinite(Number(strategy.candleCount))) {
+    parts.push(`candles=${Number(strategy.candleCount)}`);
+  }
+  if (execution.symbols && execution.symbols.length > 0) {
+    parts.push(`executionSymbols=${execution.symbols.length}`);
+  }
+  if (Number.isFinite(Number(execution.orderAmountKrw))) {
+    parts.push(`orderAmountKrw=${Math.round(Number(execution.orderAmountKrw)).toLocaleString()}`);
+  }
+  if (controls.killSwitch !== undefined && controls.killSwitch !== null) {
+    parts.push(`killSwitch=${Boolean(controls.killSwitch)}`);
+  }
+  if (meta.source) {
+    parts.push(`source=${meta.source}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : "strategy-settings 없음";
+}
+
 function toKoreanSymbol(symbol = "") {
   const map = {
     BTC_KRW: "비트코인",
@@ -263,7 +297,8 @@ function buildKpiReportText(input) {
     "[코마 요약 보고]",
     `• 분석 품질: ${qLabel} | 기대값 ${Number.isFinite(input.expectancyKrw) ? Math.round(input.expectancyKrw).toLocaleString() : "N/A"}원/거래 | 실현거래 ${input.tradeCount}건 | 미매칭매도 ${input.unmatchedSellCount ?? 0}건 | 수수료 ${Math.round(input.totalFeeKrw || 0).toLocaleString()}원`,
     `• 기준손익: ${Math.round(input.baselinePnlKrw).toLocaleString()}원 (기준 ${Math.round(input.baselineEquityKrw).toLocaleString()} → 현재 ${Math.round(input.currentEquityKrw).toLocaleString()})`,
-    `• 설정 코인: ${configuredSymbolsText}`,
+    `• 전략 스냅샷: ${input.strategySummary}`,
+    `• 실행 종목: ${configuredSymbolsText}`,
     `• 시장 상황: ${input.marketSummary}`,
     `• 시도/성공/실패: ${input.attempted}/${input.successful}/${input.rejected} (성공률 ${successRateText}, 실패율 ${failRateText})`,
     `• 시도 허용치(cap): 윈도우당 최대 ${input.maxOrderAttemptsPerWindow ?? "N/A"}회 / 실제(actual, 최근 모니터 윈도우 누적): ${input.attempted}회`,
@@ -277,10 +312,10 @@ function buildKpiReportText(input) {
 
 export async function generateKpiReport(baseDir = process.cwd()) {
   const traderDir = path.join(baseDir, ".trader");
-  const [state, summary, aiRuntime, operatorBaseline, marketUniverse, policyState] = await Promise.all([
+  const [state, summary, strategySettings, operatorBaseline, marketUniverse, policyState] = await Promise.all([
     readJson(path.join(traderDir, "state.json"), {}),
     readJson(path.join(traderDir, "execution-kpi-summary.json"), {}),
-    readJson(path.join(traderDir, "ai-runtime.json"), {}),
+    readJson(path.join(traderDir, "strategy-settings.json"), {}),
     readJson(path.join(traderDir, "operator-baseline.json"), null),
     readJson(path.join(traderDir, "market-universe.json"), {}),
     readJson(path.join(traderDir, "adaptive-policy-state.json"), {}),
@@ -309,9 +344,8 @@ export async function generateKpiReport(baseDir = process.cwd()) {
   const recentTrades = collectRecentTrades(state, fromMs, 5);
   const marketSummary = summarizeMarket(marketUniverse, { buySignals, sellSignals });
   const situationPlan = buildSituationPlan({ attempted, successful, buySignals, rejected, expectancyKrw, tradeCount });
-
-  const decision = `regime=${aiRuntime?.overlay?.regime || "unknown"}, killSwitch=${Boolean(aiRuntime?.controls?.killSwitch)}`;
-  const changeSummary = `ai-runtime updatedAt=${aiRuntime?.updatedAt || "n/a"}`;
+  const strategySummary = summarizeStrategySettings(strategySettings);
+  const changeSummary = `strategy-settings updatedAt=${strategySettings?.updatedAt || "n/a"}, version=${strategySettings?.version ?? "n/a"}`;
 
   const currentEquityKrw = toNum(mtm.krw, 0)
     + mtm.assets
@@ -348,7 +382,7 @@ export async function generateKpiReport(baseDir = process.cwd()) {
     recentTrades,
     marketSummary,
     situationPlan,
-    decision,
+    strategySummary,
     changeSummary,
     windowLabel,
     currentEquityKrw,
@@ -372,12 +406,12 @@ export async function generateKpiReport(baseDir = process.cwd()) {
       recentTrades,
       marketSummary,
       situationPlan,
-      decision,
+      strategySummary,
       changeSummary,
       windowLabel,
-      executionSymbols: aiRuntime?.execution?.symbols || [],
-      maxOrderAttemptsPerWindow: aiRuntime?.execution?.maxOrderAttemptsPerWindow ?? null,
-      policyNote: aiRuntime?.overlay?.note || "",
+      executionSymbols: strategySettings?.execution?.symbols || [],
+      maxOrderAttemptsPerWindow: strategySettings?.execution?.maxOrderAttemptsPerWindow ?? null,
+      policyNote: strategySettings?.strategy?.note || "",
       gateReasonsText: Array.isArray(policyState?.gateReasons) && policyState.gateReasons.length > 0
         ? policyState.gateReasons.join("|")
         : "",
