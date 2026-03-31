@@ -60,6 +60,7 @@ test("strategy settings source reads execution overrides and mean reversion stra
       meanExitBps: 20,
       autoSellEnabled: true,
       baseOrderAmountKrw: 7000,
+      cashUsagePct: 80,
     },
     controls: {
       killSwitch: true,
@@ -80,7 +81,34 @@ test("strategy settings source reads execution overrides and mean reversion stra
   assert.equal(result.strategy.meanLookback, 24);
   assert.equal(result.strategy.meanEntryBps, 90);
   assert.equal(result.strategy.meanExitBps, 20);
+  assert.equal(result.strategy.cashUsagePct, 80);
   assert.equal(result.controls.killSwitch, true);
+});
+
+test("strategy settings source preserves execution order amount when risk max order is auto", async () => {
+  const config = await makeConfig({
+    RISK_MAX_ORDER_NOTIONAL_KRW: "AUTO",
+  });
+  const source = new StrategySettingsSource(config);
+  await source.init();
+
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    execution: {
+      enabled: true,
+      symbol: "btc-krw",
+      symbols: ["btc-krw"],
+      orderAmountKrw: 500000,
+      windowSec: 120,
+      cooldownSec: 15,
+    },
+  };
+  await fs.writeFile(config.strategySettings.settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const result = await source.read();
+
+  assert.equal(result.execution.orderAmountKrw, 500000);
 });
 
 test("strategy settings source accepts comma-separated symbols", async () => {
@@ -105,6 +133,42 @@ test("strategy settings source accepts comma-separated symbols", async () => {
   const result = await source.read();
   assert.equal(result.execution.symbol, "BTC_KRW");
   assert.deepEqual(result.execution.symbols, ["BTC_KRW", "ETH_KRW", "USDT_KRW"]);
+});
+
+test("strategy settings source diversifies optimizer-managed multi-symbol snapshots", async () => {
+  const config = await makeConfig();
+  const source = new StrategySettingsSource(config);
+  await source.init();
+
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    meta: {
+      source: "optimizer",
+    },
+    execution: {
+      enabled: true,
+      symbol: "uos-krw",
+      symbols: ["uos-krw", "btr-krw"],
+      orderAmountKrw: 20000,
+      windowSec: 300,
+      cooldownSec: 30,
+      maxSymbolsPerWindow: 2,
+      maxOrderAttemptsPerWindow: 1,
+    },
+    strategy: {
+      name: "mean_reversion",
+      defaultSymbol: "uos-krw",
+      cashUsagePct: 100,
+    },
+  };
+  await fs.writeFile(config.strategySettings.settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const result = await source.read();
+
+  assert.deepEqual(result.execution.symbols, ["UOS_KRW", "BTR_KRW"]);
+  assert.equal(result.execution.maxOrderAttemptsPerWindow, 2);
+  assert.equal(result.strategy.cashUsagePct, 50);
 });
 
 test("strategy settings source rejects stale optimizer snapshots by default", async () => {

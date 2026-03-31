@@ -141,6 +141,63 @@ function normalizeSymbolList(symbols, fallbackSymbol = "BTC_KRW") {
   return [normalizeSymbol(fallbackSymbol)];
 }
 
+function normalizeOptionalSymbolList(symbols = []) {
+  if (!Array.isArray(symbols)) {
+    return [];
+  }
+  return Array.from(new Set(
+    symbols
+      .map((item) => normalizeSymbol(String(item || "").trim()))
+      .filter(Boolean),
+  ));
+}
+
+async function resolveProtectedSymbols(trader) {
+  if (!trader || typeof trader.listHeldSymbols !== "function") {
+    return [];
+  }
+
+  try {
+    return normalizeOptionalSymbolList(await trader.listHeldSymbols());
+  } catch {
+    return [];
+  }
+}
+
+function buildExecutionPlans({
+  requestedSymbols = [],
+  protectedSymbols = [],
+  maxSymbolsPerWindow = 0,
+} = {}) {
+  const requested = normalizeOptionalSymbolList(requestedSymbols);
+  const protectedOnly = normalizeOptionalSymbolList(protectedSymbols)
+    .filter((symbol) => !requested.includes(symbol));
+  const cappedRequested = maxSymbolsPerWindow > 0
+    ? requested.slice(0, maxSymbolsPerWindow)
+    : requested;
+
+  return {
+    protectedExitOnlySymbols: protectedOnly,
+    entrySymbols: cappedRequested,
+    plans: [
+      ...protectedOnly.map((symbol) => ({
+        symbol,
+        role: "protected_exit_only",
+        executionPolicy: {
+          allowBuy: false,
+          allowSell: true,
+          note: "protected_symbol_exit_only",
+        },
+      })),
+      ...cappedRequested.map((symbol) => ({
+        symbol,
+        role: "entry_and_exit",
+        executionPolicy: null,
+      })),
+    ],
+  };
+}
+
 function normalizeStrategySettingsRefreshRange(strategyConfig = {}) {
   const fixedRaw = Number(strategyConfig?.refreshFixedSec);
   const fixedSec = Number.isFinite(fixedRaw) && fixedRaw > 0 ? Math.floor(fixedRaw) : 0;
@@ -212,6 +269,42 @@ function aggregateWindowResults(results = []) {
     failed,
     totals,
   };
+}
+
+function summarizeLatestOrderIssue(decisions = []) {
+  if (!Array.isArray(decisions) || decisions.length === 0) {
+    return null;
+  }
+
+  for (let index = decisions.length - 1; index >= 0; index -= 1) {
+    const decision = decisions[index];
+    if (!decision || typeof decision !== "object") {
+      continue;
+    }
+
+    if (decision.orderOk === false) {
+      return {
+        type: "order_failed",
+        side: decision.side || null,
+        action: decision.action || null,
+        actionSource: decision.actionSource || null,
+        orderCode: decision.orderCode ?? null,
+        errorMessage: decision.error?.message || null,
+      };
+    }
+
+    if (typeof decision.skipped === "string" && decision.skipped) {
+      return {
+        type: "order_skipped",
+        side: decision.side || null,
+        action: decision.action || null,
+        actionSource: decision.actionSource || null,
+        skipped: decision.skipped,
+      };
+    }
+  }
+
+  return null;
 }
 
 function isRetryableFailureRow(row) {
@@ -864,12 +957,14 @@ export async function runExecutionService({
       }
 
       const requestedSymbols = normalizeSymbolList(effective.symbols, effective.symbol);
+      const protectedSymbols = await resolveProtectedSymbols(trader);
       const filteredSymbols = marketUniverse.filterSymbols(requestedSymbols);
-      const targetSymbols = filteredSymbols.symbols;
+      const eligibleRequestedSymbols = filteredSymbols.symbols;
 
       if (filteredSymbols.filteredOut.length > 0) {
         const filteredHash = JSON.stringify({
           requestedSymbols,
+          protectedSymbols,
           rejectedSymbols: filteredSymbols.filteredOut,
           allowedCount: filteredSymbols.allowedCount,
         });
@@ -878,7 +973,8 @@ export async function runExecutionService({
             window: windows,
             source: strategyRuntimeForExecution.source,
             requestedSymbols,
-            acceptedSymbols: targetSymbols,
+            protectedSymbols,
+            acceptedSymbols: eligibleRequestedSymbols,
             rejectedSymbols: filteredSymbols.filteredOut,
             allowedCount: filteredSymbols.allowedCount,
           });
@@ -936,7 +1032,28 @@ export async function runExecutionService({
         });
       }
 
-      if (targetSymbols.length === 0) {
+      const configuredMaxSymbolsPerWindow = asPositiveInt(
+        effective.maxSymbolsPerWindow,
+        runtimeConfig.execution.maxSymbolsPerWindow,
+      );
+      const executionPlan = buildExecutionPlans({
+        requestedSymbols: eligibleRequestedSymbols,
+        protectedSymbols,
+        maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
+      });
+
+      if (executionPlan.entrySymbols.length !== eligibleRequestedSymbols.length) {
+        logger.warn("execution symbol count capped per window", {
+          window: windows,
+          source: strategyRuntimeForExecution.source,
+          requestedCount: eligibleRequestedSymbols.length,
+          cappedCount: executionPlan.entrySymbols.length,
+          protectedExitOnlyCount: executionPlan.protectedExitOnlySymbols.length,
+          maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
+        });
+      }
+
+      if (executionPlan.plans.length === 0) {
         logger.warn("execution window skipped: no symbols passed market universe filter", {
           window: windows,
           source: strategyRuntimeForExecution.source,
@@ -956,30 +1073,22 @@ export async function runExecutionService({
           continue;
       }
 
-      const configuredMaxSymbolsPerWindow = asPositiveInt(
-        effective.maxSymbolsPerWindow,
-        runtimeConfig.execution.maxSymbolsPerWindow,
+      const symbolsToRun = executionPlan.plans;
+      const dedupedSymbolsToRun = symbolsToRun.filter(
+        (plan, index, plans) => plans.findIndex((candidate) => candidate.symbol === plan.symbol) === index,
       );
-      const symbolsToRun = configuredMaxSymbolsPerWindow > 0
-        ? targetSymbols.slice(0, configuredMaxSymbolsPerWindow)
-        : targetSymbols;
-      if (symbolsToRun.length !== targetSymbols.length) {
-        logger.warn("execution symbol count capped per window", {
-          window: windows,
-          source: strategyRuntimeForExecution.source,
-          requestedCount: targetSymbols.length,
-          cappedCount: symbolsToRun.length,
-          maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
-        });
-      }
-
-      const dedupedSymbolsToRun = Array.from(new Set(symbolsToRun));
       if (dedupedSymbolsToRun.length !== symbolsToRun.length) {
         logger.warn("execution symbols deduplicated for safety", {
           window: windows,
           source: strategyRuntimeForExecution.source,
-          symbolsToRun,
-          dedupedSymbolsToRun,
+          symbolsToRun: symbolsToRun.map((plan) => ({
+            symbol: plan.symbol,
+            role: plan.role,
+          })),
+          dedupedSymbolsToRun: dedupedSymbolsToRun.map((plan) => ({
+            symbol: plan.symbol,
+            role: plan.role,
+          })),
         });
       }
       const configuredMaxOrderAttemptsPerWindow = asPositiveInt(
@@ -987,18 +1096,25 @@ export async function runExecutionService({
         runtimeConfig.execution.maxOrderAttemptsPerWindow,
       );
 
+      const targetConcurrentEntrySymbols = Math.max(1, executionPlan.entrySymbols.length);
       const perSymbolResults = [];
-      for (const targetSymbol of dedupedSymbolsToRun) {
+      for (const targetPlan of dedupedSymbolsToRun) {
         // Run symbols sequentially to avoid shared-state cross contamination and duplicate submissions.
         const result = await trader.runStrategyRealtime({
-          symbol: targetSymbol,
+          symbol: targetPlan.symbol,
           amount: effective.orderAmountKrw,
           durationSec: effective.windowSec,
           cooldownSec: effective.cooldownSec,
           dryRun: executionDryRun,
+          executionPolicy: targetPlan.executionPolicy,
           maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
+          targetConcurrentSymbols: targetConcurrentEntrySymbols,
         });
-        perSymbolResults.push({ symbol: targetSymbol, result });
+        perSymbolResults.push({
+          symbol: targetPlan.symbol,
+          role: targetPlan.role,
+          result,
+        });
       }
 
       const aggregated = aggregateWindowResults(perSymbolResults);
@@ -1052,8 +1168,12 @@ export async function runExecutionService({
         window: windows,
         source: strategyRuntimeForExecution.source,
         mode: executionDryRun ? "dry_run" : "live",
-        symbols: dedupedSymbolsToRun,
+        symbols: dedupedSymbolsToRun.map((plan) => plan.symbol),
         symbolCount: dedupedSymbolsToRun.length,
+        entrySymbols: executionPlan.entrySymbols,
+        entrySymbolCount: executionPlan.entrySymbols.length,
+        protectedExitOnlySymbols: executionPlan.protectedExitOnlySymbols,
+        protectedExitOnlyCount: executionPlan.protectedExitOnlySymbols.length,
         maxSymbolsPerWindow: configuredMaxSymbolsPerWindow,
         maxOrderAttemptsPerWindow: configuredMaxOrderAttemptsPerWindow,
         amountKrw: effective.orderAmountKrw,
@@ -1094,6 +1214,8 @@ export async function runExecutionService({
         window: windows,
         source: strategyRuntimeForExecution.source,
         symbolCount: dedupedSymbolsToRun.length,
+        entrySymbolCount: executionPlan.entrySymbols.length,
+        protectedExitOnlyCount: executionPlan.protectedExitOnlySymbols.length,
         fills: {
             count: safeExecutionKpiFills.count || 0,
             buyCount: safeExecutionKpiFills.buyCount || 0,
@@ -1212,6 +1334,7 @@ export async function runExecutionService({
       }
       const perSymbolSummary = perSymbolResults.map((row) => ({
         symbol: row.symbol,
+        role: row.role,
         ok: row.result?.ok === true,
         code: row.result?.code ?? null,
         tickCount: row.result?.data?.tickCount ?? 0,
@@ -1219,6 +1342,7 @@ export async function runExecutionService({
         sellSignals: row.result?.data?.sellSignals ?? 0,
         attemptedOrders: row.result?.data?.attemptedOrders ?? 0,
         successfulOrders: row.result?.data?.successfulOrders ?? 0,
+        latestOrderIssue: summarizeLatestOrderIssue(row.result?.data?.decisions),
       }));
       const hasOrderActivity = aggregated.totals.attemptedOrders > 0 || aggregated.totals.successfulOrders > 0;
       if (aggregated.failed.length === 0) {

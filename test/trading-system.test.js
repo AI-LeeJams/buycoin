@@ -196,6 +196,107 @@ test("strategy run executes immediate market buy on BUY signal", async () => {
   assert.equal(exchange.placeCalls.length, 1);
 });
 
+test("strategy run sizes buy from available cash percentage when configured", async () => {
+  const config = await createConfig({
+    STRATEGY_CASH_USAGE_PCT: "50",
+    RISK_MAX_ORDER_NOTIONAL_KRW: "50000",
+    RISK_MAX_EXPOSURE_KRW: "100000",
+    EXECUTION_MAX_SYMBOLS_PER_WINDOW: "1",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "80000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+  ];
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.runStrategyOnce({ symbol: "BTC_KRW" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.amountBaseKrw, 40000);
+  assert.equal(result.data.amountSubmittedKrw, 48000);
+  assert.equal(result.data.sizingSource, "available_cash_pct");
+  assert.equal(exchange.placeCalls.length, 1);
+  assert.equal(exchange.placeCalls[0].amountKrw, 48000);
+});
+
+test("strategy run leaves buy cash buffer when sizing from full available cash", async () => {
+  const config = await createConfig({
+    STRATEGY_CASH_USAGE_PCT: "100",
+    RISK_MAX_ORDER_NOTIONAL_KRW: "AUTO",
+    RISK_MAX_EXPOSURE_KRW: "AUTO",
+    RISK_BUY_CASH_BUFFER_BPS: "50",
+    EXECUTION_MAX_SYMBOLS_PER_WINDOW: "1",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "100000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+  ];
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.runStrategyOnce({ symbol: "BTC_KRW" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.amountBaseKrw, 100000);
+  assert.equal(result.data.amountSubmittedKrw, 99500);
+  assert.equal(result.data.sizingSource, "available_cash_pct");
+  assert.equal(exchange.placeCalls.length, 1);
+  assert.equal(exchange.placeCalls[0].amountKrw, 99500);
+});
+
+test("strategy run caps a single symbol to half of equity when two symbols are targeted", async () => {
+  const config = await createConfig({
+    STRATEGY_CASH_USAGE_PCT: "100",
+    RISK_MAX_ORDER_NOTIONAL_KRW: "AUTO",
+    RISK_MAX_EXPOSURE_KRW: "AUTO",
+    RISK_BUY_CASH_BUFFER_BPS: "0",
+    EXECUTION_MAX_SYMBOLS_PER_WINDOW: "2",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "120000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+  ];
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.runStrategyOnce({ symbol: "BTC_KRW" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.amountSubmittedKrw, 60000);
+  assert.equal(exchange.placeCalls[0].amountKrw, 60000);
+});
+
 test("strategy run dry-run does not submit exchange order", async () => {
   const config = await createConfig();
   const exchange = new ExchangeMock();
@@ -250,8 +351,49 @@ test("strategy sell uses available position amount when sell-all exit is enabled
   assert.equal(exchange.placeCalls.length, 1);
   assert.equal(exchange.placeCalls[0].side, "sell");
   assert.equal(exchange.placeCalls[0].type, "market");
-  assert.equal(exchange.placeCalls[0].qty, 125);
-  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 10000);
+  assert.equal(exchange.placeCalls[0].qty, 300);
+  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 24000);
+});
+
+test("protective sell exits full position even above max order notional", async () => {
+  const config = await createConfig({
+    STRATEGY_SELL_ALL_ON_EXIT: "true",
+    RISK_MAX_ORDER_NOTIONAL_KRW: "18000",
+    RISK_MAX_HOLDING_LOSS_PCT: "4",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "120000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+    {
+      currency: "BTC",
+      balance: "300",
+      locked: "0",
+      avg_buy_price: "90",
+      unit_currency: "KRW",
+    },
+  ];
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataSellMock(),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.runStrategyOnce({ symbol: "BTC_KRW" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.protectiveExit?.reason, "protective_stop_loss");
+  assert.equal(exchange.placeCalls.length, 1);
+  assert.equal(exchange.placeCalls[0].side, "sell");
+  assert.equal(exchange.placeCalls[0].qty, 300);
+  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 24000);
 });
 
 test("stream ticker collects realtime ticks from websocket client", async () => {
@@ -451,6 +593,101 @@ test("realtime respects open-order cap with stale ACCEPTED state", async () => {
   assert.equal(result.ok, true);
   assert.equal(exchange.placeCalls.length, 0);
   assert.equal(result.data.successfulOrders, 0);
+});
+
+test("realtime allows another attempt after retryable order failure within the same window", async () => {
+  const config = await createConfig();
+  const exchange = new ExchangeMock();
+  let callCount = 0;
+  exchange.isRetryableError = (error) => Boolean(error?.retryable);
+  exchange.placeOrder = async (payload) => {
+    exchange.placeCalls.push(payload);
+    callCount += 1;
+    if (callCount === 1) {
+      const error = new Error("temporary exchange issue");
+      error.retryable = true;
+      throw error;
+    }
+    return { uuid: `exchange-${callCount}` };
+  };
+
+  const wsClient = new WsClientMock([
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700000 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700001 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700002 },
+  ]);
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_HOLD),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 0,
+    dryRun: false,
+    executionPolicy: {
+      mode: "override",
+      forceAction: "BUY",
+      forceAmountKrw: 9000,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.attemptedOrders, 2);
+  assert.equal(result.data.successfulOrders, 1);
+  assert.equal(exchange.placeCalls.length, 2);
+});
+
+test("realtime blocks further attempts after non-retryable order failure within the same window", async () => {
+  const config = await createConfig();
+  const exchange = new ExchangeMock();
+  exchange.isRetryableError = () => false;
+  exchange.placeOrder = async (payload) => {
+    exchange.placeCalls.push(payload);
+    const error = new Error("invalid request");
+    error.status = 400;
+    throw error;
+  };
+
+  const wsClient = new WsClientMock([
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700000 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700001 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700002 },
+  ]);
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_HOLD),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 0,
+    dryRun: false,
+    executionPolicy: {
+      mode: "override",
+      forceAction: "BUY",
+      forceAmountKrw: 9000,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.attemptedOrders, 1);
+  assert.equal(result.data.successfulOrders, 0);
+  assert.equal(exchange.placeCalls.length, 1);
+  assert.equal(
+    result.data.decisions.some((row) => row.skipped === "order_blocked_after_non_retryable_failure"),
+    true,
+  );
 });
 
 test("orderList forwards uuids/states options to exchange listOrders", async () => {

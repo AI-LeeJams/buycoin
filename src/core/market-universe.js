@@ -3,6 +3,7 @@ import path from "node:path";
 import { fromBithumbMarket, normalizeSymbol, toBithumbMarket } from "../config/defaults.js";
 import { nowIso } from "../lib/time.js";
 import { MarketDataService } from "./market-data.js";
+import { assessListingAge } from "./listing-age.js";
 
 function asNumber(value, fallback = null) {
   const parsed = Number(value);
@@ -94,6 +95,7 @@ export class CuratedMarketUniverse {
     this.quote = String(options.quote || "KRW").trim().toUpperCase();
     this.minAccTradeValue24hKrw = asNumber(options.minAccTradeValue24hKrw, 20_000_000_000);
     this.minPriceKrw = asNumber(options.minPriceKrw, 1);
+    this.minListingAgeDays = Math.max(0, Math.floor(asNumber(options.minListingAgeDays, 365)));
     this.maxSymbols = Math.max(1, Math.floor(asNumber(options.maxSymbols, 20)));
     this.minBaseAssetLength = Math.max(1, Math.floor(asNumber(options.minBaseAssetLength, 2)));
     this.includeSymbols = toSymbolArray(options.includeSymbols || []);
@@ -198,11 +200,13 @@ export class CuratedMarketUniverse {
     const startedAt = Date.now();
     const marketRows = await this.fetchMarketRows();
     const tickerRows = await this.fetchTickerRows(marketRows.map((row) => row.market));
+    const listingAgeBySymbol = await this.fetchListingAgeBySymbol({ marketRows, tickerRows });
 
     const snapshot = this.buildSnapshot({
       reason,
       marketRows,
       tickerRows,
+      listingAgeBySymbol,
     });
 
     const nextRefreshSec = randomDelaySec(this.refreshRange);
@@ -258,7 +262,57 @@ export class CuratedMarketUniverse {
     return rows;
   }
 
-  exclusionReason(symbol, marketRow, tickerRow) {
+  async fetchListingAgeBySymbol({ marketRows = [], tickerRows = [] } = {}) {
+    if (this.minListingAgeDays <= 0) {
+      return new Map();
+    }
+
+    const tickerMap = new Map(
+      (Array.isArray(tickerRows) ? tickerRows : [])
+        .filter((row) => row && typeof row.market === "string")
+        .map((row) => [String(row.market).toUpperCase(), row]),
+    );
+    const listingAgeBySymbol = new Map();
+
+    for (const marketRow of marketRows) {
+      const symbol = normalizeSymbol(fromBithumbMarket(marketRow.market));
+      if (!symbol || this.includeSymbols.includes(symbol)) {
+        continue;
+      }
+      const baseReason = this.baseExclusionReason(symbol, marketRow, tickerMap.get(marketRow.market));
+      if (baseReason) {
+        continue;
+      }
+      try {
+        const assessment = await assessListingAge({
+          marketData: this.marketData,
+          symbol,
+          minListingAgeDays: this.minListingAgeDays,
+        });
+        listingAgeBySymbol.set(symbol, assessment);
+      } catch (error) {
+        this.logger.warn("market universe listing age check failed", {
+          symbol,
+          minListingAgeDays: this.minListingAgeDays,
+          error: error.message,
+        });
+        listingAgeBySymbol.set(symbol, {
+          ok: false,
+          reason: "listing_age_unverified",
+          symbol,
+          minListingAgeDays: this.minListingAgeDays,
+          listingAgeDays: null,
+          oldestCandleAt: null,
+          candleCount: 0,
+          interval: null,
+        });
+      }
+    }
+
+    return listingAgeBySymbol;
+  }
+
+  baseExclusionReason(symbol, marketRow, tickerRow) {
     if (this.excludeSymbols.has(symbol)) {
       return "manual_exclude";
     }
@@ -289,7 +343,25 @@ export class CuratedMarketUniverse {
     return null;
   }
 
-  toCandidate(symbol, marketRow, tickerRow, selectionReason) {
+  exclusionReason(symbol, marketRow, tickerRow, listingAgeAssessment = null) {
+    const baseReason = this.baseExclusionReason(symbol, marketRow, tickerRow);
+    if (baseReason) {
+      return baseReason;
+    }
+
+    if (this.minListingAgeDays > 0) {
+      if (!listingAgeAssessment) {
+        return "listing_age_unverified";
+      }
+      if (listingAgeAssessment.ok !== true) {
+        return listingAgeAssessment.reason || "insufficient_listing_age";
+      }
+    }
+
+    return null;
+  }
+
+  toCandidate(symbol, marketRow, tickerRow, selectionReason, listingAgeAssessment = null) {
     return {
       symbol,
       market: marketRow.market,
@@ -299,11 +371,15 @@ export class CuratedMarketUniverse {
       lastPrice: selectTickerPrice(tickerRow),
       changeRate: selectChangeRate(tickerRow),
       accTradeValue24h: selectAccTradeValue24h(tickerRow),
+      listingAgeDays: Number.isFinite(Number(listingAgeAssessment?.listingAgeDays))
+        ? Math.round(Number(listingAgeAssessment.listingAgeDays))
+        : null,
+      oldestCandleAt: listingAgeAssessment?.oldestCandleAt || null,
       selectionReason,
     };
   }
 
-  buildSnapshot({ reason, marketRows, tickerRows }) {
+  buildSnapshot({ reason, marketRows, tickerRows, listingAgeBySymbol = new Map() }) {
     const marketMap = new Map(marketRows.map((row) => [row.market, row]));
     const tickerMap = new Map(
       (Array.isArray(tickerRows) ? tickerRows : [])
@@ -324,7 +400,13 @@ export class CuratedMarketUniverse {
       if (!marketRow) {
         continue;
       }
-      selected.push(this.toCandidate(includeSymbol, marketRow, tickerMap.get(includeMarket), "manual_include"));
+      selected.push(this.toCandidate(
+        includeSymbol,
+        marketRow,
+        tickerMap.get(includeMarket),
+        "manual_include",
+        listingAgeBySymbol.get(includeSymbol) || null,
+      ));
       selectedSet.add(includeSymbol);
     }
 
@@ -336,12 +418,18 @@ export class CuratedMarketUniverse {
       }
 
       const tickerRow = tickerMap.get(marketRow.market);
-      const reasonCode = this.exclusionReason(symbol, marketRow, tickerRow);
+      const reasonCode = this.exclusionReason(symbol, marketRow, tickerRow, listingAgeBySymbol.get(symbol) || null);
       if (reasonCode) {
         excludedCounts[reasonCode] = (excludedCounts[reasonCode] || 0) + 1;
         continue;
       }
-      liquidityCandidates.push(this.toCandidate(symbol, marketRow, tickerRow, "liquidity_filter"));
+      liquidityCandidates.push(this.toCandidate(
+        symbol,
+        marketRow,
+        tickerRow,
+        "liquidity_filter",
+        listingAgeBySymbol.get(symbol) || null,
+      ));
     }
 
     liquidityCandidates.sort((a, b) => {
@@ -363,6 +451,7 @@ export class CuratedMarketUniverse {
       criteria: {
         minAccTradeValue24hKrw: this.minAccTradeValue24hKrw,
         minPriceKrw: this.minPriceKrw,
+        minListingAgeDays: this.minListingAgeDays,
         maxSymbols: this.maxSymbols,
         includeSymbols: this.includeSymbols,
         excludeSymbols: Array.from(this.excludeSymbols),

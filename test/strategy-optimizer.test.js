@@ -18,6 +18,21 @@ function makeCandles({ startPrice = 1000, count = 160, slope = 1, noise = 0.3 })
   return candles;
 }
 
+function withFinalShock(candles, shockPct) {
+  return candles.map((row, index) => {
+    if (index !== candles.length - 1) {
+      return row;
+    }
+    const close = Math.max(1, row.close * (1 + shockPct));
+    return {
+      ...row,
+      close,
+      high: close,
+      low: close,
+    };
+  });
+}
+
 test("simulateRiskManagedMomentum returns metrics", () => {
   const result = simulateRiskManagedMomentum({
     candles: makeCandles({ startPrice: 1000, slope: 2 }),
@@ -91,4 +106,51 @@ test("optimizeTradingStrategies ranks and selects the best strategy candidate", 
   assert.equal(result.ranked.some((row) => row.strategy.name === "mean_reversion"), true);
   assert.equal(Boolean(result.best), true);
   assert.equal(result.ranked[0].score >= result.ranked.at(-1).score, true);
+});
+
+test("optimizeTradingStrategies records current signal and prefers buy-ready candidates", () => {
+  const base = makeCandles({ startPrice: 1000, count: 160, slope: 0.1, noise: 0.05 });
+  const buyReady = withFinalShock(base, -0.08);
+  const sellReady = withFinalShock(base, 0.08);
+
+  const result = optimizeTradingStrategies({
+    candlesBySymbol: {
+      BUY_KRW: buyReady,
+      SELL_KRW: sellReady,
+    },
+    strategyBase: {
+      autoSellEnabled: true,
+      baseOrderAmountKrw: 10_000,
+    },
+    constraints: {
+      maxDrawdownPctLimit: 50,
+      minTrades: 0,
+      minWinRatePct: 0,
+      minProfitFactor: 0,
+      minReturnPct: -100,
+      walkForwardEnabled: false,
+    },
+    simulation: {
+      interval: "15m",
+      initialCashKrw: 1_000_000,
+      baseOrderAmountKrw: 10_000,
+      minOrderNotionalKrw: 5_000,
+      feeBps: 5,
+      autoSellEnabled: true,
+    },
+    gridConfig: {
+      strategyNames: ["mean_reversion"],
+      meanLookbacks: [16],
+      meanEntryBpsCandidates: [40],
+      meanExitBpsCandidates: [0],
+    },
+  });
+
+  const buyRow = result.ranked.find((row) => row.symbol === "BUY_KRW");
+  const sellRow = result.ranked.find((row) => row.symbol === "SELL_KRW");
+
+  assert.equal(buyRow?.currentSignal?.action, "BUY");
+  assert.equal(sellRow?.currentSignal?.action, "SELL");
+  assert.equal(result.best?.symbol, "BUY_KRW");
+  assert.equal(buyRow.score > sellRow.score, true);
 });

@@ -107,6 +107,21 @@ function toNullablePositiveNumber(value) {
   return parsed;
 }
 
+function toNullablePositiveNumberOrAuto(value, fallback = null) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const token = String(value).trim().toUpperCase();
+  if (token === "AUTO" || token === "NONE" || token === "DYNAMIC") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 export function normalizeSymbol(symbol) {
   if (!symbol) {
     return "BTC_KRW";
@@ -205,6 +220,7 @@ export function loadConfig(env = process.env) {
       sellAllOnExit: toBoolean(env.STRATEGY_SELL_ALL_ON_EXIT, true),
       sellAllQtyPrecision: toPositiveInt(env.STRATEGY_SELL_ALL_QTY_PRECISION, 8),
       baseOrderAmountKrw: toPositiveNumber(env.STRATEGY_BASE_ORDER_AMOUNT_KRW, 12_000),
+      cashUsagePct: toPositiveNumber(env.STRATEGY_CASH_USAGE_PCT, 0),
       rebound: {
         enabled: toBoolean(env.REBOUND_ENABLED, true),
         dropLookback: toPositiveInt(env.REBOUND_DROP_LOOKBACK, 8),
@@ -232,6 +248,10 @@ export function loadConfig(env = process.env) {
       reportFile: env.OPTIMIZER_REPORT_FILE || path.join(process.cwd(), ".trader", "optimizer-report.json"),
       symbols: toCsvSymbols(env.OPTIMIZER_SYMBOLS, optimizerDefaultSymbols),
       maxLiveSymbols: toPositiveInt(env.OPTIMIZER_MAX_LIVE_SYMBOLS, 2),
+      minListingAgeDays: toNonNegativeInt(
+        env.OPTIMIZER_MIN_LISTING_AGE_DAYS,
+        toNonNegativeInt(env.MARKET_UNIVERSE_MIN_LISTING_AGE_DAYS, 365),
+      ),
       minHistoryCandles: toPositiveInt(
         env.OPTIMIZER_MIN_HISTORY_CANDLES,
         toPositiveInt(env.OPTIMIZER_CANDLE_COUNT, 200),
@@ -291,10 +311,11 @@ export function loadConfig(env = process.env) {
     },
     risk: {
       minOrderNotionalKrw: toPositiveNumber(env.RISK_MIN_ORDER_NOTIONAL_KRW, 10_000),
-      maxOrderNotionalKrw: toPositiveNumber(env.RISK_MAX_ORDER_NOTIONAL_KRW, 18_000),
+      buyCashBufferBps: toNonNegativeNumber(env.RISK_BUY_CASH_BUFFER_BPS, 50),
+      maxOrderNotionalKrw: toNullablePositiveNumberOrAuto(env.RISK_MAX_ORDER_NOTIONAL_KRW, 18_000),
       maxOpenOrders: toPositiveInt(env.RISK_MAX_OPEN_ORDERS, 2),
       maxOpenOrdersPerSymbol: toPositiveInt(env.RISK_MAX_OPEN_ORDERS_PER_SYMBOL, 1),
-      maxExposureKrw: toPositiveNumber(env.RISK_MAX_EXPOSURE_KRW, 65_000),
+      maxExposureKrw: toNullablePositiveNumberOrAuto(env.RISK_MAX_EXPOSURE_KRW, 65_000),
       maxDailyLossKrw: toPositiveNumber(env.RISK_MAX_DAILY_LOSS_KRW, 10_000),
       maxHoldingLossPct: toNumber(env.RISK_MAX_HOLDING_LOSS_PCT, 4.8),
       maxHoldingTakeProfitPct: toNumber(env.RISK_MAX_HOLDING_TAKE_PROFIT_PCT, 2.2),
@@ -341,6 +362,7 @@ export function loadConfig(env = process.env) {
       quote: String(env.MARKET_UNIVERSE_QUOTE || "KRW").trim().toUpperCase(),
       minAccTradeValue24hKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_ACC_TRADE_VALUE_24H_KRW, 3_500_000_000),
       minPriceKrw: toPositiveNumber(env.MARKET_UNIVERSE_MIN_PRICE_KRW, 1),
+      minListingAgeDays: toNonNegativeInt(env.MARKET_UNIVERSE_MIN_LISTING_AGE_DAYS, 365),
       maxSymbols: toPositiveInt(env.MARKET_UNIVERSE_MAX_SYMBOLS, 80),
       includeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_INCLUDE_SYMBOLS, universeDefaultIncludes),
       excludeSymbols: toCsvSymbolsOrNone(env.MARKET_UNIVERSE_EXCLUDE_SYMBOLS, []),

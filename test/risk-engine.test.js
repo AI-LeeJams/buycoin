@@ -78,3 +78,62 @@ test("risk engine rejects sell when holdings are insufficient", () => {
   assert.equal(result.allowed, false);
   assert.equal(result.reasons.some((r) => r.rule === "SELL_EXCEEDS_HOLDING"), true);
 });
+
+test("risk engine allows full-position sell above max order notional", () => {
+  const engine = new TraditionalRiskEngine(config);
+  const result = engine.evaluate({
+    amountKrw: 350000,
+    side: "sell",
+    openOrdersCount: 0,
+    exposureKrw: 0,
+    dailyPnlKrw: 0,
+    chanceMinTotalKrw: 5000,
+    holdingNotionalKrw: 350000,
+    killSwitch: false,
+  });
+
+  assert.equal(result.allowed, true);
+  assert.equal(result.reasons.some((r) => r.rule === "MAX_ORDER_NOTIONAL_KRW"), false);
+});
+
+test("risk engine skips max exposure check when exposure cap is auto", () => {
+  const engine = new TraditionalRiskEngine({
+    risk: {
+      ...config.risk,
+      maxExposureKrw: null,
+    },
+  });
+  const result = engine.evaluate({
+    amountKrw: 50000,
+    side: "buy",
+    openOrdersCount: 0,
+    exposureKrw: 80000,
+    dailyPnlKrw: 0,
+    chanceMinTotalKrw: 5000,
+    availableCashKrw: 100000,
+    killSwitch: false,
+  });
+
+  assert.equal(result.reasons.some((r) => r.rule === "MAX_EXPOSURE_KRW"), false);
+});
+
+test("risk engine skips max order notional check when order cap is auto", () => {
+  const engine = new TraditionalRiskEngine({
+    risk: {
+      ...config.risk,
+      maxOrderNotionalKrw: null,
+    },
+  });
+  const result = engine.evaluate({
+    amountKrw: 50000,
+    side: "buy",
+    openOrdersCount: 0,
+    exposureKrw: 0,
+    dailyPnlKrw: 0,
+    chanceMinTotalKrw: 5000,
+    availableCashKrw: 100000,
+    killSwitch: false,
+  });
+
+  assert.equal(result.reasons.some((r) => r.rule === "MAX_ORDER_NOTIONAL_KRW"), false);
+});

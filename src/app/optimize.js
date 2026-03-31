@@ -9,6 +9,7 @@ import { logger as defaultLogger } from "../lib/output.js";
 import { nowIso } from "../lib/time.js";
 import { CuratedMarketUniverse } from "../core/market-universe.js";
 import { MarketDataService } from "../core/market-data.js";
+import { assessListingAge } from "../core/listing-age.js";
 import { optimizeTradingStrategies } from "../engine/strategy-optimizer.js";
 import { StrategySettingsSource } from "./strategy-settings.js";
 
@@ -18,6 +19,22 @@ function roundNum(value, digits = 4) {
   }
   const scale = 10 ** digits;
   return Math.round(Number(value) * scale) / scale;
+}
+
+function asPositiveInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(parsed));
+}
+
+function asPositiveNumber(value, fallback = null) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
 }
 
 async function writeJson(filePath, payload) {
@@ -173,6 +190,16 @@ function compressCandidate(candidate) {
     score: roundNum(candidate.score, 4),
     safe: candidate.safety?.safe === true,
     checks: candidate.safety?.checks || {},
+    currentSignal: candidate.currentSignal
+      ? {
+          action: candidate.currentSignal.action || null,
+          reason: candidate.currentSignal.reason || null,
+          metrics: {
+            deviationBps: roundNum(candidate.currentSignal.metrics?.deviationBps, 4),
+            volatilityPct: roundNum(candidate.currentSignal.metrics?.volatilityPct, 4),
+          },
+        }
+      : null,
     metrics: {
       totalReturnPct: roundNum(candidate.metrics?.totalReturnPct, 4),
       maxDrawdownPct: roundNum(candidate.metrics?.maxDrawdownPct, 4),
@@ -220,11 +247,32 @@ function pickRuntimeSymbols(optimization, runtimeConfig) {
       ? optimization.ranked
       : [];
 
-  const matchingSymbols = [];
-  for (const candidate of ranked) {
-    if (!isSameStrategy(candidate.strategy, best.strategy)) {
-      continue;
+  const actionPriority = (candidate) => {
+    const action = String(candidate?.currentSignal?.action || "").trim().toUpperCase();
+    if (action === "BUY") {
+      return 2;
     }
+    if (action === "HOLD") {
+      return 1;
+    }
+    return 0;
+  };
+
+  const prioritized = ranked
+    .filter((candidate) => isSameStrategy(candidate.strategy, best.strategy))
+    .sort((a, b) => {
+      const priorityDiff = actionPriority(b) - actionPriority(a);
+      if (priorityDiff !== 0) {
+        return priorityDiff;
+      }
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return (b.metrics?.totalReturnPct || 0) - (a.metrics?.totalReturnPct || 0);
+    });
+
+  const matchingSymbols = [];
+  for (const candidate of prioritized) {
     if (!matchingSymbols.includes(candidate.symbol)) {
       matchingSymbols.push(candidate.symbol);
     }
@@ -234,7 +282,7 @@ function pickRuntimeSymbols(optimization, runtimeConfig) {
     .map((item) => normalizeSymbol(item))
     .filter(Boolean);
   for (const symbol of fallbackSymbols) {
-    if (!matchingSymbols.includes(symbol)) {
+    if (matchingSymbols.length === 0 && !matchingSymbols.includes(symbol)) {
       matchingSymbols.push(symbol);
     }
   }
@@ -331,6 +379,7 @@ async function applyBestToStrategySettings(runtimeConfig, optimization, logger) 
   const best = optimization.best;
   const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
   const runId = `${Date.now()}-${process.pid}`;
+  const targetConcurrentSymbols = selectedSymbols.length > 0 ? selectedSymbols.length : 1;
 
   const next = {
     ...template,
@@ -356,7 +405,11 @@ async function applyBestToStrategySettings(runtimeConfig, optimization, logger) 
         1,
         Number(best.strategy?.baseOrderAmountKrw || runtimeConfig.optimizer.baseOrderAmountKrw || template.execution.orderAmountKrw),
       ),
-      maxSymbolsPerWindow: selectedSymbols.length > 0 ? selectedSymbols.length : 1,
+      maxSymbolsPerWindow: targetConcurrentSymbols,
+      maxOrderAttemptsPerWindow: Math.max(
+        asPositiveInt(current?.execution?.maxOrderAttemptsPerWindow, template.execution.maxOrderAttemptsPerWindow),
+        targetConcurrentSymbols,
+      ),
     },
     strategy: {
       ...template.strategy,
@@ -371,6 +424,14 @@ async function applyBestToStrategySettings(runtimeConfig, optimization, logger) 
       ...(current.controls || {}),
     },
   };
+
+  if (targetConcurrentSymbols > 1) {
+    const diversifiedCashUsagePct = Math.max(1, Math.floor(100 / targetConcurrentSymbols));
+    next.strategy.cashUsagePct = Math.min(
+      asPositiveNumber(next.strategy.cashUsagePct, 100),
+      diversifiedCashUsagePct,
+    );
+  }
 
   await writeJson(runtimeConfig.strategySettings.settingsFile, next);
   return {
@@ -399,12 +460,37 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
       Number(config.optimizer?.minHistoryCandles || config.optimizer?.candleCount || 200),
     ),
   );
+  const minListingAgeDays = Math.max(0, Number(config.optimizer?.minListingAgeDays || 0));
 
   const candlesBySymbol = {};
   const fetchErrors = [];
   for (const symbolRaw of symbols || []) {
     const symbol = normalizeSymbol(symbolRaw);
     try {
+      if (minListingAgeDays > 0) {
+        const listingAge = await assessListingAge({
+          marketData,
+          symbol,
+          minListingAgeDays,
+        });
+        if (!listingAge.ok) {
+          fetchErrors.push({
+            symbol,
+            message: listingAge.reason || "insufficient_listing_age",
+          });
+          logger.warn("optimizer skipped symbol with insufficient listing age", {
+            symbol,
+            minListingAgeDays,
+            listingAgeDays: listingAge.listingAgeDays,
+            interval: listingAge.interval,
+            candleCount: listingAge.candleCount,
+            oldestCandleAt: listingAge.oldestCandleAt,
+            reason: listingAge.reason,
+          });
+          continue;
+        }
+      }
+
       const response = await marketData.getCandles({
         symbol,
         interval: config.optimizer.interval,

@@ -27,6 +27,7 @@ class SystemMock {
       killSwitchArgs: [],
     };
     this.killSwitch = false;
+    this.heldSymbols = [];
   }
 
   async init() {
@@ -70,6 +71,10 @@ class SystemMock {
         killSwitchReason: this.killSwitch ? "mock_kill_switch" : null,
       },
     };
+  }
+
+  async listHeldSymbols() {
+    return this.heldSymbols;
   }
 }
 
@@ -224,6 +229,48 @@ test("execution service runs multiple symbols in one window when strategy settin
   assert.equal(system.calls.realtime, 3);
   const symbols = system.calls.args.map((row) => row.symbol).sort();
   assert.deepEqual(symbols, ["BTC_KRW", "ETH_KRW", "USDT_KRW"]);
+});
+
+test("execution service keeps held symbols in exit-only mode without consuming entry slots", async () => {
+  const config = baseConfig();
+  config.execution.symbols = ["A8_KRW", "AZIT_KRW"];
+  config.execution.maxSymbolsPerWindow = 2;
+
+  const system = new SystemMock();
+  system.heldSymbols = ["TDROP_KRW"];
+
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.realtime, 3);
+  assert.deepEqual(
+    system.calls.args.map((row) => row.symbol),
+    ["TDROP_KRW", "A8_KRW", "AZIT_KRW"],
+  );
+  assert.equal(system.calls.args[0].executionPolicy.allowBuy, false);
+  assert.equal(system.calls.args[0].executionPolicy.allowSell, true);
+  assert.equal(system.calls.args[1].executionPolicy, null);
+  assert.equal(system.calls.args[2].executionPolicy, null);
+});
+
+test("execution service does not duplicate a held symbol that is already selected", async () => {
+  const config = baseConfig();
+  config.execution.symbols = ["KAT_KRW", "BTC_KRW"];
+  config.execution.maxSymbolsPerWindow = 2;
+
+  const system = new SystemMock();
+  system.heldSymbols = ["KAT_KRW"];
+
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.realtime, 2);
+  assert.deepEqual(
+    system.calls.args.map((row) => row.symbol),
+    ["KAT_KRW", "BTC_KRW"],
+  );
+  assert.equal(system.calls.args[0].executionPolicy, null);
+  assert.equal(system.calls.args[1].executionPolicy, null);
 });
 
 test("execution service keeps strategy snapshot until refresh window", async () => {

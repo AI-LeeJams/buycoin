@@ -54,6 +54,7 @@ test("market universe selects liquid KRW symbols and excludes weird ones", async
       quote: "KRW",
       minAccTradeValue24hKrw: 10_000_000_000,
       minPriceKrw: 1,
+      minListingAgeDays: 0,
       maxSymbols: 4,
       includeSymbols: ["BTC_KRW", "ETH_KRW", "USDT_KRW"],
       excludeSymbols: [],
@@ -90,6 +91,7 @@ test("market universe filterSymbols rejects symbols outside current universe", a
       quote: "KRW",
       minAccTradeValue24hKrw: 1,
       minPriceKrw: 1,
+      minListingAgeDays: 0,
       maxSymbols: 2,
       minBaseAssetLength: 2,
       refreshMinSec: 3600,
@@ -107,4 +109,53 @@ test("market universe filterSymbols rejects symbols outside current universe", a
   const filtered = universe.filterSymbols(["BTC_KRW", "ETH_KRW", "USDT_KRW"]);
   assert.deepEqual(filtered.symbols, ["BTC_KRW"]);
   assert.deepEqual(filtered.filteredOut, ["ETH_KRW", "USDT_KRW"]);
+});
+
+test("market universe excludes recently listed symbols when listing age filter is enabled", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "market-universe-age-"));
+  const snapshotFile = path.join(dir, "market-universe.json");
+  const markets = [
+    { market: "KRW-OLD", market_warning: "NONE", korean_name: "오래된코인", english_name: "OldCoin" },
+    { market: "KRW-NEW", market_warning: "NONE", korean_name: "신규코인", english_name: "NewCoin" },
+  ];
+  const tickersByMarket = {
+    "KRW-OLD": { market: "KRW-OLD", trade_price: 2000, acc_trade_price_24h: 30_000_000_000 },
+    "KRW-NEW": { market: "KRW-NEW", trade_price: 2000, acc_trade_price_24h: 35_000_000_000 },
+  };
+
+  const marketData = createMockMarketData({ markets, tickersByMarket });
+  marketData.getCandles = async ({ symbol }) => ({
+    symbol,
+    interval: "week",
+    candles: symbol === "OLD_KRW"
+      ? [{ timestamp: Date.UTC(2024, 0, 1) }, { timestamp: Date.UTC(2025, 0, 1) }]
+      : [{ timestamp: Date.now() - (21 * 24 * 60 * 60 * 1000) }],
+  });
+
+  const config = {
+    marketUniverse: {
+      enabled: true,
+      quote: "KRW",
+      minAccTradeValue24hKrw: 10_000_000_000,
+      minPriceKrw: 1,
+      minListingAgeDays: 180,
+      maxSymbols: 5,
+      includeSymbols: [],
+      excludeSymbols: [],
+      minBaseAssetLength: 2,
+      refreshMinSec: 3600,
+      refreshMaxSec: 3600,
+      tickerChunkSize: 40,
+      snapshotFile,
+    },
+  };
+
+  const universe = new CuratedMarketUniverse(config, null, marketData);
+  await universe.init();
+  const result = await universe.refresh({ reason: "listing_age_test" });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.data.symbols, ["OLD_KRW"]);
+  assert.equal(result.data.excludedCounts.insufficient_listing_age, 1);
+  assert.equal(result.data.candidates[0].listingAgeDays > 180, true);
 });

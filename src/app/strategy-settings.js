@@ -29,16 +29,23 @@ const STRATEGY_SAFE_RANGES = {
   targetVolatilityPct: { min: 0.3, max: 1.2 },
   riskManagedMinMultiplier: { min: 0.4, max: 1.0 },
   riskManagedMaxMultiplier: { min: 1.2, max: 2.5 },
+  cashUsagePct: { min: 1, max: 100 },
 };
 
 function clampRange(value, min, max, fallback, label, logger = null) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return fallback;
   }
-  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+  if (!Number.isFinite(min) && !Number.isFinite(max)) {
     return value;
   }
-  const clamped = Math.min(Math.max(value, min), max);
+  let clamped = value;
+  if (Number.isFinite(min)) {
+    clamped = Math.max(clamped, min);
+  }
+  if (Number.isFinite(max)) {
+    clamped = Math.min(clamped, max);
+  }
   if (clamped !== value && logger) {
     logger.warn("strategy settings: value clamped", {
       field: label,
@@ -324,6 +331,7 @@ export class StrategySettingsSource {
       sellAllOnExit: toBoolean(base.sellAllOnExit, true),
       sellAllQtyPrecision: toPositiveInt(base.sellAllQtyPrecision, 8),
       baseOrderAmountKrw: toPositiveNumber(base.baseOrderAmountKrw, 20_000),
+      cashUsagePct: toPositiveNumber(base.cashUsagePct, 0),
     };
   }
 
@@ -422,6 +430,8 @@ export class StrategySettingsSource {
   }
 
   normalize(raw = {}) {
+    const meta = normalizeRuntimeMeta(raw.meta);
+    const optimizerManaged = meta?.source === "optimizer";
     const executionRaw = raw.execution || {};
     const defaults = this.defaultExecution();
     const strategyRaw = raw.strategy || {};
@@ -439,7 +449,7 @@ export class StrategySettingsSource {
     };
 
     const riskMinOrder = toPositiveNumber(this.config?.risk?.minOrderNotionalKrw, 20_000);
-    const riskMaxOrder = toPositiveNumber(this.config?.risk?.maxOrderNotionalKrw, 300_000);
+    const riskMaxOrder = toPositiveNumber(this.config?.risk?.maxOrderNotionalKrw, null);
     execution.orderAmountKrw = clampRange(
       execution.orderAmountKrw,
       riskMinOrder,
@@ -523,7 +533,46 @@ export class StrategySettingsSource {
       sellAllOnExit: toBoolean(strategyRaw.sellAllOnExit, strategyDefaults.sellAllOnExit),
       sellAllQtyPrecision: toPositiveInt(strategyRaw.sellAllQtyPrecision, strategyDefaults.sellAllQtyPrecision),
       baseOrderAmountKrw: toPositiveNumber(strategyRaw.baseOrderAmountKrw, strategyDefaults.baseOrderAmountKrw),
+      cashUsagePct: toPositiveNumber(strategyRaw.cashUsagePct, strategyDefaults.cashUsagePct),
     };
+
+    if (optimizerManaged) {
+      const targetConcurrentSymbols = Math.max(
+        1,
+        Math.min(
+          execution.symbols.length || 1,
+          toPositiveInt(execution.maxSymbolsPerWindow, execution.symbols.length || 1),
+        ),
+      );
+
+      if (targetConcurrentSymbols > 1) {
+        const diversifiedCashUsagePct = Math.max(1, Math.floor(100 / targetConcurrentSymbols));
+        const nextAttempts = Math.max(
+          toPositiveInt(execution.maxOrderAttemptsPerWindow, 1),
+          targetConcurrentSymbols,
+        );
+
+        if (execution.maxOrderAttemptsPerWindow !== nextAttempts) {
+          this.logger.warn("strategy settings: optimizer snapshot raised order attempts for multi-symbol execution", {
+            symbols: execution.symbols,
+            previous: execution.maxOrderAttemptsPerWindow,
+            adjusted: nextAttempts,
+            targetConcurrentSymbols,
+          });
+          execution.maxOrderAttemptsPerWindow = nextAttempts;
+        }
+
+        if (strategy.cashUsagePct > diversifiedCashUsagePct) {
+          this.logger.warn("strategy settings: optimizer snapshot capped cash usage for multi-symbol diversification", {
+            symbols: execution.symbols,
+            previous: strategy.cashUsagePct,
+            adjusted: diversifiedCashUsagePct,
+            targetConcurrentSymbols,
+          });
+          strategy.cashUsagePct = diversifiedCashUsagePct;
+        }
+      }
+    }
 
     for (const [field, range] of Object.entries(STRATEGY_SAFE_RANGES)) {
       const value = strategy[field];
@@ -546,7 +595,6 @@ export class StrategySettingsSource {
     const controls = {
       killSwitch: normalizeKillSwitch(raw?.controls?.killSwitch),
     };
-    const meta = normalizeRuntimeMeta(raw.meta);
 
     return {
       source: "strategy_settings_file",

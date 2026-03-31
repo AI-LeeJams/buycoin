@@ -24,6 +24,7 @@ test("defaults include orthodox strategy and overlay settings", () => {
   assert.equal(config.strategy.sellAllQtyPrecision, 8);
   assert.equal(config.strategy.breakoutLookback, 20);
   assert.equal(config.strategy.baseOrderAmountKrw, 12000);
+  assert.equal(config.strategy.cashUsagePct, 0);
   assert.equal(config.overlay.timeoutMs, 500);
   assert.equal(config.overlay.enabled, false);
   assert.equal(config.exchange.publicMaxPerSec, 150);
@@ -41,6 +42,7 @@ test("defaults include orthodox strategy and overlay settings", () => {
   assert.equal(config.marketUniverse.enabled, true);
   assert.equal(config.marketUniverse.quote, "KRW");
   assert.equal(config.marketUniverse.minAccTradeValue24hKrw, 3_500_000_000);
+  assert.equal(config.marketUniverse.minListingAgeDays, 365);
   assert.equal(config.marketUniverse.maxSymbols, 80);
   assert.deepEqual(config.marketUniverse.includeSymbols, []);
   assert.equal(config.marketUniverse.minBaseAssetLength, 2);
@@ -58,12 +60,14 @@ test("defaults include orthodox strategy and overlay settings", () => {
   assert.equal(config.execution.maxWindows, 0);
   assert.equal(config.execution.logOnlyOnActivity, true);
   assert.equal(config.execution.heartbeatWindows, 12);
+  assert.equal(config.risk.buyCashBufferBps, 50);
   assert.equal(config.optimizer.enabled, true);
   assert.equal(config.optimizer.applyOnStart, true);
   assert.equal(config.optimizer.reoptEnabled, true);
   assert.equal(config.optimizer.reoptIntervalSec, 3600);
   assert.equal(config.optimizer.applyToStrategySettings, true);
   assert.equal(config.optimizer.maxLiveSymbols, 2);
+  assert.equal(config.optimizer.minListingAgeDays, 365);
   assert.equal(config.optimizer.minHistoryCandles, 200);
   assert.equal(config.optimizer.initialCashKrw, 100000);
   assert.equal(config.optimizer.baseOrderAmountKrw, 12000);
@@ -87,4 +91,20 @@ test("market universe include symbols can be explicitly disabled", () => {
 
   assert.deepEqual(config.marketUniverse.includeSymbols, []);
   assert.equal(config.optimizer.minHistoryCandles, 160);
+});
+
+test("risk max exposure can be set to auto", () => {
+  const config = loadConfig({
+    RISK_MAX_EXPOSURE_KRW: "AUTO",
+  });
+
+  assert.equal(config.risk.maxExposureKrw, null);
+});
+
+test("risk max order notional can be set to auto", () => {
+  const config = loadConfig({
+    RISK_MAX_ORDER_NOTIONAL_KRW: "AUTO",
+  });
+
+  assert.equal(config.risk.maxOrderNotionalKrw, null);
 });

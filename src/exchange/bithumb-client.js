@@ -132,6 +132,89 @@ function objectKeys(value) {
   return Object.keys(value).sort();
 }
 
+function shouldAttachOrderAudit(path) {
+  return path === "/v1/orders"
+    || path === "/v2/orders"
+    || path === "/v1/order"
+    || path === "/v2/order";
+}
+
+function summarizeOrderRequest(query = {}, body = {}) {
+  const market = body?.market ?? query?.market ?? null;
+  const side = body?.side ?? null;
+  const ordType = body?.ord_type ?? null;
+  const price = body?.price ?? null;
+  const volume = body?.volume ?? null;
+  const identifier = body?.identifier ?? body?.client_order_id ?? body?.clientOrderId ?? null;
+
+  if (
+    market === null
+    && side === null
+    && ordType === null
+    && price === null
+    && volume === null
+    && identifier === null
+  ) {
+    return null;
+  }
+
+  return {
+    market,
+    side,
+    ordType,
+    price,
+    volume,
+    identifier,
+  };
+}
+
+function summarizeOrderResponse(payload) {
+  if (payload === undefined) {
+    return null;
+  }
+  if (payload === null) {
+    return { kind: "null" };
+  }
+  if (Array.isArray(payload)) {
+    return {
+      kind: "array",
+      length: payload.length,
+    };
+  }
+  if (typeof payload !== "object") {
+    return {
+      kind: typeof payload,
+      value: String(payload),
+    };
+  }
+
+  return {
+    code: payload.code ?? payload.status ?? null,
+    name: payload.name ?? payload.error?.name ?? null,
+    message: payload.message ?? payload.error?.message ?? null,
+    uuid: payload.uuid ?? payload.order_id ?? payload.orderId ?? payload.id ?? null,
+    identifier: payload.identifier ?? payload.client_order_id ?? payload.clientOrderId ?? null,
+    state: payload.state ?? payload.order_state ?? payload.orderStatus ?? null,
+    market: payload.market ?? null,
+    side: payload.side ?? null,
+    ordType: payload.ord_type ?? payload.type ?? null,
+    price: payload.price ?? null,
+    volume: payload.volume ?? null,
+    remainingVolume: payload.remaining_volume ?? payload.volume_remain ?? null,
+    executedVolume: payload.executed_volume ?? payload.volume_traded ?? null,
+  };
+}
+
+function isInvalidRequestError(error) {
+  if (!error) {
+    return false;
+  }
+  const message = String(error.message || "").trim().toLowerCase();
+  return message.includes("invalid request")
+    || error.status === 400
+    || error.status === 422;
+}
+
 export class BithumbClient {
   constructor(config, logger, options = {}) {
     this.config = config;
@@ -227,6 +310,8 @@ export class BithumbClient {
     const queryString = canonicalQuery(query);
     const url = queryString ? `${this.baseUrl}${path}?${queryString}` : `${this.baseUrl}${path}`;
     const startedAt = this.nowFn();
+    const attachOrderAudit = shouldAttachOrderAudit(path);
+    const orderRequest = attachOrderAudit ? summarizeOrderRequest(query, body) : null;
     const headers = {
       Accept: "application/json",
     };
@@ -283,6 +368,8 @@ export class BithumbClient {
         status: wrappedError.status ?? null,
         retryable: this.isRetryableError(wrappedError),
         error: wrappedError.message,
+        orderRequest,
+        responsePreview: summarizeOrderResponse(wrappedError.payload),
         durationMs: this.nowFn() - startedAt,
       });
       throw wrappedError;
@@ -309,6 +396,8 @@ export class BithumbClient {
         status: response.status,
         retryable: this.isRetryableError(error),
         error: message,
+        orderRequest,
+        responsePreview: attachOrderAudit ? summarizeOrderResponse(payload) : null,
         durationMs: this.nowFn() - startedAt,
       });
       throw error;
@@ -326,6 +415,8 @@ export class BithumbClient {
       status: response.status,
       retryable: false,
       error: null,
+      orderRequest,
+      responsePreview: attachOrderAudit ? summarizeOrderResponse(payload) : null,
       durationMs: this.nowFn() - startedAt,
     });
     return payload;
@@ -818,7 +909,7 @@ export class BithumbClient {
       if (!Number.isFinite(spend) || spend <= 0) {
         throw new ExchangeHttpError("Invalid market-buy notional (price)", { retryable: false });
       }
-      body.price = String(spend);
+      body.price = String(Math.floor(spend));
     } else if (ordType === "market") {
       if (sideNormalized !== "ask") {
         throw new ExchangeHttpError("ord_type=market requires side=ask", { retryable: false });
@@ -828,29 +919,45 @@ export class BithumbClient {
       throw new ExchangeHttpError(`Unsupported order type: ${type}`, { retryable: false });
     }
 
-    const primary = () =>
+    const submit = (path, requestBody) =>
       this.withRetry({
         method: "POST",
-        path: "/v1/orders",
-        body,
+        path,
+        body: requestBody,
         requiresAuth: true,
       });
 
-    const fallback = () =>
-      this.withRetry({
-        method: "POST",
-        path: "/v2/orders",
-        body,
-        requiresAuth: true,
-      });
+    const submitWithIdentifierRetry = async (path) => {
+      try {
+        return await submit(path, body);
+      } catch (error) {
+        if (!body.identifier || !isInvalidRequestError(error)) {
+          throw error;
+        }
+
+        const retryBody = { ...body };
+        delete retryBody.identifier;
+        this.logger.warn("retrying order submit without identifier after invalid request", {
+          path,
+          market: retryBody.market,
+          side: retryBody.side,
+          ordType: retryBody.ord_type,
+          price: retryBody.price ?? null,
+          volume: retryBody.volume ?? null,
+          status: error.status ?? null,
+          reason: error.message,
+        });
+        return submit(path, retryBody);
+      }
+    };
 
     try {
-      return await primary();
+      return await submitWithIdentifierRetry("/v1/orders");
     } catch (error) {
       if (!this.shouldUseFallbackEndpoint(error)) {
         throw error;
       }
-      return fallback();
+      return submitWithIdentifierRetry("/v2/orders");
     }
   }
 

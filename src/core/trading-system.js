@@ -220,6 +220,113 @@ function clampOrderAmountByRiskLimits(amount, riskConfig = {}) {
   return Math.max(minOrder, requested);
 }
 
+function symbolExposureFromAccountContext(accountContext, symbol) {
+  const normalizedSymbol = normalizeSymbol(symbol || "");
+  const [baseCurrency] = normalizedSymbol.split("_");
+  if (!baseCurrency) {
+    return 0;
+  }
+
+  const quantity = Math.max(asNumber(accountContext?.metrics?.holdings?.[baseCurrency], 0), 0);
+  const avgBuyPrice = asNumber(accountContext?.metrics?.holdingsAvgBuyPrice?.[baseCurrency], 0);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(avgBuyPrice) || avgBuyPrice <= 0) {
+    return 0;
+  }
+  return quantity * avgBuyPrice;
+}
+
+async function resolveBuyAmountFromCash(
+  system,
+  fallbackAmountKrw,
+  signalMultiplier,
+  overlayMultiplier,
+  options = {},
+) {
+  const fallback = asPositiveNumber(fallbackAmountKrw, null);
+  const cashUsagePct = asPositiveNumber(system?.config?.strategy?.cashUsagePct, 0);
+  const totalMultiplier = Math.max(0.01, asNumber(signalMultiplier, 1) * asNumber(overlayMultiplier, 1));
+  const targetConcurrentSymbols = asPositiveInt(
+    options?.targetConcurrentSymbols,
+    asPositiveInt(system?.config?.execution?.maxSymbolsPerWindow, 1),
+  );
+  const normalizedSymbol = options?.symbol ? normalizeSymbol(options.symbol) : null;
+
+  if (cashUsagePct <= 0) {
+    const adjustedAmount = fallback === null ? null : Math.max(1, Math.round(fallback * totalMultiplier));
+    return {
+      amountBaseKrw: fallback,
+      amountAdjustedKrw: adjustedAmount,
+      amountCappedKrw: adjustedAmount === null ? null : clampOrderAmountByRiskLimits(adjustedAmount, system.config.risk),
+      sizingSource: "configured_base",
+    };
+  }
+
+  const accountContext = await system.loadAccountContext();
+  const availableCashKrw = asNumber(
+    accountContext?.metrics?.cashAvailableKrw,
+    asNumber(accountContext?.metrics?.cashKrw, null),
+  );
+  const buyCashBufferBps = asNonNegativeNumber(system?.config?.risk?.buyCashBufferBps, 50);
+  const exposureKrw = asNumber(accountContext?.metrics?.exposureKrw, 0);
+  const maxExposureKrw = asPositiveNumber(system?.config?.risk?.maxExposureKrw, null);
+  const maxOrderNotionalKrw = asPositiveNumber(system?.config?.risk?.maxOrderNotionalKrw, null);
+  const minOrderNotionalKrw = asPositiveNumber(system?.config?.risk?.minOrderNotionalKrw, 1);
+  const remainingExposureKrw =
+    maxExposureKrw === null ? null : Math.max(0, maxExposureKrw - exposureKrw);
+  const symbolExposureKrw = normalizedSymbol ? symbolExposureFromAccountContext(accountContext, normalizedSymbol) : 0;
+  const equityKrw = asNumber(accountContext?.metrics?.equityKrw, null);
+  const perSymbolAllocationCapKrw =
+    targetConcurrentSymbols > 1 && Number.isFinite(equityKrw) && equityKrw > 0
+      ? Math.floor(equityKrw / targetConcurrentSymbols)
+      : null;
+  const remainingSymbolAllocationKrw =
+    Number.isFinite(perSymbolAllocationCapKrw)
+      ? Math.max(0, perSymbolAllocationCapKrw - symbolExposureKrw)
+      : null;
+  const spendableCashKrw = Number.isFinite(availableCashKrw)
+    ? Math.max(0, Math.floor(availableCashKrw * Math.max(0, 1 - (buyCashBufferBps / 10_000))))
+    : null;
+  const percentBaseAmount =
+    availableCashKrw === null ? fallback : (availableCashKrw * cashUsagePct) / 100;
+  const baseAmount = asPositiveNumber(percentBaseAmount, fallback);
+  const adjustedAmount = baseAmount === null ? null : Math.max(1, Math.round(baseAmount * totalMultiplier));
+
+  let cappedAmount = adjustedAmount;
+  if (adjustedAmount !== null) {
+    if (Number.isFinite(spendableCashKrw)) {
+      cappedAmount = Math.min(cappedAmount, spendableCashKrw);
+    }
+    if (Number.isFinite(remainingExposureKrw)) {
+      cappedAmount = Math.min(cappedAmount, remainingExposureKrw);
+    }
+    if (Number.isFinite(maxOrderNotionalKrw)) {
+      cappedAmount = Math.min(cappedAmount, maxOrderNotionalKrw);
+    }
+    if (Number.isFinite(remainingSymbolAllocationKrw)) {
+      cappedAmount = Math.min(cappedAmount, remainingSymbolAllocationKrw);
+    }
+    if (cappedAmount < minOrderNotionalKrw) {
+      cappedAmount = Math.max(0, cappedAmount);
+    }
+  }
+
+  return {
+    amountBaseKrw: baseAmount,
+    amountAdjustedKrw: adjustedAmount,
+    amountCappedKrw: cappedAmount,
+    sizingSource: "available_cash_pct",
+    availableCashKrw,
+    spendableCashKrw,
+    remainingExposureKrw,
+    targetConcurrentSymbols,
+    symbolExposureKrw,
+    perSymbolAllocationCapKrw,
+    remainingSymbolAllocationKrw,
+    cashUsagePct,
+    buyCashBufferBps,
+  };
+}
+
 function requiredCandleWindow(config) {
   const strategyName = String(config?.strategy?.name || "risk_managed_momentum").toLowerCase();
   if (strategyName === "breakout") {
@@ -890,6 +997,7 @@ function normalizeRuntimeStrategy(input = {}, fallback = {}) {
       : Boolean(strategy.sellAllOnExit),
     sellAllQtyPrecision: asPositiveInt(strategy.sellAllQtyPrecision, asPositiveInt(base.sellAllQtyPrecision, 8)),
     baseOrderAmountKrw: asPositiveNumber(strategy.baseOrderAmountKrw, asPositiveNumber(base.baseOrderAmountKrw, 20_000)),
+    cashUsagePct: asPositiveNumber(strategy.cashUsagePct, asPositiveNumber(base.cashUsagePct, 0)),
   };
 }
 
@@ -1773,6 +1881,7 @@ export class TradingSystem {
     dryRun = false,
     executionPolicy = null,
     maxOrderAttemptsPerWindow = 0,
+    targetConcurrentSymbols = 1,
   } = {}) {
     const runId = uuid();
     const normalizedSymbol = normalizeSymbol(symbol || this.config.strategy.defaultSymbol);
@@ -1784,7 +1893,7 @@ export class TradingSystem {
     const runtimePolicy = normalizeExecutionPolicy(executionPolicy, {
       autoSellEnabled,
     });
-    const effectiveForceOnce = runtimePolicy.mode === "override" ? true : runtimePolicy.forceOnce;
+    const effectiveForceOnce = Boolean(runtimePolicy.forceOnce);
     const overrideConsumeKey = runtimePolicy.mode === "override" && effectiveForceOnce && runtimePolicy.forceAction
       ? [
         normalizedSymbol,
@@ -1834,15 +1943,18 @@ export class TradingSystem {
     let sellSignals = 0;
     let attemptedOrders = 0;
     let successfulOrders = 0;
-    let lastOrderAtMs = 0;
+    let lastSuccessfulOrderAtMs = 0;
+    let lastRetryableFailureAtMs = 0;
+    let symbolOrderBlocked = false;
+    let symbolOrderBlockedReason = null;
     let streamError = null;
     let streamHandle = null;
     let timer = null;
     let processing = Promise.resolve();
     let overrideActionConsumed = this.isPolicyOverrideConsumedOnce(overrideConsumeKey);
-    let overrideActionsAttempted = 0;
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
+    const retryableFailureBackoffMs = cooldownMs > 0 ? Math.min(cooldownMs, 1_000) : 0;
 
     try {
       // Determinism guard: keep one overlay snapshot per realtime window.
@@ -1885,8 +1997,7 @@ export class TradingSystem {
               const canUseOverride =
                 runtimePolicy.mode === "override" &&
                 runtimePolicy.forceAction &&
-                !(effectiveForceOnce && overrideActionConsumed) &&
-                overrideActionsAttempted < 1;
+                !(effectiveForceOnce && overrideActionConsumed);
 
               if (forcedExit) {
                 selectedAction = protectiveExit.action;
@@ -1931,7 +2042,24 @@ export class TradingSystem {
               }
 
               const nowMs = Date.now();
-              if (cooldownMs > 0 && nowMs - lastOrderAtMs < cooldownMs) {
+              if (symbolOrderBlocked) {
+                decisions.push({
+                  at: nowIso(),
+                  price: tick.tradePrice,
+                  signal: signal.action,
+                  action: selectedAction,
+                  actionSource: selectedSource,
+                  side: selectedAction === "SELL" ? "sell" : "buy",
+                  skipped: "order_blocked_after_non_retryable_failure",
+                  blockedReason: symbolOrderBlockedReason,
+                });
+                while (decisions.length > decisionTrailLimit) {
+                  decisions.shift();
+                }
+                return;
+              }
+
+              if (cooldownMs > 0 && nowMs - lastSuccessfulOrderAtMs < cooldownMs) {
                 decisions.push({
                   at: nowIso(),
                   price: tick.tradePrice,
@@ -1947,7 +2075,24 @@ export class TradingSystem {
                 return;
               }
 
-              if (orderAttemptsLimit > 0 && attemptedOrders >= orderAttemptsLimit) {
+              if (lastRetryableFailureAtMs > 0 && nowMs - lastRetryableFailureAtMs < retryableFailureBackoffMs) {
+                decisions.push({
+                  at: nowIso(),
+                  price: tick.tradePrice,
+                  signal: signal.action,
+                  action: selectedAction,
+                  actionSource: selectedSource,
+                  side: selectedAction === "SELL" ? "sell" : "buy",
+                  skipped: "retryable_failure_backoff",
+                  retryableFailureBackoffMs,
+                });
+                while (decisions.length > decisionTrailLimit) {
+                  decisions.shift();
+                }
+                return;
+              }
+
+              if (orderAttemptsLimit > 0 && successfulOrders >= orderAttemptsLimit) {
                 decisions.push({
                   at: nowIso(),
                   price: tick.tradePrice,
@@ -1957,7 +2102,7 @@ export class TradingSystem {
                   side: selectedAction === "SELL" ? "sell" : "buy",
                   skipped: "order_attempt_cap",
                   orderAttemptsLimit,
-                  attemptedOrders,
+                  successfulOrders,
                 });
                 while (decisions.length > decisionTrailLimit) {
                   decisions.shift();
@@ -1968,17 +2113,31 @@ export class TradingSystem {
               const overlay = windowOverlay;
               const policyOverrideAmount =
                 selectedSource === "policy_override" ? asPositiveNumber(runtimePolicy.forceAmountKrw, null) : null;
-              const baseAmount =
-                policyOverrideAmount ?? asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
               const signalMultiplier =
                 selectedSource === "policy_override" ? 1 : signalRiskMultiplier(signal, this.config);
               const totalMultiplier =
                 selectedSource === "policy_override" && policyOverrideAmount !== null
                   ? 1
                   : Math.max(0.01, overlay.multiplier * signalMultiplier);
-              const adjustedAmount = Math.max(1, Math.round(baseAmount * totalMultiplier));
-              const cappedAmount = clampOrderAmountByRiskLimits(adjustedAmount, this.config.risk);
               const orderSide = selectedAction === "SELL" ? "sell" : "buy";
+              const buySizing = orderSide === "buy"
+                ? await resolveBuyAmountFromCash(
+                  this,
+                  policyOverrideAmount ?? asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw,
+                  signalMultiplier,
+                  selectedSource === "policy_override" && policyOverrideAmount !== null ? 1 : overlay.multiplier,
+                  {
+                    symbol: normalizedSymbol,
+                    targetConcurrentSymbols,
+                  },
+                )
+                : null;
+              const baseAmount = buySizing?.amountBaseKrw
+                ?? policyOverrideAmount
+                ?? asNumber(amount, null)
+                ?? this.config.strategy.baseOrderAmountKrw;
+              const adjustedAmount = buySizing?.amountAdjustedKrw ?? Math.max(1, Math.round(baseAmount * totalMultiplier));
+              const cappedAmount = buySizing?.amountCappedKrw ?? clampOrderAmountByRiskLimits(adjustedAmount, this.config.risk);
               let orderAmountKrw = cappedAmount;
               let sellPlan = null;
 
@@ -1993,6 +2152,7 @@ export class TradingSystem {
                   skipped: "order_amount_invalid_after_risk_cap",
                   amountAdjustedKrw: adjustedAmount,
                   amountCappedKrw: cappedAmount,
+                  sizingSource: buySizing?.sizingSource || null,
                 });
                 while (decisions.length > decisionTrailLimit) {
                   decisions.shift();
@@ -2065,7 +2225,10 @@ export class TradingSystem {
                 }
               } else {
                 const accountContext = await this.loadAccountContext();
-                const availableCashKrw = asNumber(accountContext?.metrics?.availableCashKrw, null);
+                const availableCashKrw = asNumber(
+                  accountContext?.metrics?.cashAvailableKrw,
+                  asNumber(accountContext?.metrics?.cashKrw, null),
+                );
                 const cashKnown = Number.isFinite(availableCashKrw);
 
                 if (cashKnown && availableCashKrw + 1e-9 < orderAmountKrw) {
@@ -2079,6 +2242,7 @@ export class TradingSystem {
                     skipped: "buy_insufficient_cash_gate",
                     availableCashKrw,
                     requiredOrderKrw: orderAmountKrw,
+                    sizingSource: buySizing?.sizingSource || null,
                   });
                   while (decisions.length > decisionTrailLimit) {
                     decisions.shift();
@@ -2095,6 +2259,7 @@ export class TradingSystem {
                     actionSource: selectedSource,
                     side: orderSide,
                     note: "cash_unknown_gate_bypassed",
+                    sizingSource: buySizing?.sizingSource || null,
                   });
                   while (decisions.length > decisionTrailLimit) {
                     decisions.shift();
@@ -2103,9 +2268,6 @@ export class TradingSystem {
               }
 
               attemptedOrders += 1;
-              if (selectedSource === "policy_override") {
-                overrideActionsAttempted += 1;
-              }
               if (forcedExit) {
                 await this.recordRiskEvent({
                   type: "protective_exit",
@@ -2130,11 +2292,17 @@ export class TradingSystem {
               });
               if (order.ok) {
                 successfulOrders += 1;
-                lastOrderAtMs = nowMs;
+                lastSuccessfulOrderAtMs = nowMs;
+                lastRetryableFailureAtMs = 0;
                 if (!dryRun && selectedSource === "policy_override" && effectiveForceOnce) {
                   overrideActionConsumed = true;
                   await this.markPolicyOverrideConsumedOnce(overrideConsumeKey);
                 }
+              } else if (order.code === EXIT_CODES.EXCHANGE_RETRYABLE || order.code === EXIT_CODES.RATE_LIMITED) {
+                lastRetryableFailureAtMs = nowMs;
+              } else if (order.code !== EXIT_CODES.OK) {
+                symbolOrderBlocked = true;
+                symbolOrderBlockedReason = order.error?.message || String(order.code || "unknown_order_failure");
               }
 
               decisions.push({
@@ -2152,6 +2320,7 @@ export class TradingSystem {
                 overlayMultiplier: overlay.multiplier,
                 signalMultiplier,
                 totalMultiplier,
+                sizingSource: buySizing?.sizingSource || null,
                 sellPlan,
                 protectiveExit: forcedExit ? protectiveExit : null,
                 orderOk: order.ok,
@@ -2468,6 +2637,34 @@ export class TradingSystem {
       source: "sell_all_available_qty",
       availableQty: flooredQty,
     };
+  }
+
+  async listHeldSymbols() {
+    const accountContext = await this.loadAccountContext();
+    const symbols = [];
+    const minNotionalKrw = asPositiveNumber(this.config?.risk?.minOrderNotionalKrw, 10_000);
+    const holdingsAvailable = accountContext?.metrics?.holdingsAvailable || {};
+    const holdingsAvgBuyPrice = accountContext?.metrics?.holdingsAvgBuyPrice || {};
+
+    for (const [currency, availableQtyRaw] of Object.entries(holdingsAvailable)) {
+      const baseCurrency = String(currency || "").trim().toUpperCase();
+      const availableQty = Math.max(asNumber(availableQtyRaw, 0), 0);
+      const avgBuyPrice = asNumber(holdingsAvgBuyPrice[baseCurrency], 0);
+      const estimatedNotionalKrw = availableQty * avgBuyPrice;
+
+      if (!baseCurrency || baseCurrency === "KRW" || availableQty <= 0) {
+        continue;
+      }
+      if (!Number.isFinite(avgBuyPrice) || avgBuyPrice <= 0) {
+        continue;
+      }
+      if (!Number.isFinite(estimatedNotionalKrw) || estimatedNotionalKrw < minNotionalKrw) {
+        continue;
+      }
+      symbols.push(normalizeSymbol(`${baseCurrency}_KRW`));
+    }
+
+    return Array.from(new Set(symbols));
   }
 
   async resolveDailyPnl(equityKrw) {
@@ -3025,11 +3222,8 @@ export class TradingSystem {
 
       const signal = this.signalEngine.evaluate(candleRes.data.candles);
       const overlay = await this.resolveOverlay();
-      const baseAmount = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
       const signalMultiplier = signalRiskMultiplier(signal, this.config);
       const totalMultiplier = Math.max(0.01, overlay.multiplier * signalMultiplier);
-      const adjustedAmount = Math.max(1, Math.round(baseAmount * totalMultiplier));
-      const cappedAmount = clampOrderAmountByRiskLimits(adjustedAmount, this.config.risk);
       const lastClose = asNumber(candleRes.data.candles.at(-1)?.close, null);
       const protectiveExit = await this.resolveProtectiveExit({
         symbol: normalizedSymbol,
@@ -3039,6 +3233,23 @@ export class TradingSystem {
       const reason = protectiveExit?.reason || signal.reason;
       const action = forcedExit ? protectiveExit.action : signal.action;
       const orderSide = action === "SELL" ? "sell" : "buy";
+      const buySizing = orderSide === "buy"
+        ? await resolveBuyAmountFromCash(
+          this,
+          asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw,
+          signalMultiplier,
+          overlay.multiplier,
+          {
+            symbol: normalizedSymbol,
+            targetConcurrentSymbols: asPositiveInt(this.config?.execution?.maxSymbolsPerWindow, 1),
+          },
+        )
+        : null;
+      const baseAmount = buySizing?.amountBaseKrw
+        ?? asNumber(amount, null)
+        ?? this.config.strategy.baseOrderAmountKrw;
+      const adjustedAmount = buySizing?.amountAdjustedKrw ?? Math.max(1, Math.round(baseAmount * totalMultiplier));
+      const cappedAmount = buySizing?.amountCappedKrw ?? clampOrderAmountByRiskLimits(adjustedAmount, this.config.risk);
       let submittedAmountKrw = cappedAmount;
       let sellPlan = null;
       if (!Number.isFinite(cappedAmount) || cappedAmount <= 0) {
@@ -3052,6 +3263,7 @@ export class TradingSystem {
           amountSubmittedKrw: null,
           signalMultiplier,
           totalMultiplier,
+          sizingSource: buySizing?.sizingSource || null,
           protectiveExit,
           note: "order_amount_invalid_after_risk_cap",
         };
@@ -3082,7 +3294,13 @@ export class TradingSystem {
           price: lastClose,
           fallbackAmountKrw: cappedAmount,
         });
-        submittedAmountKrw = Math.min(asNumber(sellPlan.amountKrw, cappedAmount), cappedAmount);
+        submittedAmountKrw = asNumber(sellPlan.amountKrw, cappedAmount);
+
+        const sellAllPlan = sellPlan?.source === "sell_all_available_qty";
+        const allowFullSellAmount = sellAllPlan || forcedExit;
+        if (!allowFullSellAmount) {
+          submittedAmountKrw = Math.min(submittedAmountKrw, cappedAmount);
+        }
       }
 
       const decision = {
@@ -3094,6 +3312,7 @@ export class TradingSystem {
         amountSubmittedKrw: submittedAmountKrw,
         signalMultiplier,
         totalMultiplier,
+        sizingSource: buySizing?.sizingSource || null,
         sellPlan,
         protectiveExit,
       };
