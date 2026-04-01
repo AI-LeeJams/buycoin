@@ -12,8 +12,15 @@
  * 옵티마이저만 수동 실행:
  *   pm2 start ecosystem.config.cjs --only buycoin-optimizer
  *
- * 로그 위치: ~/.pm2/logs/ 또는 아래 error_file/out_file
+ * 로그 위치: <프로젝트>/logs/
  */
+
+const path = require("path");
+const fs = require("fs");
+const logsDir = path.join(__dirname, "logs");
+
+// PM2는 로그 디렉토리가 없으면 자동 생성하지 않으므로 보장합니다.
+try { fs.mkdirSync(logsDir, { recursive: true }); } catch (_) {}
 
 module.exports = {
   apps: [
@@ -39,16 +46,16 @@ module.exports = {
         TZ: "Asia/Seoul",
       },
 
-      // 로그 설정
-      error_file: "./logs/trader-error.log",
-      out_file: "./logs/trader-out.log",
+      // 로그 설정 (절대 경로 — PM2 데몬이 cwd를 무시할 수 있음)
+      error_file: path.join(logsDir, "trader-error.log"),
+      out_file: path.join(logsDir, "trader-out.log"),
       log_date_format: "YYYY-MM-DD HH:mm:ss Z",
       merge_logs: true,
 
       // 시그널 처리 (graceful shutdown)
       // 실시간 윈도우(기본 300초)가 끝날 때까지 대기해야 하므로
       // kill_timeout은 windowSec + 여유시간으로 설정합니다.
-      kill_timeout: 330000,        // SIGTERM 후 330초(5.5분) 대기, 이후 SIGKILL
+      kill_timeout: 10000,         // SIGTERM 후 10초 대기, 이후 SIGKILL
       listen_timeout: 10000,
       shutdown_with_message: false,
 
@@ -57,6 +64,14 @@ module.exports = {
     },
 
     // ─── 옵티마이저 (주기적 실행) ───
+    //
+    // PM2의 cron_restart는 "실행 중인" 프로세스를 재시작하는 기능이므로
+    // autorestart: true로 해야 프로세스가 종료 → 즉시 재시작 → 대기(sleep)
+    // → cron 시간에 재시작 사이클이 동작합니다.
+    //
+    // optimize.js는 작업 완료 후 process.exit(0)으로 종료하므로,
+    // autorestart: true + restart_delay로 실행 간격을 조절합니다.
+    // 파일 잠금(lock) 메커니즘이 중복 실행을 방지합니다.
     {
       name: "buycoin-optimizer",
       script: "./src/app/optimize.js",
@@ -64,9 +79,11 @@ module.exports = {
       interpreter_args: "--max-old-space-size=1024",
       cwd: __dirname,
 
-      // cron으로 1시간마다 실행
-      cron_restart: "0 * * * *",  // 매 정시에 실행
-      autorestart: false,          // cron job이므로 완료 후 재시작 불필요
+      cron_restart: "0 * * * *",  // 매 정시에 강제 재시작 (최신 데이터로 최적화)
+      autorestart: true,           // 종료 후에도 PM2가 프로세스를 유지
+      restart_delay: 3600000,      // 일반 재시작은 1시간 후 (cron이 우선)
+      max_restarts: 100,
+      min_uptime: "5s",
       watch: false,
 
       env: {
@@ -75,12 +92,11 @@ module.exports = {
       },
 
       // 로그 설정
-      error_file: "./logs/optimizer-error.log",
-      out_file: "./logs/optimizer-out.log",
+      error_file: path.join(logsDir, "optimizer-error.log"),
+      out_file: path.join(logsDir, "optimizer-out.log"),
       log_date_format: "YYYY-MM-DD HH:mm:ss Z",
       merge_logs: true,
 
-      // 옵티마이저가 15분 이상 걸리면 강제 종료
       kill_timeout: 10000,
       max_memory_restart: "1024M",
     },

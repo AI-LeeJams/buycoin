@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadEnvFile } from "../config/env-loader.js";
 import { loadConfig, normalizeSymbol } from "../config/defaults.js";
@@ -394,11 +395,23 @@ export async function runExecutionService({
 }
 
 async function main() {
+  logger.info("buycoin-trader starting", {
+    pid: process.pid,
+    cwd: process.cwd(),
+    nodeVersion: process.version,
+    argv: process.argv.slice(0, 3),
+  });
   await loadEnvFile(process.env.TRADER_ENV_FILE || ".env");
   await runExecutionService();
 }
 
-const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// PM2 환경에서는 process.argv[1]과 import.meta.url의 경로가
+// 심볼릭 링크 등에 의해 달라질 수 있으므로 path.resolve로 정규화합니다.
+const __filename = fileURLToPath(import.meta.url);
+const isPM2 = "pm_id" in process.env;
+const isDirectRun =
+  isPM2 ||
+  (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename));
 if (isDirectRun) {
   // PM2 환경에서 예기치 못한 비동기 에러가 프로세스를 즉사시키는 것을 방지합니다.
   // 로그를 남기고 PM2의 자동 재시작에 의존합니다.

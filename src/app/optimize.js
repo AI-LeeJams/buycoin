@@ -467,7 +467,11 @@ async function main() {
   }
 }
 
-const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const __filename = fileURLToPath(import.meta.url);
+const isPM2 = "pm_id" in process.env;
+const isDirectRun =
+  isPM2 ||
+  (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename));
 if (isDirectRun) {
   process.on("unhandledRejection", (reason) => {
     defaultLogger.error("optimizer unhandled promise rejection", {
