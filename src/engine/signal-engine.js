@@ -332,12 +332,12 @@ export class MeanReversionSignalEngine {
 }
 
 export function createSignalEngine(config) {
-  const strategyName = String(config?.strategy?.name || "risk_managed_momentum").trim().toLowerCase();
+  const strategyName = String(config?.strategy?.name || "mean_reversion").trim().toLowerCase();
   if (strategyName === "breakout") {
     return new BreakoutSignalEngine(config);
   }
-  if (strategyName === "mean_reversion") {
-    return new MeanReversionSignalEngine(config);
+  if (strategyName === "risk_managed_momentum") {
+    return new RiskManagedMomentumSignalEngine(config);
   }
-  return new RiskManagedMomentumSignalEngine(config);
+  return new MeanReversionSignalEngine(config);
 }

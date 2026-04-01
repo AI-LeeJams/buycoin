@@ -216,8 +216,8 @@ function summarizeStrategySettings(strategySettings = {}) {
   if (Number.isFinite(Number(execution.orderAmountKrw))) {
     parts.push(`orderAmountKrw=${Math.round(Number(execution.orderAmountKrw)).toLocaleString()}`);
   }
-  if (controls.killSwitch !== undefined && controls.killSwitch !== null) {
-    parts.push(`killSwitch=${Boolean(controls.killSwitch)}`);
+  if (controls.pauseEntries !== undefined && controls.pauseEntries !== null) {
+    parts.push(`pauseEntries=${Boolean(controls.pauseEntries)}`);
   }
   if (meta.source) {
     parts.push(`source=${meta.source}`);

@@ -53,6 +53,31 @@ function normalizeCandles(candles = []) {
   return rows;
 }
 
+function evaluateCurrentSignal(candles = [], strategy = {}) {
+  const rows = normalizeCandles(candles);
+  if (rows.length === 0) {
+    return {
+      action: "HOLD",
+      reason: "insufficient_candles",
+      metrics: {
+        candleCount: 0,
+      },
+    };
+  }
+
+  const engine = createSignalEngine({
+    strategy: {
+      ...strategy,
+    },
+  });
+  const signal = engine.evaluate(rows);
+  return {
+    action: String(signal?.action || "HOLD").toUpperCase(),
+    reason: signal?.reason || null,
+    metrics: signal?.metrics || {},
+  };
+}
+
 function safeMean(values = []) {
   if (!Array.isArray(values) || values.length === 0) {
     return 0;
@@ -277,10 +302,24 @@ function scoreCandidate(metrics) {
   const profitFactor = Math.min(5, Math.max(0, asNumber(metrics.profitFactor, 0) ?? 0));
   const winRatePct = asNumber(metrics.winRatePct, 0) ?? 0;
   const tradeCount = asNumber(metrics.tradeCount, 0) ?? 0;
+  const currentSignalAction = String(metrics.currentSignalAction || "").trim().toUpperCase();
 
-  // Return-first with explicit penalties for drawdown and low activity.
-  const inactivityPenalty = tradeCount < 3 ? (3 - tradeCount) * 5 : 0;
-  return totalReturnPct * 1.3 + sharpe * 2.5 + profitFactor * 2 + winRatePct * 0.08 - maxDdPct * 1.2 - inactivityPenalty;
+  // Keep return-first, but demote thinly-traded candidates and symbols that are
+  // already in a SELL state at the time we are selecting live symbols.
+  const inactivityPenalty = tradeCount < 8 ? (8 - tradeCount) * 2 : 0;
+  const currentSignalBias =
+    currentSignalAction === "BUY" ? 28
+      : currentSignalAction === "HOLD" ? 4
+        : currentSignalAction === "SELL" ? -12
+          : 0;
+
+  return totalReturnPct * 1.3
+    + sharpe * 2.5
+    + profitFactor * 2
+    + winRatePct * 0.08
+    - maxDdPct * 1.2
+    - inactivityPenalty
+    + currentSignalBias;
 }
 
 function safetyCheck(metrics, constraints = {}) {
@@ -289,6 +328,8 @@ function safetyCheck(metrics, constraints = {}) {
   const minWinRatePct = asNumber(constraints.minWinRatePct, 45) ?? 45;
   const minProfitFactor = asNumber(constraints.minProfitFactor, 1.05) ?? 1.05;
   const minReturnPct = asNumber(constraints.minReturnPct, 0) ?? 0;
+  const minExpectancyKrw = asNumber(constraints.minExpectancyKrw, -999999) ?? -999999;
+  const minNetEdgeBps = asNumber(constraints.minNetEdgeBps, -999999) ?? -999999;
   const minWalkForwardScore = asNumber(constraints.minWalkForwardScore, -999999);
   const minWalkForwardFoldCount = asPositiveInt(constraints.minWalkForwardFoldCount, 0);
   const minWalkForwardPassRate = asNumber(constraints.minWalkForwardPassRate, 0);
@@ -300,6 +341,8 @@ function safetyCheck(metrics, constraints = {}) {
     minWinRate: (asNumber(metrics.winRatePct, 0) ?? 0) >= minWinRatePct,
     minProfitFactor: (asNumber(metrics.profitFactor, 0) ?? 0) >= minProfitFactor,
     minReturn: (asNumber(metrics.totalReturnPct, -9999) ?? -9999) >= minReturnPct,
+    minExpectancy: (asNumber(metrics.expectancyKrw, -999999) ?? -999999) >= minExpectancyKrw,
+    minNetEdge: (asNumber(metrics.netEdgeBps, -999999) ?? -999999) >= minNetEdgeBps,
     walkForward: walkForwardEnabled
       ? (asNumber(metrics.walkForwardScore, -999999) >= minWalkForwardScore
         && (asNumber(metrics.walkForwardFoldCount, 0) ?? 0) >= minWalkForwardFoldCount
@@ -468,6 +511,10 @@ function simulateStrategyPerformance({
   const expectancyPct = realizedTradeCount > 0
     ? (expectancyKrw / (asNumber(initialCashKrw, 1_000_000) ?? 1_000_000)) * 100
     : 0;
+  const avgRoundTripNotionalKrw = realizedTradeCount > 0 ? turnoverKrw / realizedTradeCount : 0;
+  const grossEdgeBps = avgRoundTripNotionalKrw > 0 ? (expectancyKrw / avgRoundTripNotionalKrw) * 10_000 : 0;
+  const roundTripFeeAndSlipBps = (feeRate * 10_000 * 2) + ((asNumber(simulatedSlippageBps, 0) ?? 0) * 2);
+  const netEdgeBps = grossEdgeBps - roundTripFeeAndSlipBps;
 
   const metrics = {
     initialCashKrw: asNumber(initialCashKrw, 1_000_000) ?? 1_000_000,
@@ -481,6 +528,8 @@ function simulateStrategyPerformance({
     realizedTradeCount,
     expectancyKrw,
     expectancyPct,
+    grossEdgeBps,
+    netEdgeBps,
     buyCount,
     sellCount,
     winRatePct: winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0,
@@ -705,8 +754,10 @@ function optimizeStrategies({
         const walkForwardScore = walkForwardEnabled
           ? walkForwardResult?.ok ? walkForwardResult.metrics?.score || 0 : -999999
           : 0;
+        const currentSignal = evaluateCurrentSignal(candles, strategy);
         const score = scoreCandidate({
           ...simulationResult.metrics,
+          currentSignalAction: currentSignal.action,
           walkForwardScore,
         }) + walkForwardScore * (walkForwardConfig.scoreWeight || 0.25);
 
@@ -730,6 +781,7 @@ function optimizeStrategies({
           strategy,
           strategyName,
           metrics: simulationResult.metrics,
+          currentSignal,
           walkForward: walkForwardResult
             ? {
                 ok: walkForwardResult.ok,
@@ -774,6 +826,8 @@ function optimizeStrategies({
       minWinRatePct: asNumber(constraints.minWinRatePct, 45) ?? 45,
       minProfitFactor: asNumber(constraints.minProfitFactor, 1.05) ?? 1.05,
       minReturnPct: asNumber(constraints.minReturnPct, 0) ?? 0,
+      minExpectancyKrw: asNumber(constraints.minExpectancyKrw, -999999) ?? -999999,
+      minNetEdgeBps: asNumber(constraints.minNetEdgeBps, -999999) ?? -999999,
       walkForwardEnabled: walkForward.enabled === true,
       walkForwardMinScore: asNumber(walkForward.minScore, -999999) ?? -999999,
       walkForwardMinFoldCount: asPositiveInt(walkForward.minFoldCount, 3),

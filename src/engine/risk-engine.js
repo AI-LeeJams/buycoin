@@ -19,15 +19,25 @@ export class TraditionalRiskEngine {
     const dailyPnlKrw = asNumber(input.dailyPnlKrw, 0);
     const chanceMinTotalKrw = asNumber(input.chanceMinTotalKrw, 0);
     const holdingNotionalKrw = asNumber(input.holdingNotionalKrw, 0);
+    const maxExposureRaw = limits.maxExposureKrw;
+    const maxExposureKrw =
+      maxExposureRaw === null || maxExposureRaw === undefined || maxExposureRaw === ""
+        ? null
+        : (Number.isFinite(Number(maxExposureRaw)) ? Number(maxExposureRaw) : null);
+    const maxOrderRaw = limits.maxOrderNotionalKrw;
+    const maxOrderNotionalKrw =
+      maxOrderRaw === null || maxOrderRaw === undefined || maxOrderRaw === ""
+        ? null
+        : (Number.isFinite(Number(maxOrderRaw)) ? Number(maxOrderRaw) : null);
 
     const appliedMinNotional = Math.max(limits.minOrderNotionalKrw, chanceMinTotalKrw);
     const projectedExposureKrw = exposureKrw + (side === "buy" ? amountKrw : 0);
     const reasons = [];
 
-    if (input.killSwitch) {
+    if (side === "buy" && input.entryBlocked) {
       reasons.push({
-        rule: "KILL_SWITCH_ACTIVE",
-        detail: "kill switch is enabled",
+        rule: "ENTRY_BLOCKED",
+        detail: "entry block is active",
       });
     }
 
@@ -57,17 +67,17 @@ export class TraditionalRiskEngine {
       });
     }
 
-    if (amountKrw > limits.maxOrderNotionalKrw) {
+    if (side !== "sell" && maxOrderNotionalKrw !== null && amountKrw > maxOrderNotionalKrw) {
       reasons.push({
         rule: "MAX_ORDER_NOTIONAL_KRW",
-        detail: `${amountKrw} > ${limits.maxOrderNotionalKrw}`,
+        detail: `${amountKrw} > ${maxOrderNotionalKrw}`,
       });
     }
 
-    if (side === "buy" && projectedExposureKrw > limits.maxExposureKrw) {
+    if (side === "buy" && maxExposureKrw !== null && projectedExposureKrw > maxExposureKrw) {
       reasons.push({
         rule: "MAX_EXPOSURE_KRW",
-        detail: `${projectedExposureKrw} > ${limits.maxExposureKrw}`,
+        detail: `${projectedExposureKrw} > ${maxExposureKrw}`,
       });
     }
 
@@ -92,7 +102,7 @@ export class TraditionalRiskEngine {
       });
     }
 
-    if (dailyPnlKrw <= -Math.abs(limits.maxDailyLossKrw)) {
+    if (side === "buy" && dailyPnlKrw <= -Math.abs(limits.maxDailyLossKrw)) {
       reasons.push({
         rule: "MAX_DAILY_LOSS_KRW",
         detail: `${dailyPnlKrw} <= -${Math.abs(limits.maxDailyLossKrw)}`,

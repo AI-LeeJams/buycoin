@@ -6,9 +6,14 @@ function initialState() {
   return {
     version: 1,
     settings: {
-      killSwitch: false,
-      killSwitchReason: null,
-      killSwitchAt: null,
+      entryBlock: {
+        blocked: false,
+        reason: null,
+        source: null,
+        blockedAt: null,
+        tradeDate: null,
+        manual: false,
+      },
     },
     orders: [],
     orderEvents: [],
@@ -30,12 +35,87 @@ function initialState() {
 
 function normalizeState(state) {
   const base = initialState();
+  const rawEntryBlock = state?.settings?.entryBlock;
+  const legacyKillSwitch = state?.settings?.killSwitch === true;
+  const legacyKillSwitchReason = String(state?.settings?.killSwitchReason || "").trim();
+  const legacyTradeDate = state?.settings?.dailyPnlBaseline?.date || null;
+  const legacyBlockedAt = state?.settings?.killSwitchAt || null;
+  const legacyEntryBlockByReason = (() => {
+    switch (legacyKillSwitchReason) {
+      case "strategy_settings_control":
+        return {
+          blocked: true,
+          reason: "manual_pause_entries",
+          source: "manual_pause_entries",
+          blockedAt: legacyBlockedAt,
+          tradeDate: legacyTradeDate,
+          manual: true,
+        };
+      case "max_mtm_daily_loss_reached":
+        return {
+          blocked: true,
+          reason: "max_mtm_daily_loss",
+          source: "max_mtm_daily_loss",
+          blockedAt: legacyBlockedAt,
+          tradeDate: legacyTradeDate,
+          manual: false,
+        };
+      case "max_daily_loss_reached":
+        return {
+          blocked: true,
+          reason: "max_daily_loss",
+          source: "max_daily_loss",
+          blockedAt: legacyBlockedAt,
+          tradeDate: legacyTradeDate,
+          manual: false,
+        };
+      case "max_consecutive_risk_rejects":
+        return {
+          blocked: true,
+          reason: "risk_reject_streak",
+          source: "risk_reject_streak",
+          blockedAt: legacyBlockedAt,
+          tradeDate: legacyTradeDate,
+          manual: false,
+        };
+      default:
+        if (legacyKillSwitchReason.startsWith("kpi_guard")) {
+          return {
+            blocked: true,
+            reason: "kpi_guard",
+            source: "kpi_guard",
+            blockedAt: legacyBlockedAt,
+            tradeDate: legacyTradeDate,
+            manual: false,
+          };
+        }
+        return null;
+    }
+  })();
+  const entryBlock = rawEntryBlock && typeof rawEntryBlock === "object"
+    ? {
+      ...base.settings.entryBlock,
+      ...rawEntryBlock,
+      blocked: Boolean(rawEntryBlock.blocked),
+      reason: rawEntryBlock.reason ? String(rawEntryBlock.reason) : null,
+      source: rawEntryBlock.source ? String(rawEntryBlock.source) : null,
+      blockedAt: rawEntryBlock.blockedAt || null,
+      tradeDate: rawEntryBlock.tradeDate || null,
+      manual: Boolean(rawEntryBlock.manual),
+    }
+    : (legacyKillSwitch && legacyEntryBlockByReason
+      ? {
+        ...base.settings.entryBlock,
+        ...legacyEntryBlockByReason,
+      }
+      : base.settings.entryBlock);
   const normalized = {
     ...base,
     ...(state || {}),
     settings: {
       ...base.settings,
       ...(state?.settings || {}),
+      entryBlock,
     },
     marketData: {
       ...base.marketData,
@@ -49,6 +129,9 @@ function normalizeState(state) {
   delete normalized.settings.paperMode;
   delete normalized.settings.paperModeInitialized;
   delete normalized.settings.paperReason;
+  delete normalized.settings.killSwitch;
+  delete normalized.settings.killSwitchReason;
+  delete normalized.settings.killSwitchAt;
   return normalized;
 }
 
