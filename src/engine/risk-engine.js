@@ -34,10 +34,10 @@ export class TraditionalRiskEngine {
     const projectedExposureKrw = exposureKrw + (side === "buy" ? amountKrw : 0);
     const reasons = [];
 
-    if (input.killSwitch) {
+    if (side === "buy" && input.entryBlocked) {
       reasons.push({
-        rule: "KILL_SWITCH_ACTIVE",
-        detail: "kill switch is enabled",
+        rule: "ENTRY_BLOCKED",
+        detail: "entry block is active",
       });
     }
 
@@ -102,7 +102,7 @@ export class TraditionalRiskEngine {
       });
     }
 
-    if (dailyPnlKrw <= -Math.abs(limits.maxDailyLossKrw)) {
+    if (side === "buy" && dailyPnlKrw <= -Math.abs(limits.maxDailyLossKrw)) {
       reasons.push({
         rule: "MAX_DAILY_LOSS_KRW",
         detail: `${dailyPnlKrw} <= -${Math.abs(limits.maxDailyLossKrw)}`,

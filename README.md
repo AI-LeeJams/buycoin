@@ -50,12 +50,12 @@
 - `holdingNotional < 5,000 KRW`(dust)는 보호청산/신호 대상에서 제외
 
 ### C. 비실행성 거절 승격 제외
-다음 거절은 `riskReject streak`/auto kill-switch 승격에서 제외:
+다음 거절은 `riskReject streak`/auto entry-block 승격에서 제외:
 - `MIN_ORDER_NOTIONAL_KRW`
 - `INSUFFICIENT_CASH`
 - `SELL_EXCEEDS_HOLDING`
 - `NO_SELLABLE_HOLDING`
-- `KILL_SWITCH_ACTIVE`(에코)
+- `ENTRY_BLOCKED`(에코)
 
 ### D. SELL 최소금액 미만 스킵
 - SELL 주문금액이 최소 체결금액 미만이면 주문 시도 자체를 스킵
@@ -128,16 +128,18 @@ pm2 status
 
 - Node.js 20+
 - Bithumb API Key/Secret
-- `.env`는 최소 운영값만 두는 것을 권장 (`BITHUMB_ACCESS_KEY`, `BITHUMB_SECRET_KEY`, `TZ`, `TRADER_INITIAL_CAPITAL_KRW`)
-- 매매 튜닝 대부분은 코드 기본값과 optimizer가 담당
+- `.env`는 최소 운영값만 두는 것을 권장 (`BITHUMB_ACCESS_KEY`, `BITHUMB_SECRET_KEY`, `TZ`, `TRADER_INITIAL_CAPITAL_KRW`, `TRADING_PROFILE`)
+- live 매매 기본값은 코드 프리셋(`safe`, `balanced`, `aggressive`)이 담당
+- 필요 시 `EXECUTION_SYMBOL`, `EXECUTION_ORDER_AMOUNT_KRW`만 추가 오버라이드
 
 ---
 
 ## 8) 운영 주의사항
 
-- `npm start` 단독으로도 시작 시 최적화 + 주기 재최적화가 동작하도록 설계됨
-- `strategy-settings.json`은 `version=1`, `updatedAt`, `meta.source=optimizer`를 만족하고 max-age 정책을 통과해야 live에 반영됨
-- 리스크 정책이 올린 runtime kill-switch는 `strategy-settings.controls.killSwitch=false`로 자동 해제되지 않음
+- `npm start`는 단일 mean reversion 실행기입니다. 시작 시 optimizer를 live에 적용하지 않습니다.
+- `npm run optimize`는 연구용 리포트만 생성하며 live 설정을 바꾸지 않습니다.
+- `strategy-settings.json`은 이제 운영 제어 파일입니다. `pauseEntries`와 단일 심볼/주문금액 오버라이드만 live에 반영됩니다.
+- 리스크 정책은 전역 정지 대신 `entry block`을 올려 신규 진입만 차단하고, 보호청산/SELL은 계속 허용함
 - overlay는 기본 비활성화되어 과거 `.trader/overlay.json`이 주문 크기를 왜곡하지 않음
 - 이상 징후(성공률 급락/거절률 급등/전략-로그 불일치) 시 즉시 핫픽스 후 재검증
 

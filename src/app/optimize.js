@@ -11,7 +11,6 @@ import { CuratedMarketUniverse } from "../core/market-universe.js";
 import { MarketDataService } from "../core/market-data.js";
 import { assessListingAge } from "../core/listing-age.js";
 import { optimizeTradingStrategies } from "../engine/strategy-optimizer.js";
-import { StrategySettingsSource } from "./strategy-settings.js";
 
 function roundNum(value, digits = 4) {
   if (!Number.isFinite(Number(value))) {
@@ -19,22 +18,6 @@ function roundNum(value, digits = 4) {
   }
   const scale = 10 ** digits;
   return Math.round(Number(value) * scale) / scale;
-}
-
-function asPositiveInt(value, fallback) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
-  }
-  return Math.max(1, Math.floor(parsed));
-}
-
-function asPositiveNumber(value, fallback = null) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
-  }
-  return parsed;
 }
 
 async function writeJson(filePath, payload) {
@@ -48,25 +31,7 @@ async function writeJson(filePath, payload) {
     await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), "utf8");
     await fs.rename(tempFile, filePath);
   } catch (error) {
-    try {
-      await fs.unlink(tempFile);
-    } catch (cleanupError) {
-      if (cleanupError.code !== "ENOENT") {
-        error.cleanupError = cleanupError.message;
-      }
-    }
-    throw error;
-  }
-}
-
-async function loadStrategySettingsSafe(filePath) {
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    return raw.trim() ? JSON.parse(raw) : {};
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return {};
-    }
+    await fs.unlink(tempFile).catch(() => {});
     throw error;
   }
 }
@@ -77,69 +42,34 @@ async function acquireOptimizeLock(lockFile, ttlSec = 900, logger = defaultLogge
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
 
   while (true) {
-    const payload = JSON.stringify({
-      pid: process.pid,
-      startedAt: nowIso(),
-      script: "optimize.js",
-    });
     try {
-      await fs.writeFile(lockPath, payload, { encoding: "utf8", flag: "wx" });
+      await fs.writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        startedAt: nowIso(),
+        script: "optimize.js",
+      }), { encoding: "utf8", flag: "wx" });
       return { acquired: true, lockPath };
     } catch (error) {
       if (error.code !== "EEXIST") {
         throw error;
       }
 
-      const lockInfo = await fs.readFile(lockPath, "utf8").catch(() => null);
-      let lockMeta = null;
-      if (lockInfo) {
-        try {
-          lockMeta = JSON.parse(lockInfo);
-        } catch {
-          lockMeta = { malformed: true, raw: lockInfo.slice(0, 120) };
-        }
-      }
-
-      const lockPid = Number(lockMeta?.pid);
-      const lockPidAlive = Number.isFinite(lockPid) && lockPid > 0
-        ? (() => {
-          try {
-            process.kill(lockPid, 0);
-            return true;
-          } catch (killError) {
-            if (killError.code === "ESRCH") {
-              return false;
-            }
-            if (killError.code === "EPERM") {
-              return true;
-            }
-            return false;
-          }
-        })()
-        : null;
-
       try {
         const stats = await fs.stat(lockPath);
-        const stale = lockPidAlive === false || stats.mtimeMs + lockTtlMs < Date.now();
-        if (!stale) {
+        if (stats.mtimeMs + lockTtlMs >= Date.now()) {
           return {
             acquired: false,
             lockPath,
             reason: "busy",
-            lockMeta,
           };
         }
       } catch (statError) {
-        if (statError.code === "ENOENT") {
-          continue;
+        if (statError.code !== "ENOENT") {
+          throw statError;
         }
-        throw statError;
       }
 
-      logger.warn("optimize lock recovered as stale; removing", {
-        lockPath,
-        lockMeta,
-      });
+      logger.warn("optimize lock recovered as stale; removing", { lockPath });
       await fs.unlink(lockPath).catch(() => {});
     }
   }
@@ -149,30 +79,7 @@ async function releaseOptimizeLock(lockPath) {
   if (!lockPath) {
     return;
   }
-  try {
-    const lockInfo = await fs.readFile(lockPath, "utf8").catch(() => null);
-    let lockMeta = null;
-    if (lockInfo) {
-      try {
-        lockMeta = JSON.parse(lockInfo);
-      } catch {
-        lockMeta = { malformed: true, raw: lockInfo.slice(0, 120) };
-      }
-    }
-
-    const lockPid = Number(lockMeta?.pid);
-    if (!Number.isFinite(lockPid) || lockPid === process.pid) {
-      await fs.unlink(lockPath);
-      return;
-    }
-
-    defaultLogger.warn("optimize lock owner mismatch; skip unlink", {
-      lockPath,
-      lockMeta,
-    });
-  } catch {
-    // best effort cleanup
-  }
+  await fs.unlink(lockPath).catch(() => {});
 }
 
 function compressCandidate(candidate) {
@@ -206,6 +113,8 @@ function compressCandidate(candidate) {
       sharpe: roundNum(candidate.metrics?.sharpe, 4),
       expectancyKrw: roundNum(candidate.metrics?.expectancyKrw, 2),
       expectancyPct: roundNum(candidate.metrics?.expectancyPct, 4),
+      grossEdgeBps: roundNum(candidate.metrics?.grossEdgeBps, 4),
+      netEdgeBps: roundNum(candidate.metrics?.netEdgeBps, 4),
       totalFeeKrw: roundNum(candidate.metrics?.totalFeeKrw, 2),
       avgSlippageBps: roundNum(candidate.metrics?.avgSlippageBps, 4),
       maxSlippageBps: roundNum(candidate.metrics?.maxSlippageBps, 4),
@@ -231,11 +140,7 @@ function compressCandidate(candidate) {
   };
 }
 
-function isSameStrategy(left = {}, right = {}) {
-  return JSON.stringify(left || {}) === JSON.stringify(right || {});
-}
-
-function pickRuntimeSymbols(optimization, runtimeConfig) {
+export function pickRuntimeSymbols(optimization, runtimeConfig) {
   const best = optimization?.best;
   if (!best) {
     return [];
@@ -247,48 +152,27 @@ function pickRuntimeSymbols(optimization, runtimeConfig) {
       ? optimization.ranked
       : [];
 
-  const actionPriority = (candidate) => {
-    const action = String(candidate?.currentSignal?.action || "").trim().toUpperCase();
-    if (action === "BUY") {
-      return 2;
+  const bestPerSymbol = [];
+  const seenSymbols = new Set();
+  for (const candidate of ranked) {
+    const symbol = normalizeSymbol(candidate?.symbol);
+    if (!symbol || seenSymbols.has(symbol)) {
+      continue;
     }
-    if (action === "HOLD") {
-      return 1;
-    }
-    return 0;
-  };
-
-  const prioritized = ranked
-    .filter((candidate) => isSameStrategy(candidate.strategy, best.strategy))
-    .sort((a, b) => {
-      const priorityDiff = actionPriority(b) - actionPriority(a);
-      if (priorityDiff !== 0) {
-        return priorityDiff;
-      }
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
-      return (b.metrics?.totalReturnPct || 0) - (a.metrics?.totalReturnPct || 0);
-    });
-
-  const matchingSymbols = [];
-  for (const candidate of prioritized) {
-    if (!matchingSymbols.includes(candidate.symbol)) {
-      matchingSymbols.push(candidate.symbol);
-    }
+    seenSymbols.add(symbol);
+    bestPerSymbol.push(candidate);
   }
 
-  const fallbackSymbols = [best.symbol]
-    .map((item) => normalizeSymbol(item))
-    .filter(Boolean);
-  for (const symbol of fallbackSymbols) {
-    if (matchingSymbols.length === 0 && !matchingSymbols.includes(symbol)) {
-      matchingSymbols.push(symbol);
-    }
-  }
-
+  const bestScore = Number(best.score || 0);
+  const maxScoreGap = Math.max(0, Number(runtimeConfig.optimizer?.maxSymbolScoreGap || 0));
   const maxSymbols = Math.max(1, Number(runtimeConfig.optimizer?.maxLiveSymbols || 1));
-  return matchingSymbols.slice(0, maxSymbols);
+
+  return bestPerSymbol
+    .filter((candidate) => Number(candidate.score || -Infinity) >= bestScore - maxScoreGap)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .map((candidate) => normalizeSymbol(candidate.symbol))
+    .filter(Boolean)
+    .slice(0, maxSymbols);
 }
 
 async function loadMarketUniverseSymbols(config, logger) {
@@ -321,7 +205,9 @@ async function loadMarketUniverseSymbols(config, logger) {
   if (!refresh.ok || !refresh.data) {
     return [];
   }
-  return Array.isArray(refresh.data.symbols) ? refresh.data.symbols.map((item) => normalizeSymbol(item)).filter(Boolean) : [];
+  return Array.isArray(refresh.data.symbols)
+    ? refresh.data.symbols.map((item) => normalizeSymbol(item)).filter(Boolean)
+    : [];
 }
 
 async function resolveOptimizerSymbols(config, logger) {
@@ -331,14 +217,9 @@ async function resolveOptimizerSymbols(config, logger) {
 
   try {
     const universeSymbols = await loadMarketUniverseSymbols(config, logger);
-    const mergedSymbols = Array.from(new Set([...universeSymbols, ...fallbackSymbols]));
-    if (mergedSymbols.length > 0) {
-      logger.info("optimizer using configured market universe symbols", {
-        count: mergedSymbols.length,
-        symbols: mergedSymbols,
-        source: config.marketUniverse?.snapshotFile || "optimizer_symbols",
-      });
-      return mergedSymbols;
+    const merged = Array.from(new Set([...universeSymbols, ...fallbackSymbols]));
+    if (merged.length > 0) {
+      return merged;
     }
   } catch (error) {
     logger.warn("optimizer failed to load market-universe snapshot; fallback to configured symbols", {
@@ -346,100 +227,7 @@ async function resolveOptimizerSymbols(config, logger) {
     });
   }
 
-  try {
-    const source = new StrategySettingsSource(config, logger);
-    await source.init();
-    const current = await source.read();
-    const runtimeSymbols = Array.isArray(current?.execution?.symbols)
-      ? current.execution.symbols.map((item) => normalizeSymbol(item)).filter(Boolean)
-      : [];
-    if (runtimeSymbols.length > 0) {
-      logger.info("optimizer using runtime strategy symbols as fallback", {
-        count: runtimeSymbols.length,
-        symbols: runtimeSymbols,
-        source: current.source,
-      });
-      return runtimeSymbols;
-    }
-  } catch (error) {
-    logger.warn("optimizer failed to load current strategy settings; fallback to optimizer config symbols", {
-      error: error.message,
-    });
-  }
-
   return fallbackSymbols;
-}
-
-async function applyBestToStrategySettings(runtimeConfig, optimization, logger) {
-  const source = new StrategySettingsSource(runtimeConfig, logger);
-  await source.init();
-
-  const current = await loadStrategySettingsSafe(runtimeConfig.strategySettings.settingsFile);
-  const template = source.defaultTemplate();
-  const best = optimization.best;
-  const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
-  const runId = `${Date.now()}-${process.pid}`;
-  const targetConcurrentSymbols = selectedSymbols.length > 0 ? selectedSymbols.length : 1;
-
-  const next = {
-    ...template,
-    ...current,
-    version: 1,
-    updatedAt: nowIso(),
-    meta: {
-      ...(current.meta && typeof current.meta === "object" ? current.meta : {}),
-      source: "optimizer",
-      runId,
-      evaluatedStrategies: optimization.strategyNames || [],
-      bestSymbol: best.symbol,
-    },
-    execution: {
-      ...template.execution,
-      ...(current.execution || {}),
-      enabled: true,
-      symbol: selectedSymbols[0] || best.symbol || template.execution.symbol,
-      symbols: selectedSymbols.length > 0
-        ? selectedSymbols
-        : [best.symbol || template.execution.symbol],
-      orderAmountKrw: Math.max(
-        1,
-        Number(best.strategy?.baseOrderAmountKrw || runtimeConfig.optimizer.baseOrderAmountKrw || template.execution.orderAmountKrw),
-      ),
-      maxSymbolsPerWindow: targetConcurrentSymbols,
-      maxOrderAttemptsPerWindow: Math.max(
-        asPositiveInt(current?.execution?.maxOrderAttemptsPerWindow, template.execution.maxOrderAttemptsPerWindow),
-        targetConcurrentSymbols,
-      ),
-    },
-    strategy: {
-      ...template.strategy,
-      ...(current.strategy || {}),
-      ...best.strategy,
-      defaultSymbol: selectedSymbols[0] || best.symbol || template.strategy.defaultSymbol,
-      candleInterval: runtimeConfig.optimizer.interval,
-      candleCount: runtimeConfig.optimizer.candleCount,
-    },
-    controls: {
-      ...template.controls,
-      ...(current.controls || {}),
-    },
-  };
-
-  if (targetConcurrentSymbols > 1) {
-    const diversifiedCashUsagePct = Math.max(1, Math.floor(100 / targetConcurrentSymbols));
-    next.strategy.cashUsagePct = Math.min(
-      asPositiveNumber(next.strategy.cashUsagePct, 100),
-      diversifiedCashUsagePct,
-    );
-  }
-
-  await writeJson(runtimeConfig.strategySettings.settingsFile, next);
-  return {
-    settingsFile: runtimeConfig.strategySettings.settingsFile,
-    appliedAt: next.updatedAt,
-    symbols: next.execution.symbols,
-    strategy: next.strategy.name,
-  };
 }
 
 async function fetchCandlesBySymbol(config, logger, symbols) {
@@ -447,18 +235,9 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
   const marketData = new MarketDataService(config, client);
   const requestedCandleCount = Math.max(1, Number(config.optimizer?.candleCount || 200));
   const fetchCandleCount = Math.min(200, requestedCandleCount);
-  if (fetchCandleCount !== requestedCandleCount) {
-    logger.warn("optimizer candle count capped to exchange limit", {
-      requestedCandleCount,
-      fetchCandleCount,
-    });
-  }
   const minHistoryCandles = Math.max(
     30,
-    Math.min(
-      fetchCandleCount,
-      Number(config.optimizer?.minHistoryCandles || config.optimizer?.candleCount || 200),
-    ),
+    Math.min(fetchCandleCount, Number(config.optimizer?.minHistoryCandles || requestedCandleCount)),
   );
   const minListingAgeDays = Math.max(0, Number(config.optimizer?.minListingAgeDays || 0));
 
@@ -474,19 +253,7 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
           minListingAgeDays,
         });
         if (!listingAge.ok) {
-          fetchErrors.push({
-            symbol,
-            message: listingAge.reason || "insufficient_listing_age",
-          });
-          logger.warn("optimizer skipped symbol with insufficient listing age", {
-            symbol,
-            minListingAgeDays,
-            listingAgeDays: listingAge.listingAgeDays,
-            interval: listingAge.interval,
-            candleCount: listingAge.candleCount,
-            oldestCandleAt: listingAge.oldestCandleAt,
-            reason: listingAge.reason,
-          });
+          fetchErrors.push({ symbol, message: listingAge.reason || "insufficient_listing_age" });
           continue;
         }
       }
@@ -498,33 +265,12 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
       });
       const candles = Array.isArray(response.candles) ? response.candles : [];
       if (candles.length < minHistoryCandles) {
-        fetchErrors.push({
-          symbol,
-          message: `insufficient_history:${candles.length} < ${minHistoryCandles}`,
-        });
-        logger.warn("optimizer skipped symbol with insufficient candle history", {
-          symbol,
-          interval: config.optimizer.interval,
-          candleCount: candles.length,
-          minHistoryCandles,
-        });
+        fetchErrors.push({ symbol, message: `insufficient_history:${candles.length} < ${minHistoryCandles}` });
         continue;
       }
       candlesBySymbol[symbol] = candles;
-      logger.info("optimizer fetched candles", {
-        symbol,
-        interval: config.optimizer.interval,
-        candleCount: candlesBySymbol[symbol].length,
-      });
     } catch (error) {
-      fetchErrors.push({
-        symbol,
-        message: error.message,
-      });
-      logger.warn("optimizer failed to fetch candles", {
-        symbol,
-        reason: error.message,
-      });
+      fetchErrors.push({ symbol, message: error.message });
     }
   }
   return { candlesBySymbol, fetchErrors };
@@ -533,7 +279,7 @@ async function fetchCandlesBySymbol(config, logger, symbols) {
 export async function optimizeAndApplyBest({
   config = null,
   logger = defaultLogger,
-  apply = true,
+  apply = false,
 } = {}) {
   const runtimeConfig = config || loadConfig(process.env);
   if (!runtimeConfig.optimizer?.enabled) {
@@ -541,18 +287,6 @@ export async function optimizeAndApplyBest({
       ok: false,
       error: { message: "optimizer_disabled" },
     };
-  }
-
-  if (runtimeConfig.marketUniverse?.enabled) {
-    try {
-      const universe = new CuratedMarketUniverse(runtimeConfig, logger);
-      await universe.init();
-      await universe.maybeRefresh({ force: true, reason: "optimizer" });
-    } catch (error) {
-      logger.warn("optimizer failed to refresh market universe; continuing with fallback symbol sources", {
-        error: error.message,
-      });
-    }
   }
 
   const optimizerSymbols = await resolveOptimizerSymbols(runtimeConfig, logger);
@@ -579,6 +313,8 @@ export async function optimizeAndApplyBest({
       minWinRatePct: runtimeConfig.optimizer.minWinRatePct,
       minProfitFactor: runtimeConfig.optimizer.minProfitFactor,
       minReturnPct: runtimeConfig.optimizer.minReturnPct,
+      minExpectancyKrw: runtimeConfig.optimizer.minExpectancyKrw,
+      minNetEdgeBps: runtimeConfig.optimizer.minNetEdgeBps,
       minWalkForwardFoldCount: runtimeConfig.optimizer.walkForwardMinFoldCount,
       minWalkForwardPassRate: runtimeConfig.optimizer.walkForwardMinPassRate,
       minWalkForwardScore: runtimeConfig.optimizer.walkForwardMinScore,
@@ -636,7 +372,8 @@ export async function optimizeAndApplyBest({
   const report = {
     generatedAt: nowIso(),
     source: "optimizer",
-    mode: "live",
+    mode: "research_only",
+    appliesToLive: false,
     interval: runtimeConfig.optimizer.interval,
     candleCount: runtimeConfig.optimizer.candleCount,
     strategyNames: optimization.strategyNames || [],
@@ -661,32 +398,19 @@ export async function optimizeAndApplyBest({
 
   await writeJson(runtimeConfig.optimizer.reportFile, report);
 
-  let applied = false;
-  let applyResult = null;
-  if (apply) {
-    if (optimization.best?.safety?.safe !== true) {
-      logger.warn("optimizer skipped apply: best candidate is not safe", {
-        symbol: optimization.best?.symbol || null,
-        checks: optimization.best?.safety?.checks || null,
-        safeCandidates,
-      });
-    } else {
-      applyResult = await applyBestToStrategySettings(runtimeConfig, optimization, logger);
-      applied = true;
-    }
-  }
-
   return {
     ok: true,
     data: {
       reportFile: runtimeConfig.optimizer.reportFile,
-      applied,
-      applyResult,
-      riskSummary: report.riskSummary,
+      applied: false,
+      applyRequested: Boolean(apply),
+      applyResult: null,
       best: report.best,
       top: report.top,
       selectedSymbols,
       strategyNames: report.strategyNames,
+      riskSummary: report.riskSummary,
+      note: "research_only_report",
     },
   };
 }
@@ -703,7 +427,6 @@ async function main() {
     defaultLogger.warn("optimizer run skipped by lock guard", {
       reason: lock.reason || "unknown",
       lockPath: lock.lockPath,
-      lockMeta: lock.lockMeta || null,
     });
     process.exitCode = 0;
     return;
@@ -713,7 +436,7 @@ async function main() {
     const result = await optimizeAndApplyBest({
       config,
       logger: defaultLogger,
-      apply: config.optimizer.applyToStrategySettings !== false,
+      apply: false,
     });
 
     if (!result.ok) {
@@ -727,7 +450,7 @@ async function main() {
 
     defaultLogger.info("optimizer completed", {
       reportFile: result.data.reportFile,
-      applied: result.data.applied,
+      applied: false,
       symbol: result.data.best?.symbol || null,
       selectedSymbols: result.data.selectedSymbols || [],
       strategyNames: result.data.strategyNames || [],

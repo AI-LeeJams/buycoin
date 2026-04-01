@@ -396,6 +396,45 @@ test("protective sell exits full position even above max order notional", async 
   assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 24000);
 });
 
+test("strategy run does not force a take-profit exit when fixed TP is disabled", async () => {
+  const config = await createConfig({
+    STRATEGY_BREAKOUT_LOOKBACK: "4",
+    RISK_MAX_HOLDING_TAKE_PROFIT_PCT: "0",
+    RISK_TRAILING_ARM_PCT: "10",
+    RISK_TRAILING_STOP_PCT: "5",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "120000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+    {
+      currency: "BTC",
+      balance: "300",
+      locked: "0",
+      avg_buy_price: "90",
+      unit_currency: "KRW",
+    },
+  ];
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_HOLD),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.runStrategyOnce({ symbol: "BTC_KRW" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.protectiveExit, null);
+  assert.equal(result.data.order, null);
+  assert.equal(exchange.placeCalls.length, 0);
+});
+
 test("stream ticker collects realtime ticks from websocket client", async () => {
   const config = await createConfig();
   const wsClient = new WsClientMock([
@@ -496,6 +535,60 @@ test("strategy realtime can execute policy override decision without signal trig
   assert.equal(exchange.placeCalls[0].side, "buy");
   assert.equal(exchange.placeCalls[0].amountKrw, 10000);
   assert.equal(result.data.decisions[0].actionSource, "policy_override");
+});
+
+test("strategy realtime blocks additional buy when a symbol already has an open position", async () => {
+  const config = await createConfig();
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    {
+      currency: "KRW",
+      balance: "120000",
+      locked: "0",
+      avg_buy_price: "0",
+      unit_currency: "KRW",
+    },
+    {
+      currency: "BTC",
+      balance: "300",
+      locked: "0",
+      avg_buy_price: "90",
+      unit_currency: "KRW",
+    },
+  ];
+  const wsClient = new WsClientMock([
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700000 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700001 },
+  ]);
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_HOLD),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 0,
+    dryRun: false,
+    executionPolicy: {
+      mode: "override",
+      forceAction: "BUY",
+      forceAmountKrw: 9000,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.attemptedOrders, 0);
+  assert.equal(result.data.successfulOrders, 0);
+  assert.equal(exchange.placeCalls.length, 0);
+  assert.equal(
+    result.data.decisions.some((row) => row.skipped === "single_position_per_symbol"),
+    true,
+  );
 });
 
 test("strategy realtime does not consume force-once override on non-actionable sell", async () => {

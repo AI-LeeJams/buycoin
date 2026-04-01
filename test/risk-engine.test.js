@@ -21,7 +21,7 @@ test("risk engine rejects below min notional", () => {
     exposureKrw: 0,
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.allowed, false);
@@ -38,7 +38,7 @@ test("risk engine rejects buy when available cash is insufficient", () => {
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
     availableCashKrw: 10000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.allowed, false);
@@ -54,7 +54,7 @@ test("risk engine rejects by daily loss and exposure", () => {
     exposureKrw: 80000,
     dailyPnlKrw: -25000,
     chanceMinTotalKrw: 5000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.allowed, false);
@@ -72,7 +72,7 @@ test("risk engine rejects sell when holdings are insufficient", () => {
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
     holdingNotionalKrw: 10000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.allowed, false);
@@ -89,7 +89,7 @@ test("risk engine allows full-position sell above max order notional", () => {
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
     holdingNotionalKrw: 350000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.allowed, true);
@@ -111,7 +111,7 @@ test("risk engine skips max exposure check when exposure cap is auto", () => {
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
     availableCashKrw: 100000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.reasons.some((r) => r.rule === "MAX_EXPOSURE_KRW"), false);
@@ -132,8 +132,43 @@ test("risk engine skips max order notional check when order cap is auto", () => 
     dailyPnlKrw: 0,
     chanceMinTotalKrw: 5000,
     availableCashKrw: 100000,
-    killSwitch: false,
+    entryBlocked: false,
   });
 
   assert.equal(result.reasons.some((r) => r.rule === "MAX_ORDER_NOTIONAL_KRW"), false);
+});
+
+test("risk engine blocks buy when entry block is active", () => {
+  const engine = new TraditionalRiskEngine(config);
+  const result = engine.evaluate({
+    amountKrw: 10000,
+    side: "buy",
+    openOrdersCount: 0,
+    exposureKrw: 0,
+    dailyPnlKrw: 0,
+    chanceMinTotalKrw: 5000,
+    availableCashKrw: 100000,
+    entryBlocked: true,
+  });
+
+  assert.equal(result.allowed, false);
+  assert.equal(result.reasons.some((r) => r.rule === "ENTRY_BLOCKED"), true);
+});
+
+test("risk engine still allows sell when daily loss limit is exceeded", () => {
+  const engine = new TraditionalRiskEngine(config);
+  const result = engine.evaluate({
+    amountKrw: 10000,
+    side: "sell",
+    openOrdersCount: 0,
+    exposureKrw: 0,
+    dailyPnlKrw: -25000,
+    chanceMinTotalKrw: 5000,
+    holdingNotionalKrw: 10000,
+    entryBlocked: true,
+  });
+
+  assert.equal(result.reasons.some((r) => r.rule === "MAX_DAILY_LOSS_KRW"), false);
+  assert.equal(result.reasons.some((r) => r.rule === "ENTRY_BLOCKED"), false);
+  assert.equal(result.allowed, true);
 });

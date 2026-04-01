@@ -13,6 +13,7 @@ class SystemMock {
       data: {
         tickCount: 1,
         buySignals: 0,
+        sellSignals: 0,
         attemptedOrders: 0,
         successfulOrders: 0,
       },
@@ -20,14 +21,30 @@ class SystemMock {
     this.calls = {
       init: 0,
       realtime: 0,
-      strategyApply: 0,
-      killSwitch: 0,
+      entryBlockSet: 0,
+      entryBlockClear: 0,
       args: [],
-      strategyArgs: [],
-      killSwitchArgs: [],
+      entryBlockArgs: [],
     };
-    this.killSwitch = false;
+    this.entryBlock = {
+      blocked: false,
+      reason: null,
+      source: null,
+      blockedAt: null,
+      tradeDate: null,
+    };
     this.heldSymbols = [];
+    this.markToMarketResult = {
+      ok: true,
+      code: 0,
+      data: {
+        positionCount: 0,
+        totalUnrealizedPnlKrw: 0,
+        totalUnrealizedPnlPct: 0,
+        dailyPnlKrw: 0,
+        equityMtmKrw: 100000,
+      },
+    };
   }
 
   async init() {
@@ -40,26 +57,51 @@ class SystemMock {
     return this.result;
   }
 
-  async applyStrategySettings(args) {
-    this.calls.strategyApply += 1;
-    this.calls.strategyArgs.push(args);
+  async setEntryBlock(blocked, options = {}) {
+    this.calls.entryBlockSet += 1;
+    this.calls.entryBlockArgs.push({ blocked, ...options });
+    this.entryBlock = blocked
+      ? {
+        blocked: true,
+        reason: options.reason || null,
+        source: options.source || options.reason || null,
+        blockedAt: options.blockedAt || new Date().toISOString(),
+        tradeDate: options.tradeDate || null,
+      }
+      : {
+        blocked: false,
+        reason: null,
+        source: null,
+        blockedAt: null,
+        tradeDate: null,
+      };
     return {
       ok: true,
-      code: 0,
-      data: args,
+      data: {
+        entryBlocked: this.entryBlock.blocked,
+        entryBlockReason: this.entryBlock.reason,
+        entryBlockSource: this.entryBlock.source,
+      },
     };
   }
 
-  async setKillSwitch(enabled, reason = null) {
-    this.calls.killSwitch += 1;
-    this.calls.killSwitchArgs.push({ enabled, reason });
-    this.killSwitch = Boolean(enabled);
+  async clearEntryBlock(reason = null) {
+    this.calls.entryBlockClear += 1;
+    if (!reason || this.entryBlock.reason === reason) {
+      this.entryBlock = {
+        blocked: false,
+        reason: null,
+        source: null,
+        blockedAt: null,
+        tradeDate: null,
+      };
+    }
     return {
       ok: true,
-      code: 0,
       data: {
-        killSwitch: this.killSwitch,
-        reason,
+        entryBlocked: this.entryBlock.blocked,
+        entryBlockReason: this.entryBlock.reason,
+        entryBlockSource: this.entryBlock.source,
       },
     };
   }
@@ -67,14 +109,21 @@ class SystemMock {
   async status() {
     return {
       data: {
-        killSwitch: this.killSwitch,
-        killSwitchReason: this.killSwitch ? "mock_kill_switch" : null,
+        entryBlocked: this.entryBlock.blocked,
+        entryBlockReason: this.entryBlock.reason,
+        entryBlockSource: this.entryBlock.source,
+        entryBlockAt: this.entryBlock.blockedAt,
+        entryBlockTradeDate: this.entryBlock.tradeDate,
       },
     };
   }
 
   async listHeldSymbols() {
     return this.heldSymbols;
+  }
+
+  async evaluateMarkToMarket() {
+    return this.markToMarketResult;
   }
 }
 
@@ -85,20 +134,30 @@ function baseConfig() {
       accessKey: "",
       secretKey: "",
     },
+    tradingProfile: {
+      name: "balanced",
+    },
     strategy: {
-      name: "risk_managed_momentum",
+      name: "mean_reversion",
       defaultSymbol: "BTC_KRW",
       candleInterval: "15m",
-      candleCount: 120,
+      candleCount: 180,
+      meanLookback: 20,
+      meanEntryBps: 60,
+      meanExitBps: 10,
       baseOrderAmountKrw: 20000,
       autoSellEnabled: true,
+    },
+    risk: {
+      maxMtmDailyLossKrw: 4000,
     },
     strategySettings: {
       enabled: false,
       settingsFile: null,
-      requireOptimizerSource: false,
-      refreshMinSec: 1800,
-      refreshMaxSec: 3600,
+      maxAgeSec: 7200,
+    },
+    marketUniverse: {
+      enabled: false,
     },
     execution: {
       enabled: true,
@@ -107,8 +166,12 @@ function baseConfig() {
       orderAmountKrw: 20000,
       windowSec: 1,
       cooldownSec: 1,
-      maxSymbolsPerWindow: 3,
+      maxSymbolsPerWindow: 1,
+      maxOrderAttemptsPerWindow: 1,
+      dryRun: false,
+      logOnlyOnActivity: true,
       restartDelayMs: 1,
+      kpiMonitorMaxOpenLossPct: -1.5,
     },
   };
 }
@@ -148,8 +211,8 @@ test("execution service exits immediately when disabled", async () => {
   assert.equal(system.calls.realtime, 0);
 });
 
-test("execution service applies strategy settings per window", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-"));
+test("execution service reads single-symbol operator overrides from strategy settings", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-settings-"));
   const settingsFile = path.join(baseDir, "strategy-settings.json");
   const payload = {
     version: 1,
@@ -157,27 +220,9 @@ test("execution service applies strategy settings per window", async () => {
     execution: {
       enabled: true,
       symbol: "USDT_KRW",
-      symbols: ["USDT_KRW"],
       orderAmountKrw: 7000,
       windowSec: 2,
       cooldownSec: 0,
-    },
-    strategy: {
-      name: "risk_managed_momentum",
-      defaultSymbol: "USDT_KRW",
-      candleInterval: "5m",
-      momentumLookback: 36,
-      volatilityLookback: 96,
-      momentumEntryBps: 16,
-      momentumExitBps: 10,
-      targetVolatilityPct: 0.35,
-      riskManagedMinMultiplier: 0.4,
-      riskManagedMaxMultiplier: 1.8,
-      autoSellEnabled: true,
-      baseOrderAmountKrw: 7000,
-      candleCount: 120,
-      breakoutLookback: 20,
-      breakoutBufferBps: 5,
     },
   };
   await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
@@ -191,154 +236,39 @@ test("execution service applies strategy settings per window", async () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.windows, 1);
-  assert.equal(system.calls.strategyApply, 1);
   assert.equal(system.calls.realtime, 1);
   assert.equal(system.calls.args[0].symbol, "USDT_KRW");
-  assert.equal(system.calls.args[0].amount, 20000);
-  assert.equal(system.calls.args[0].durationSec, 5);
+  assert.equal(system.calls.args[0].amount, 7000);
+  assert.equal(system.calls.args[0].durationSec, 2);
   assert.equal(system.calls.args[0].cooldownSec, 0);
-  assert.equal(system.calls.args[0].dryRun, false);
-});
-
-test("execution service runs multiple symbols in one window when strategy settings provide symbols", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-multi-"));
-  const settingsFile = path.join(baseDir, "strategy-settings.json");
-  const payload = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    execution: {
-      enabled: true,
-      symbol: "BTC_KRW",
-      symbols: ["BTC_KRW", "ETH_KRW", "USDT_KRW"],
-      orderAmountKrw: 7000,
-      windowSec: 2,
-      cooldownSec: 0,
-    },
-  };
-  await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
-
-  const config = baseConfig();
-  config.strategySettings.enabled = true;
-  config.strategySettings.settingsFile = settingsFile;
-
-  const system = new SystemMock();
-  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
-
-  assert.equal(result.ok, true);
-  assert.equal(result.windows, 1);
-  assert.equal(system.calls.realtime, 3);
-  const symbols = system.calls.args.map((row) => row.symbol).sort();
-  assert.deepEqual(symbols, ["BTC_KRW", "ETH_KRW", "USDT_KRW"]);
 });
 
 test("execution service keeps held symbols in exit-only mode without consuming entry slots", async () => {
   const config = baseConfig();
-  config.execution.symbols = ["A8_KRW", "AZIT_KRW"];
-  config.execution.maxSymbolsPerWindow = 2;
-
   const system = new SystemMock();
   system.heldSymbols = ["TDROP_KRW"];
 
   const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
 
   assert.equal(result.ok, true);
-  assert.equal(system.calls.realtime, 3);
+  assert.equal(system.calls.realtime, 2);
   assert.deepEqual(
     system.calls.args.map((row) => row.symbol),
-    ["TDROP_KRW", "A8_KRW", "AZIT_KRW"],
+    ["TDROP_KRW", "BTC_KRW"],
   );
   assert.equal(system.calls.args[0].executionPolicy.allowBuy, false);
   assert.equal(system.calls.args[0].executionPolicy.allowSell, true);
   assert.equal(system.calls.args[1].executionPolicy, null);
-  assert.equal(system.calls.args[2].executionPolicy, null);
 });
 
-test("execution service does not duplicate a held symbol that is already selected", async () => {
-  const config = baseConfig();
-  config.execution.symbols = ["KAT_KRW", "BTC_KRW"];
-  config.execution.maxSymbolsPerWindow = 2;
-
-  const system = new SystemMock();
-  system.heldSymbols = ["KAT_KRW"];
-
-  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
-
-  assert.equal(result.ok, true);
-  assert.equal(system.calls.realtime, 2);
-  assert.deepEqual(
-    system.calls.args.map((row) => row.symbol),
-    ["KAT_KRW", "BTC_KRW"],
-  );
-  assert.equal(system.calls.args[0].executionPolicy, null);
-  assert.equal(system.calls.args[1].executionPolicy, null);
-});
-
-test("execution service keeps strategy snapshot until refresh window", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-refresh-"));
-  const settingsFile = path.join(baseDir, "strategy-settings.json");
-  const firstPayload = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    execution: {
-      enabled: true,
-      symbol: "USDT_KRW",
-      symbols: ["USDT_KRW"],
-      orderAmountKrw: 7000,
-      windowSec: 1,
-      cooldownSec: 0,
-    },
-  };
-  const secondPayload = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    execution: {
-      enabled: true,
-      symbol: "ETH_KRW",
-      symbols: ["ETH_KRW"],
-      orderAmountKrw: 9000,
-      windowSec: 1,
-      cooldownSec: 0,
-    },
-  };
-  await fs.writeFile(settingsFile, JSON.stringify(firstPayload, null, 2), "utf8");
-
-  class MutatingSystemMock extends SystemMock {
-    async runStrategyRealtime(args) {
-      this.calls.realtime += 1;
-      this.calls.args.push(args);
-      if (this.calls.realtime === 1) {
-        await fs.writeFile(settingsFile, JSON.stringify(secondPayload, null, 2), "utf8");
-      }
-      return this.result;
-    }
-  }
-
-  const config = baseConfig();
-  config.strategySettings.enabled = true;
-  config.strategySettings.settingsFile = settingsFile;
-  config.strategySettings.refreshMinSec = 3600;
-  config.strategySettings.refreshMaxSec = 3600;
-
-  const system = new MutatingSystemMock();
-  const result = await runExecutionService({ system, config, stopAfterWindows: 2 });
-
-  assert.equal(result.ok, true);
-  assert.equal(result.windows, 2);
-  assert.equal(system.calls.realtime, 2);
-  assert.equal(system.calls.args[0].symbol, "USDT_KRW");
-  assert.equal(system.calls.args[1].symbol, "USDT_KRW");
-  assert.equal(system.calls.args[0].amount, 20000);
-  assert.equal(system.calls.args[1].amount, 20000);
-});
-
-test("execution service applies kill switch from strategy settings", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-kill-"));
+test("execution service applies pause entries from strategy settings", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-pause-"));
   const settingsFile = path.join(baseDir, "strategy-settings.json");
   const payload = {
     version: 1,
     updatedAt: new Date().toISOString(),
     controls: {
-      killSwitch: true,
+      pauseEntries: true,
     },
   };
   await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
@@ -352,27 +282,28 @@ test("execution service applies kill switch from strategy settings", async () =>
 
   assert.equal(result.ok, true);
   assert.equal(result.windows, 1);
-  assert.equal(system.calls.killSwitch, 1);
+  assert.equal(system.calls.entryBlockSet, 1);
   assert.equal(system.calls.realtime, 0);
-  assert.equal(system.calls.killSwitchArgs[0].enabled, true);
+  assert.deepEqual(system.calls.entryBlockArgs[0], {
+    blocked: true,
+    reason: "manual_pause_entries",
+    source: "manual_pause_entries",
+    manual: true,
+  });
 });
 
-test("execution service does not clear runtime kill switch unless explicitly allowed", async () => {
-  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-strategy-kill-reset-"));
+test("execution service clears manual pause entries when strategy settings disable it", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-pause-reset-"));
   const settingsFile = path.join(baseDir, "strategy-settings.json");
   const payload = {
     version: 1,
     updatedAt: new Date().toISOString(),
-    meta: {
-      source: "optimizer",
-    },
     execution: {
       enabled: true,
       symbol: "BTC_KRW",
-      symbols: ["BTC_KRW"],
     },
     controls: {
-      killSwitch: false,
+      pauseEntries: false,
     },
   };
   await fs.writeFile(settingsFile, JSON.stringify(payload, null, 2), "utf8");
@@ -382,18 +313,23 @@ test("execution service does not clear runtime kill switch unless explicitly all
   config.strategySettings.settingsFile = settingsFile;
 
   const system = new SystemMock();
-  system.killSwitch = true;
+  system.entryBlock = {
+    blocked: true,
+    reason: "manual_pause_entries",
+    source: "manual_pause_entries",
+    blockedAt: new Date().toISOString(),
+    tradeDate: null,
+  };
   const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
 
   assert.equal(result.ok, true);
-  assert.equal(system.calls.killSwitch, 0);
-  assert.equal(system.killSwitch, true);
-  assert.equal(system.calls.realtime, 0);
+  assert.equal(system.calls.entryBlockClear >= 1, true);
+  assert.equal(system.entryBlock.blocked, false);
+  assert.equal(system.calls.realtime, 1);
 });
 
-test("execution service applies market universe filter to requested symbols", async () => {
+test("execution service applies market universe filter to requested symbol", async () => {
   const config = baseConfig();
-  config.execution.symbols = ["BTC_KRW", "ETH_KRW", "USDT_KRW"];
 
   const system = new SystemMock();
   const universe = {
@@ -403,31 +339,27 @@ test("execution service applies market universe filter to requested symbols", as
       return {
         ok: true,
         data: {
-          symbols: ["BTC_KRW", "USDT_KRW"],
-          criteria: { minAccTradeValue24hKrw: 1 },
-          nextRefreshSec: 1800,
+          symbols: ["USDT_KRW"],
         },
       };
     },
     filterSymbols(symbols = []) {
-      const allowed = new Set(["BTC_KRW", "USDT_KRW"]);
-      const accepted = [];
-      const rejected = [];
-      for (const symbol of symbols) {
-        if (allowed.has(symbol)) {
-          accepted.push(symbol);
-        } else {
-          rejected.push(symbol);
-        }
-      }
       return {
-        symbols: accepted,
-        filteredOut: rejected,
-        allowedCount: allowed.size,
-        source: "mock",
+        symbols: symbols.filter((symbol) => symbol === "USDT_KRW"),
       };
     },
   };
+  config.strategySettings.enabled = true;
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-universe-"));
+  const settingsFile = path.join(baseDir, "strategy-settings.json");
+  await fs.writeFile(settingsFile, JSON.stringify({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    execution: {
+      symbol: "USDT_KRW",
+    },
+  }, null, 2), "utf8");
+  config.strategySettings.settingsFile = settingsFile;
 
   const result = await runExecutionService({
     system,
@@ -438,7 +370,64 @@ test("execution service applies market universe filter to requested symbols", as
 
   assert.equal(result.ok, true);
   assert.equal(result.windows, 1);
-  assert.equal(system.calls.realtime, 2);
-  const symbols = system.calls.args.map((row) => row.symbol).sort();
-  assert.deepEqual(symbols, ["BTC_KRW", "USDT_KRW"]);
+  assert.equal(system.calls.realtime, 1);
+  assert.equal(system.calls.args[0].symbol, "USDT_KRW");
+});
+
+test("execution service activates entry block from mtm daily loss before trading", async () => {
+  const config = baseConfig();
+  const system = new SystemMock();
+  system.markToMarketResult = {
+    ok: true,
+    code: 0,
+    data: {
+      positionCount: 1,
+      totalUnrealizedPnlKrw: -2500,
+      totalUnrealizedPnlPct: -2.5,
+      dailyPnlKrw: -5000,
+      equityMtmKrw: 95000,
+    },
+  };
+
+  const result = await runExecutionService({
+    system,
+    config,
+    stopAfterWindows: 1,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.stoppedBy, "window_limit");
+  assert.equal(system.calls.entryBlockSet, 1);
+  assert.equal(system.calls.realtime, 0);
+});
+
+test("execution service blocks new entries and switches to exit-only on open loss monitor alert", async () => {
+  const config = baseConfig();
+
+  const system = new SystemMock();
+  system.heldSymbols = ["BTC_KRW"];
+  system.markToMarketResult = {
+    ok: true,
+    code: 0,
+    data: {
+      positionCount: 1,
+      totalUnrealizedPnlKrw: -1600,
+      totalUnrealizedPnlPct: -2,
+      dailyPnlKrw: -1000,
+      equityMtmKrw: 99000,
+    },
+  };
+
+  const result = await runExecutionService({
+    system,
+    config,
+    stopAfterWindows: 1,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.windows, 1);
+  assert.equal(system.calls.realtime, 1);
+  assert.equal(system.calls.args[0].symbol, "BTC_KRW");
+  assert.equal(system.calls.args[0].executionPolicy.allowBuy, false);
+  assert.equal(system.calls.args[0].executionPolicy.allowSell, true);
 });

@@ -328,6 +328,8 @@ function safetyCheck(metrics, constraints = {}) {
   const minWinRatePct = asNumber(constraints.minWinRatePct, 45) ?? 45;
   const minProfitFactor = asNumber(constraints.minProfitFactor, 1.05) ?? 1.05;
   const minReturnPct = asNumber(constraints.minReturnPct, 0) ?? 0;
+  const minExpectancyKrw = asNumber(constraints.minExpectancyKrw, -999999) ?? -999999;
+  const minNetEdgeBps = asNumber(constraints.minNetEdgeBps, -999999) ?? -999999;
   const minWalkForwardScore = asNumber(constraints.minWalkForwardScore, -999999);
   const minWalkForwardFoldCount = asPositiveInt(constraints.minWalkForwardFoldCount, 0);
   const minWalkForwardPassRate = asNumber(constraints.minWalkForwardPassRate, 0);
@@ -339,6 +341,8 @@ function safetyCheck(metrics, constraints = {}) {
     minWinRate: (asNumber(metrics.winRatePct, 0) ?? 0) >= minWinRatePct,
     minProfitFactor: (asNumber(metrics.profitFactor, 0) ?? 0) >= minProfitFactor,
     minReturn: (asNumber(metrics.totalReturnPct, -9999) ?? -9999) >= minReturnPct,
+    minExpectancy: (asNumber(metrics.expectancyKrw, -999999) ?? -999999) >= minExpectancyKrw,
+    minNetEdge: (asNumber(metrics.netEdgeBps, -999999) ?? -999999) >= minNetEdgeBps,
     walkForward: walkForwardEnabled
       ? (asNumber(metrics.walkForwardScore, -999999) >= minWalkForwardScore
         && (asNumber(metrics.walkForwardFoldCount, 0) ?? 0) >= minWalkForwardFoldCount
@@ -507,6 +511,10 @@ function simulateStrategyPerformance({
   const expectancyPct = realizedTradeCount > 0
     ? (expectancyKrw / (asNumber(initialCashKrw, 1_000_000) ?? 1_000_000)) * 100
     : 0;
+  const avgRoundTripNotionalKrw = realizedTradeCount > 0 ? turnoverKrw / realizedTradeCount : 0;
+  const grossEdgeBps = avgRoundTripNotionalKrw > 0 ? (expectancyKrw / avgRoundTripNotionalKrw) * 10_000 : 0;
+  const roundTripFeeAndSlipBps = (feeRate * 10_000 * 2) + ((asNumber(simulatedSlippageBps, 0) ?? 0) * 2);
+  const netEdgeBps = grossEdgeBps - roundTripFeeAndSlipBps;
 
   const metrics = {
     initialCashKrw: asNumber(initialCashKrw, 1_000_000) ?? 1_000_000,
@@ -520,6 +528,8 @@ function simulateStrategyPerformance({
     realizedTradeCount,
     expectancyKrw,
     expectancyPct,
+    grossEdgeBps,
+    netEdgeBps,
     buyCount,
     sellCount,
     winRatePct: winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0,
@@ -816,6 +826,8 @@ function optimizeStrategies({
       minWinRatePct: asNumber(constraints.minWinRatePct, 45) ?? 45,
       minProfitFactor: asNumber(constraints.minProfitFactor, 1.05) ?? 1.05,
       minReturnPct: asNumber(constraints.minReturnPct, 0) ?? 0,
+      minExpectancyKrw: asNumber(constraints.minExpectancyKrw, -999999) ?? -999999,
+      minNetEdgeBps: asNumber(constraints.minNetEdgeBps, -999999) ?? -999999,
       walkForwardEnabled: walkForward.enabled === true,
       walkForwardMinScore: asNumber(walkForward.minScore, -999999) ?? -999999,
       walkForwardMinFoldCount: asPositiveInt(walkForward.minFoldCount, 3),

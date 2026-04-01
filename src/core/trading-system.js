@@ -118,6 +118,41 @@ function toDateByTimezone(timezone) {
   }
 }
 
+const DAILY_ENTRY_BLOCK_REASONS = new Set([
+  "max_mtm_daily_loss",
+  "max_daily_loss",
+  "kpi_guard",
+]);
+
+function defaultEntryBlockState() {
+  return {
+    blocked: false,
+    reason: null,
+    source: null,
+    blockedAt: null,
+    tradeDate: null,
+    manual: false,
+  };
+}
+
+function normalizeEntryBlockState(entryBlock = null) {
+  const base = defaultEntryBlockState();
+  if (!entryBlock || typeof entryBlock !== "object") {
+    return base;
+  }
+  const next = {
+    ...base,
+    ...entryBlock,
+    blocked: Boolean(entryBlock.blocked),
+    reason: entryBlock.reason ? String(entryBlock.reason) : null,
+    source: entryBlock.source ? String(entryBlock.source) : null,
+    blockedAt: entryBlock.blockedAt || null,
+    tradeDate: entryBlock.tradeDate || null,
+    manual: Boolean(entryBlock.manual),
+  };
+  return next.blocked ? next : base;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -233,6 +268,53 @@ function symbolExposureFromAccountContext(accountContext, symbol) {
     return 0;
   }
   return quantity * avgBuyPrice;
+}
+
+function positionSnapshotFromAccountContext(accountContext, symbol, price = null) {
+  const normalizedSymbol = normalizeSymbol(symbol || "");
+  const [baseCurrency] = normalizedSymbol.split("_");
+  if (!baseCurrency) {
+    return {
+      symbol: normalizedSymbol,
+      availableQty: 0,
+      totalQty: 0,
+      avgBuyPrice: 0,
+      price: asNumber(price, null),
+      notionalKrw: 0,
+      unrealizedPnlKrw: 0,
+      unrealizedPnlPct: 0,
+    };
+  }
+
+  const totalQty = Math.max(asNumber(accountContext?.metrics?.holdings?.[baseCurrency], 0), 0);
+  const availableQty = Math.max(asNumber(accountContext?.metrics?.holdingsAvailable?.[baseCurrency], totalQty), 0);
+  const avgBuyPrice = asNumber(accountContext?.metrics?.holdingsAvgBuyPrice?.[baseCurrency], 0);
+  const resolvedPrice = asNumber(price, avgBuyPrice);
+  const referencePrice = Number.isFinite(resolvedPrice) && resolvedPrice > 0 ? resolvedPrice : avgBuyPrice;
+  const notionalKrw = Number.isFinite(referencePrice) && referencePrice > 0 ? availableQty * referencePrice : 0;
+  const costKrw = avgBuyPrice > 0 ? availableQty * avgBuyPrice : 0;
+  const unrealizedPnlKrw = notionalKrw - costKrw;
+  const unrealizedPnlPct = costKrw > 0 ? (unrealizedPnlKrw / costKrw) * 100 : 0;
+
+  return {
+    symbol: normalizedSymbol,
+    availableQty,
+    totalQty,
+    avgBuyPrice,
+    price: Number.isFinite(referencePrice) && referencePrice > 0 ? referencePrice : null,
+    notionalKrw,
+    unrealizedPnlKrw,
+    unrealizedPnlPct,
+  };
+}
+
+function hasBlockingSinglePosition(config, accountContext, symbol, price = null) {
+  if (config?.risk?.singlePositionPerSymbol !== true) {
+    return false;
+  }
+  const snapshot = positionSnapshotFromAccountContext(accountContext, symbol, price);
+  const minOrderNotionalKrw = asPositiveNumber(config?.risk?.minOrderNotionalKrw, 10_000);
+  return snapshot.availableQty > 0 && snapshot.notionalKrw >= minOrderNotionalKrw;
 }
 
 async function resolveBuyAmountFromCash(
@@ -1401,9 +1483,7 @@ export class TradingSystem {
   async init() {
     await this.store.init();
     await this.store.update((state) => {
-      if (typeof state.settings.killSwitch !== "boolean") {
-        state.settings.killSwitch = false;
-      }
+      state.settings.entryBlock = normalizeEntryBlockState(state.settings.entryBlock);
       if (!state.system) {
         state.system = {};
       }
@@ -1667,6 +1747,7 @@ export class TradingSystem {
   }
 
   async status() {
+    const entryBlock = await this.refreshEntryBlock();
     const state = this.store.snapshot();
     return {
       ok: true,
@@ -1674,8 +1755,11 @@ export class TradingSystem {
       data: {
         now: nowIso(),
         mode: "live",
-        killSwitch: Boolean(state.settings.killSwitch),
-        killSwitchReason: state.settings.killSwitchReason || null,
+        entryBlocked: entryBlock.blocked,
+        entryBlockReason: entryBlock.reason,
+        entryBlockSource: entryBlock.source,
+        entryBlockAt: entryBlock.blockedAt,
+        entryBlockTradeDate: entryBlock.tradeDate,
         defaultSymbol: this.config.strategy.defaultSymbol,
         strategy: {
           name: this.config.strategy.name,
@@ -1729,11 +1813,26 @@ export class TradingSystem {
     });
   }
 
-  async setKillSwitch(enabled, reason = null) {
+  async setEntryBlock(blocked, {
+    reason = null,
+    source = null,
+    tradeDate = null,
+    manual = false,
+  } = {}) {
+    let resolved = defaultEntryBlockState();
     await this.store.update((state) => {
-      state.settings.killSwitch = Boolean(enabled);
-      state.settings.killSwitchAt = nowIso();
-      state.settings.killSwitchReason = reason || null;
+      const next = blocked
+        ? normalizeEntryBlockState({
+          blocked: true,
+          reason,
+          source: source || reason || null,
+          blockedAt: nowIso(),
+          tradeDate: tradeDate || null,
+          manual,
+        })
+        : defaultEntryBlockState();
+      state.settings.entryBlock = next;
+      resolved = next;
       return state;
     });
 
@@ -1741,10 +1840,79 @@ export class TradingSystem {
       ok: true,
       code: EXIT_CODES.OK,
       data: {
-        killSwitch: Boolean(enabled),
-        reason: reason || null,
+        entryBlocked: resolved.blocked,
+        entryBlockReason: resolved.reason,
+        entryBlockSource: resolved.source,
+        entryBlockAt: resolved.blockedAt,
+        entryBlockTradeDate: resolved.tradeDate,
       },
     };
+  }
+
+  async clearEntryBlock(reason = null) {
+    let resolved = defaultEntryBlockState();
+    let cleared = false;
+    await this.store.update((state) => {
+      const current = normalizeEntryBlockState(state.settings.entryBlock);
+      if (!current.blocked || (reason && current.reason !== reason)) {
+        resolved = current;
+        return state;
+      }
+      state.settings.entryBlock = defaultEntryBlockState();
+      resolved = state.settings.entryBlock;
+      cleared = true;
+      return state;
+    });
+
+    return {
+      ok: true,
+      code: EXIT_CODES.OK,
+      data: {
+        cleared,
+        entryBlocked: resolved.blocked,
+        entryBlockReason: resolved.reason,
+        entryBlockSource: resolved.source,
+        entryBlockAt: resolved.blockedAt,
+        entryBlockTradeDate: resolved.tradeDate,
+      },
+    };
+  }
+
+  async refreshEntryBlock() {
+    const tradeDate = toDateByTimezone(this.config.runtime.timezone);
+    const resetMs = Math.max(
+      0,
+      Math.floor(asNumber(this.config.risk.riskRejectResetSec, 300) * 1000),
+    );
+    let resolved = normalizeEntryBlockState(this.store.snapshot()?.settings?.entryBlock);
+
+    await this.store.update((state) => {
+      const current = normalizeEntryBlockState(state.settings.entryBlock);
+      if (!current.blocked) {
+        resolved = current;
+        return state;
+      }
+
+      const shouldReleaseByTradeDate = DAILY_ENTRY_BLOCK_REASONS.has(current.reason)
+        && current.tradeDate
+        && current.tradeDate !== tradeDate;
+      const blockedAtMs = Date.parse(current.blockedAt || "");
+      const shouldReleaseByRiskRejectReset = current.reason === "risk_reject_streak"
+        && resetMs > 0
+        && Number.isFinite(blockedAtMs)
+        && Date.now() - blockedAtMs > resetMs;
+
+      if (shouldReleaseByTradeDate || shouldReleaseByRiskRejectReset) {
+        state.settings.entryBlock = defaultEntryBlockState();
+        resolved = state.settings.entryBlock;
+        return state;
+      }
+
+      resolved = current;
+      return state;
+    });
+
+    return resolved;
   }
 
   async applyStrategySettings(strategy = {}, source = "runtime") {
@@ -2250,6 +2418,24 @@ export class TradingSystem {
                   return;
                 }
 
+                if (hasBlockingSinglePosition(this.config, accountContext, normalizedSymbol, tick.tradePrice)) {
+                  const position = positionSnapshotFromAccountContext(accountContext, normalizedSymbol, tick.tradePrice);
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: orderSide,
+                    skipped: "single_position_per_symbol",
+                    position,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
+                }
+
                 if (!cashKnown) {
                   decisions.push({
                     at: nowIso(),
@@ -2687,12 +2873,11 @@ export class TradingSystem {
         return state;
       }
 
-      const configured = asNumber(this.config.risk.initialCapitalKrw, null);
-      baseline = configured !== null && configured > 0 ? configured : equityKrw;
+      baseline = equityKrw;
       state.settings.dailyPnlBaseline = {
         date: tradeDate,
         equityKrw: baseline,
-        source: configured !== null && configured > 0 ? "initial_capital" : "first_equity_of_day",
+        source: "first_equity_of_day",
         updatedAt: nowIso(),
       };
       return state;
@@ -2702,6 +2887,79 @@ export class TradingSystem {
       tradeDate,
       baselineEquityKrw: baseline,
       dailyPnlKrw: equityKrw - baseline,
+    };
+  }
+
+  async evaluateMarkToMarket(symbols = null) {
+    const accountContext = await this.loadAccountContext();
+    const symbolFilter = Array.isArray(symbols) && symbols.length > 0
+      ? new Set(symbols.map((item) => normalizeSymbol(item)).filter(Boolean))
+      : null;
+    const holdings = accountContext?.metrics?.holdingsAvailable || {};
+    const positions = [];
+    let totalOpenValueKrw = 0;
+    let totalOpenCostKrw = 0;
+
+    for (const [currency, availableQtyRaw] of Object.entries(holdings)) {
+      const baseCurrency = String(currency || "").trim().toUpperCase();
+      const availableQty = Math.max(asNumber(availableQtyRaw, 0), 0);
+      if (!baseCurrency || baseCurrency === "KRW" || availableQty <= 0) {
+        continue;
+      }
+
+      const symbol = normalizeSymbol(`${baseCurrency}_KRW`);
+      if (symbolFilter && !symbolFilter.has(symbol)) {
+        continue;
+      }
+
+      let lastPrice = asNumber(accountContext?.metrics?.holdingsAvgBuyPrice?.[baseCurrency], null);
+      let priceSource = "avg_buy_price_fallback";
+      try {
+        const ticker = await this.fetchTicker(symbol);
+        if (ticker.ok) {
+          const metrics = this.marketData.extractTickerMetrics(ticker.data);
+          const fetchedPrice = asNumber(metrics?.lastPrice, null);
+          if (fetchedPrice !== null && fetchedPrice > 0) {
+            lastPrice = fetchedPrice;
+            priceSource = "ticker";
+          }
+        }
+      } catch {
+        // Best-effort MTM. Fallback price keeps guards conservative when market data is unavailable.
+      }
+
+      const snapshot = positionSnapshotFromAccountContext(accountContext, symbol, lastPrice);
+      positions.push({
+        ...snapshot,
+        priceSource,
+      });
+      totalOpenValueKrw += Math.max(0, snapshot.notionalKrw);
+      totalOpenCostKrw += Math.max(0, snapshot.availableQty * snapshot.avgBuyPrice);
+    }
+
+    const cashKrw = asNumber(accountContext?.metrics?.cashKrw, 0);
+    const equityMtmKrw = cashKrw + totalOpenValueKrw;
+    const dailyPnl = await this.resolveDailyPnl(equityMtmKrw);
+    const totalUnrealizedPnlKrw = totalOpenValueKrw - totalOpenCostKrw;
+    const totalUnrealizedPnlPct = totalOpenCostKrw > 0 ? (totalUnrealizedPnlKrw / totalOpenCostKrw) * 100 : 0;
+
+    return {
+      ok: true,
+      code: EXIT_CODES.OK,
+      data: {
+        source: accountContext.source,
+        cashKrw,
+        equityMtmKrw,
+        positionCount: positions.length,
+        totalOpenValueKrw,
+        totalOpenCostKrw,
+        totalUnrealizedPnlKrw,
+        totalUnrealizedPnlPct,
+        dailyPnlKrw: dailyPnl.dailyPnlKrw,
+        baselineEquityKrw: dailyPnl.baselineEquityKrw,
+        tradeDate: dailyPnl.tradeDate,
+        positions,
+      },
     };
   }
 
@@ -2800,6 +3058,7 @@ export class TradingSystem {
   async evaluateRiskForOrder(orderInput, { chanceMinTotalKrw = 0 } = {}) {
     const accountContext = await this.loadAccountContext();
     const pnlContext = await this.resolveDailyPnl(accountContext.metrics.equityKrw);
+    const entryBlock = await this.refreshEntryBlock();
     const [baseCurrency] = String(orderInput.symbol || "").split("_");
     const availableCashKrw = asNumber(
       accountContext.metrics.availableCashKrw,
@@ -2818,7 +3077,7 @@ export class TradingSystem {
     const risk = this.riskEngine.evaluate({
       amountKrw: orderInput.amountKrw,
       side: orderInput.side,
-      killSwitch: this.store.snapshot().settings.killSwitch,
+      entryBlocked: entryBlock.blocked,
       openOrdersCount: this.getOpenOrdersCount(),
       openOrdersBySymbol: this.getOpenOrdersCount(orderInput.symbol),
       exposureKrw: accountContext.metrics.exposureKrw,
@@ -3030,16 +3289,17 @@ export class TradingSystem {
           "INSUFFICIENT_CASH",
           "SELL_EXCEEDS_HOLDING",
           "NO_SELLABLE_HOLDING",
-          "KILL_SWITCH_ACTIVE",
+          "MAX_DAILY_LOSS_KRW",
+          "ENTRY_BLOCKED",
         ]);
         // Hotfix: reject-streak 승격은 '실행 불가능한 거절'에는 적용하지 않는다.
-        // KILL_SWITCH_ACTIVE가 함께 섞여 들어온 경우도 non-escalating으로 처리한다.
+        // ENTRY_BLOCKED가 함께 섞여 들어온 경우도 non-escalating으로 처리한다.
         const isNonEscalatingReject = reasonRules.length > 0
           && reasonRules.every((rule) => nonEscalatingRejectRules.has(rule));
-        const isKillSwitchEchoReject = reasonRules.length > 0
-          && reasonRules.every((rule) => rule === "KILL_SWITCH_ACTIVE");
+        const isEntryBlockEchoReject = reasonRules.length > 0
+          && reasonRules.every((rule) => rule === "ENTRY_BLOCKED");
 
-        const shouldEscalateRejectStreak = !isNonEscalatingReject && !isKillSwitchEchoReject;
+        const shouldEscalateRejectStreak = !isNonEscalatingReject && !isEntryBlockEchoReject;
         const streak = shouldEscalateRejectStreak
           ? await this.bumpRiskRejectStreak({
             symbol: orderInput.symbol,
@@ -3058,10 +3318,16 @@ export class TradingSystem {
           nonEscalating: !shouldEscalateRejectStreak,
         });
 
-        if (hitDailyLossLimit && !this.store.snapshot().settings.killSwitch) {
-          await this.setKillSwitch(true, "max_daily_loss_reached");
-          this.logger.warn("kill switch auto-activated by risk policy", {
+        if (hitDailyLossLimit && orderInput.side === "buy") {
+          await this.setEntryBlock(true, {
+            reason: "max_daily_loss",
+            source: "max_daily_loss",
+            tradeDate: context.pnlContext.tradeDate,
+            manual: false,
+          });
+          this.logger.warn("execution entry block activated", {
             rule: "MAX_DAILY_LOSS_KRW",
+            reason: "max_daily_loss",
             symbol: orderInput.symbol,
             dailyPnlKrw: context.risk.metrics.dailyPnlKrw,
             maxDailyLossKrw: this.config.risk.maxDailyLossKrw,
@@ -3072,9 +3338,15 @@ export class TradingSystem {
         if (shouldEscalateRejectStreak
           && maxRiskRejectStreak > 0
           && streak >= maxRiskRejectStreak
-          && !this.store.snapshot().settings.killSwitch) {
-          await this.setKillSwitch(true, "max_consecutive_risk_rejects");
-          this.logger.error("kill switch auto-activated by risk-reject streak", {
+          && orderInput.side === "buy") {
+          await this.setEntryBlock(true, {
+            reason: "risk_reject_streak",
+            source: "risk_reject_streak",
+            tradeDate: context.pnlContext.tradeDate,
+            manual: false,
+          });
+          this.logger.error("execution entry block activated", {
+            reason: "risk_reject_streak",
             symbol: orderInput.symbol,
             streak,
             limit: maxRiskRejectStreak,
@@ -3092,6 +3364,7 @@ export class TradingSystem {
       }
 
       await this.clearRiskRejectStreak();
+      await this.clearEntryBlock("risk_reject_streak");
 
       if (dryRun) {
         return {
@@ -3331,6 +3604,25 @@ export class TradingSystem {
           code: EXIT_CODES.OK,
           data: result,
         };
+      }
+
+      if (orderSide === "buy") {
+        const accountContext = await this.loadAccountContext();
+        if (hasBlockingSinglePosition(this.config, accountContext, normalizedSymbol, lastClose)) {
+          const result = {
+            runId,
+            ...decision,
+            order: null,
+            note: "buy skipped: single position per symbol",
+            position: positionSnapshotFromAccountContext(accountContext, normalizedSymbol, lastClose),
+          };
+          await this.finishRun(runId, "COMPLETED", { result });
+          return {
+            ok: true,
+            code: EXIT_CODES.OK,
+            data: result,
+          };
+        }
       }
 
       if (!Number.isFinite(submittedAmountKrw) || submittedAmountKrw <= 0) {
