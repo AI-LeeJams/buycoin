@@ -400,10 +400,32 @@ async function main() {
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isDirectRun) {
+  // PM2 환경에서 예기치 못한 비동기 에러가 프로세스를 즉사시키는 것을 방지합니다.
+  // 로그를 남기고 PM2의 자동 재시작에 의존합니다.
+  process.on("unhandledRejection", (reason) => {
+    logger.error("unhandled promise rejection", {
+      message: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    });
+    // PM2가 재시작하도록 프로세스를 정리합니다.
+    process.exitCode = 1;
+    setTimeout(() => process.exit(1), 3000);
+  });
+
+  process.on("uncaughtException", (error) => {
+    logger.error("uncaught exception", {
+      message: error.message,
+      stack: error.stack,
+    });
+    process.exitCode = 1;
+    setTimeout(() => process.exit(1), 3000);
+  });
+
   main().catch((error) => {
     logger.error("execution service fatal error", {
       message: error.message,
+      stack: error.stack,
     });
-    process.exitCode = 1;
+    process.exit(1);
   });
 }

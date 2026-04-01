@@ -815,6 +815,196 @@ test("orderList forwards uuids/states options to exchange listOrders", async () 
   });
 });
 
+// ---------------------------------------------------------------------------
+// FIX-1  protective exit bypasses cooldown and order-attempt cap
+// ---------------------------------------------------------------------------
+
+test("realtime protective exit fires even when cooldown is active after a buy", async () => {
+  // Scenario: already holding BTC at avgBuyPrice=100, price crashes to 80 (-20%)
+  // => protective_stop_loss must fire despite a very long cooldown.
+  // No buy occurs here; we only test that cooldown does not block protective exit.
+  const config = await createConfig({
+    STRATEGY_BREAKOUT_LOOKBACK: "3",
+    STRATEGY_BREAKOUT_BUFFER_BPS: "0",
+    RISK_MAX_HOLDING_LOSS_PCT: "3",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    { currency: "KRW", balance: "120000", locked: "0", avg_buy_price: "0", unit_currency: "KRW" },
+    { currency: "BTC", balance: "100", locked: "0", avg_buy_price: "100", unit_currency: "KRW" },
+  ];
+
+  // Use HOLD candles so no BUY/SELL signal from strategy — only protective exit.
+  // Tick at price 80 triggers -20% loss => protective exit.
+  const wsClient = new WsClientMock([
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 100, streamType: "REALTIME", timestamp: 2700000 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 80, streamType: "REALTIME", timestamp: 2700001 },
+  ]);
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_HOLD),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  // Simulate that a buy just succeeded moments ago by seeding internal state.
+  // We call runStrategyRealtime with a huge cooldown to confirm protective exit bypasses it.
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 9999,
+    maxOrderAttemptsPerWindow: 0,
+    dryRun: false,
+  });
+
+  assert.equal(result.ok, true);
+  const sellDecisions = result.data.decisions.filter(
+    (d) => d.side === "sell" && d.actionSource === "protective_exit" && d.orderOk === true,
+  );
+  assert.equal(sellDecisions.length >= 1, true, "protective exit sell must execute despite active cooldown");
+});
+
+test("realtime protective exit fires even when order-attempt cap is reached", async () => {
+  // Scenario: a buy already consumed the single order attempt.
+  // Price then crashes triggering protective exit — must still fire.
+  const config = await createConfig({
+    STRATEGY_BREAKOUT_LOOKBACK: "3",
+    STRATEGY_BREAKOUT_BUFFER_BPS: "0",
+    RISK_MAX_HOLDING_LOSS_PCT: "3",
+    RISK_SINGLE_POSITION_PER_SYMBOL: "false",
+  });
+  const exchange = new ExchangeMock();
+  // The getOrder/reconcile mock returns uuid but no terminal state,
+  // so the order record stays as UNKNOWN_SUBMIT (non-blocking for sells).
+  exchange.getAccounts = async () => [
+    { currency: "KRW", balance: "120000", locked: "0", avg_buy_price: "0", unit_currency: "KRW" },
+    { currency: "BTC", balance: "100", locked: "0", avg_buy_price: "100", unit_currency: "KRW" },
+  ];
+  // Reconcile returns done state so the open order count clears.
+  exchange.getOrder = async () => ({ uuid: "exchange-1", state: "done" });
+  exchange.getOrderStatus = exchange.getOrder;
+
+  const wsClient = new WsClientMock([
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 104, streamType: "REALTIME", timestamp: 2700000 },
+    { symbol: "BTC_KRW", market: "KRW-BTC", tradePrice: 80, streamType: "REALTIME", timestamp: 2700001 },
+  ]);
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_BUY),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 0,
+    maxOrderAttemptsPerWindow: 1,
+    dryRun: false,
+  });
+
+  assert.equal(result.ok, true);
+  const sellDecisions = result.data.decisions.filter(
+    (d) => d.side === "sell" && d.actionSource === "protective_exit" && d.orderOk === true,
+  );
+  assert.equal(sellDecisions.length >= 1, true, "protective exit sell must bypass order attempt cap");
+});
+
+// ---------------------------------------------------------------------------
+// FIX-2  REST fallback protective exit when WS stream has no ticks
+// ---------------------------------------------------------------------------
+
+test("realtime REST fallback protective exit fires when no WS ticks arrive", async () => {
+  const config = await createConfig({
+    STRATEGY_BREAKOUT_LOOKBACK: "3",
+    STRATEGY_BREAKOUT_BUFFER_BPS: "0",
+    RISK_MAX_HOLDING_LOSS_PCT: "3",
+    EXECUTION_REST_FALLBACK_INTERVAL_MS: "200",
+  });
+  const exchange = new ExchangeMock();
+  exchange.getAccounts = async () => [
+    { currency: "KRW", balance: "120000", locked: "0", avg_buy_price: "0", unit_currency: "KRW" },
+    { currency: "BTC", balance: "100", locked: "0", avg_buy_price: "100", unit_currency: "KRW" },
+  ];
+
+  // WsClientMock sends no ticks — simulates a dead/disconnected stream.
+  const wsClient = new WsClientMock([]);
+
+  // MarketDataMock.getMarketTicker returns a price of 80 => -20% loss => protective exit.
+  const marketData = new MarketDataMock(REALTIME_CANDLES_HOLD);
+  marketData.getMarketTicker = async () => ({
+    symbol: "BTC_KRW",
+    market: "KRW-BTC",
+    trade_price: 80,
+    tradePrice: 80,
+  });
+  marketData.extractTickerMetrics = (data) => ({
+    lastPrice: data?.tradePrice ?? data?.trade_price ?? null,
+  });
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData,
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const result = await system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 1,
+    cooldownSec: 0,
+    dryRun: false,
+  });
+
+  assert.equal(result.ok, true);
+  // Even though WS was dead, REST fallback should have triggered protective exit
+  const sellDecisions = (result.data.decisions || []).filter(
+    (d) => d.side === "sell" && d.actionSource === "protective_exit",
+  );
+  assert.equal(sellDecisions.length >= 1, true, "REST fallback protective exit must fire when WS is dead");
+});
+
+test("loadAccountContext cache reduces API calls within TTL window", async () => {
+  const config = await createConfig({
+    EXECUTION_ACCOUNT_CACHE_TTL_MS: "5000",
+  });
+  const exchange = new ExchangeMock();
+  let getAccountsCalls = 0;
+  const originalGetAccounts = exchange.getAccounts.bind(exchange);
+  exchange.getAccounts = async () => {
+    getAccountsCalls += 1;
+    return originalGetAccounts();
+  };
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(),
+    overlayEngine: new OverlayMock(),
+    wsClient: new WsClientMock([]),
+  });
+  await system.init();
+
+  // Call loadAccountContext 5 times rapidly — cache should reduce to 1 API call
+  const results = [];
+  for (let i = 0; i < 5; i++) {
+    results.push(await system.loadAccountContext());
+  }
+
+  assert.equal(getAccountsCalls, 1, "cache must collapse rapid loadAccountContext calls into one API call");
+  assert.equal(results[0].source, "exchange_accounts");
+  assert.equal(results[4].source, "exchange_accounts");
+
+  // After invalidation, the next call should hit the API again
+  system.invalidateAccountCache();
+  await system.loadAccountContext();
+  assert.equal(getAccountsCalls, 2, "invalidateAccountCache must force a fresh API call");
+});
+
 test("keep-latest retention keeps open orders and latest snapshots", async () => {
   const config = await createConfig({
     TRADER_STATE_KEEP_LATEST_ONLY: "true",

@@ -1324,6 +1324,9 @@ export class TradingSystem {
     this.executionEngine = deps.executionEngine || new ExecutionEngine(this.exchangeClient);
     this.sleepFn = deps.sleepFn || sleep;
     this.orderSequence = Promise.resolve();
+    this._accountContextCache = null;
+    this._accountContextCacheAtMs = 0;
+    this._accountContextCacheTtlMs = asPositiveInt(config?.execution?.accountCacheTtlMs, 2_000);
   }
 
   async withOrderSequence(task) {
@@ -2118,6 +2121,8 @@ export class TradingSystem {
     let streamError = null;
     let streamHandle = null;
     let timer = null;
+    let restFallbackTimer = null;
+    let lastWsTickAtMs = 0;
     let processing = Promise.resolve();
     let overrideActionConsumed = this.isPolicyOverrideConsumedOnce(overrideConsumeKey);
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
@@ -2132,6 +2137,7 @@ export class TradingSystem {
         symbols: [normalizedSymbol],
         onTicker: (tick) => {
           tickCount += 1;
+          lastWsTickAtMs = Date.now();
           const tickTs = Number.isFinite(Number(tick.timestamp)) ? Number(tick.timestamp) : Date.now();
           aggregator.push(tick.tradePrice, tickTs);
           // Snapshot the candle state at the moment this tick arrived so the async
@@ -2227,55 +2233,60 @@ export class TradingSystem {
                 return;
               }
 
-              if (cooldownMs > 0 && nowMs - lastSuccessfulOrderAtMs < cooldownMs) {
-                decisions.push({
-                  at: nowIso(),
-                  price: tick.tradePrice,
-                  signal: signal.action,
-                  action: selectedAction,
-                  actionSource: selectedSource,
-                  side: selectedAction === "SELL" ? "sell" : "buy",
-                  skipped: "cooldown",
-                });
-                while (decisions.length > decisionTrailLimit) {
-                  decisions.shift();
+              // Protective exits (stop-loss, trailing stop) bypass cooldown,
+              // retryable-failure backoff, and order-attempt caps to ensure
+              // loss containment is never blocked by execution throttles.
+              if (!forcedExit) {
+                if (cooldownMs > 0 && nowMs - lastSuccessfulOrderAtMs < cooldownMs) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: selectedAction === "SELL" ? "sell" : "buy",
+                    skipped: "cooldown",
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
                 }
-                return;
-              }
 
-              if (lastRetryableFailureAtMs > 0 && nowMs - lastRetryableFailureAtMs < retryableFailureBackoffMs) {
-                decisions.push({
-                  at: nowIso(),
-                  price: tick.tradePrice,
-                  signal: signal.action,
-                  action: selectedAction,
-                  actionSource: selectedSource,
-                  side: selectedAction === "SELL" ? "sell" : "buy",
-                  skipped: "retryable_failure_backoff",
-                  retryableFailureBackoffMs,
-                });
-                while (decisions.length > decisionTrailLimit) {
-                  decisions.shift();
+                if (lastRetryableFailureAtMs > 0 && nowMs - lastRetryableFailureAtMs < retryableFailureBackoffMs) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: selectedAction === "SELL" ? "sell" : "buy",
+                    skipped: "retryable_failure_backoff",
+                    retryableFailureBackoffMs,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
                 }
-                return;
-              }
 
-              if (orderAttemptsLimit > 0 && successfulOrders >= orderAttemptsLimit) {
-                decisions.push({
-                  at: nowIso(),
-                  price: tick.tradePrice,
-                  signal: signal.action,
-                  action: selectedAction,
-                  actionSource: selectedSource,
-                  side: selectedAction === "SELL" ? "sell" : "buy",
-                  skipped: "order_attempt_cap",
-                  orderAttemptsLimit,
-                  successfulOrders,
-                });
-                while (decisions.length > decisionTrailLimit) {
-                  decisions.shift();
+                if (orderAttemptsLimit > 0 && successfulOrders >= orderAttemptsLimit) {
+                  decisions.push({
+                    at: nowIso(),
+                    price: tick.tradePrice,
+                    signal: signal.action,
+                    action: selectedAction,
+                    actionSource: selectedSource,
+                    side: selectedAction === "SELL" ? "sell" : "buy",
+                    skipped: "order_attempt_cap",
+                    orderAttemptsLimit,
+                    successfulOrders,
+                  });
+                  while (decisions.length > decisionTrailLimit) {
+                    decisions.shift();
+                  }
+                  return;
                 }
-                return;
               }
 
               const overlay = windowOverlay;
@@ -2540,11 +2551,169 @@ export class TradingSystem {
         }, durationMs);
       }
 
+      // REST fallback: when no WS ticks arrive for a sustained period, poll
+      // the REST ticker endpoint so protective exits (stop-loss, trailing stop)
+      // are never missed due to a dead or disconnected WebSocket stream.
+      const restFallbackIntervalMs = Math.max(
+        asPositiveInt(this.config?.execution?.restFallbackIntervalMs, 5_000),
+        500,
+      );
+      const restFallbackStalenessMs = Math.max(restFallbackIntervalMs * 2, 3_000);
+      restFallbackTimer = setInterval(() => {
+        const now = Date.now();
+        // Only poll when WS ticks have gone stale (or never arrived).
+        if (lastWsTickAtMs > 0 && now - lastWsTickAtMs < restFallbackStalenessMs) {
+          return;
+        }
+        processing = processing
+          .then(async () => {
+            try {
+              if (!this.marketData?.getMarketTicker) {
+                return;
+              }
+              const tickerData = await this.marketData.getMarketTicker(normalizedSymbol);
+              if (!tickerData) {
+                return;
+              }
+              const metrics = typeof this.marketData.extractTickerMetrics === "function"
+                ? this.marketData.extractTickerMetrics(tickerData)
+                : null;
+              const restPrice = asNumber(
+                metrics?.lastPrice ?? tickerData?.tradePrice ?? tickerData?.trade_price,
+                null,
+              );
+              if (restPrice === null || restPrice <= 0) {
+                return;
+              }
+
+              const protectiveExit = await this.resolveProtectiveExit({
+                symbol: normalizedSymbol,
+                currentPrice: restPrice,
+              });
+              if (!protectiveExit?.shouldExit) {
+                return;
+              }
+
+              // Bypass cooldown / attempt-cap checks for protective exits.
+              const orderSide = "sell";
+              const baseAmount = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
+              const orderAmountKrw = baseAmount;
+              let sellPlan = null;
+              const order = await this.placeOrder({
+                symbol: normalizedSymbol,
+                side: orderSide,
+                amountKrw: orderAmountKrw,
+                reason: protectiveExit.reason || "rest_fallback_protective_exit",
+                dryRun,
+                sellPlan,
+              });
+
+              attemptedOrders += 1;
+              if (order.ok) {
+                successfulOrders += 1;
+                lastSuccessfulOrderAtMs = Date.now();
+              }
+
+              decisions.push({
+                at: nowIso(),
+                price: restPrice,
+                signal: "SELL",
+                action: "SELL",
+                actionSource: "protective_exit",
+                actionReason: protectiveExit.reason || "rest_fallback_protective_exit",
+                side: orderSide,
+                amountSubmittedKrw: orderAmountKrw,
+                sellPlan,
+                protectiveExit,
+                restFallback: true,
+                orderOk: order.ok,
+                orderCode: order.code,
+                error: order.ok ? null : order.error,
+              });
+              while (decisions.length > decisionTrailLimit) {
+                decisions.shift();
+              }
+            } catch (err) {
+              this.logger.warn("realtime: REST fallback protective-exit poll failed", {
+                symbol: normalizedSymbol,
+                reason: err.message,
+              });
+            }
+          })
+          .catch(() => {});
+      }, restFallbackIntervalMs);
+
       await streamHandle.closed;
       if (timer) {
         clearTimeout(timer);
       }
+      if (restFallbackTimer) {
+        clearInterval(restFallbackTimer);
+      }
       await processing;
+
+      // Post-stream REST fallback: if the WS stream delivered zero ticks
+      // (completely dead connection), do a single REST check for protective
+      // exits before returning, so stop-losses are never missed.
+      if (tickCount === 0 && !streamError && this.marketData?.getMarketTicker) {
+        try {
+          const tickerData = await this.marketData.getMarketTicker(normalizedSymbol);
+          if (tickerData) {
+            const metrics = typeof this.marketData.extractTickerMetrics === "function"
+              ? this.marketData.extractTickerMetrics(tickerData)
+              : null;
+            const restPrice = asNumber(
+              metrics?.lastPrice ?? tickerData?.tradePrice ?? tickerData?.trade_price,
+              null,
+            );
+            if (restPrice !== null && restPrice > 0) {
+              const protectiveExit = await this.resolveProtectiveExit({
+                symbol: normalizedSymbol,
+                currentPrice: restPrice,
+              });
+              if (protectiveExit?.shouldExit) {
+                const orderSide = "sell";
+                const orderAmountKrw = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
+                const order = await this.placeOrder({
+                  symbol: normalizedSymbol,
+                  side: orderSide,
+                  amountKrw: orderAmountKrw,
+                  reason: protectiveExit.reason || "rest_fallback_protective_exit",
+                  dryRun,
+                  sellPlan: null,
+                });
+                attemptedOrders += 1;
+                if (order.ok) {
+                  successfulOrders += 1;
+                }
+                decisions.push({
+                  at: nowIso(),
+                  price: restPrice,
+                  signal: "SELL",
+                  action: "SELL",
+                  actionSource: "protective_exit",
+                  actionReason: protectiveExit.reason || "rest_fallback_protective_exit",
+                  side: orderSide,
+                  amountSubmittedKrw: orderAmountKrw,
+                  protectiveExit,
+                  restFallback: true,
+                  orderOk: order.ok,
+                  orderCode: order.code,
+                  error: order.ok ? null : order.error,
+                });
+                while (decisions.length > decisionTrailLimit) {
+                  decisions.shift();
+                }
+              }
+            }
+          }
+        } catch (err) {
+          this.logger.warn("realtime: post-stream REST fallback protective-exit failed", {
+            symbol: normalizedSymbol,
+            reason: err.message,
+          });
+        }
+      }
 
       if (streamError) {
       await this.finishRun(runId, "FAILED", {
@@ -2618,6 +2787,9 @@ export class TradingSystem {
     } catch (error) {
       if (timer) {
         clearTimeout(timer);
+      }
+      if (restFallbackTimer) {
+        clearInterval(restFallbackTimer);
       }
       await this.finishRun(runId, "FAILED", {
         error: {
@@ -2731,16 +2903,33 @@ export class TradingSystem {
     return snapshots[snapshots.length - 1];
   }
 
+  invalidateAccountCache() {
+    this._accountContextCache = null;
+    this._accountContextCacheAtMs = 0;
+  }
+
   async loadAccountContext() {
+    const now = Date.now();
+    if (
+      this._accountContextCache
+      && this._accountContextCacheTtlMs > 0
+      && now - this._accountContextCacheAtMs < this._accountContextCacheTtlMs
+    ) {
+      return this._accountContextCache;
+    }
+
     try {
       const payload = await this.exchangeClient.getAccounts();
       const accounts = normalizeAccounts(payload);
       await this.captureBalancesSnapshot("risk_context", accounts);
-      return {
+      const result = {
         accounts,
         metrics: calculateAccountMetrics(accounts),
         source: "exchange_accounts",
       };
+      this._accountContextCache = result;
+      this._accountContextCacheAtMs = Date.now();
+      return result;
     } catch (error) {
       const latest = this.getLatestBalancesSnapshot();
       if (latest?.items) {
@@ -3429,6 +3618,7 @@ export class TradingSystem {
 
         const submitted = await this.executionEngine.submit(orderInput);
         submitted.expectedPrice = orderInput.expectedPrice;
+        this.invalidateAccountCache();
         let reconciled = await this.reconcileOrder(submitted, { persist: false });
         if (!reconciled) {
           reconciled = submitted;

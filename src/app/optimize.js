@@ -469,8 +469,27 @@ async function main() {
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isDirectRun) {
+  process.on("unhandledRejection", (reason) => {
+    defaultLogger.error("optimizer unhandled promise rejection", {
+      message: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    });
+    process.exit(1);
+  });
+
+  process.on("uncaughtException", (error) => {
+    defaultLogger.error("optimizer uncaught exception", {
+      message: error.message,
+      stack: error.stack,
+    });
+    process.exit(1);
+  });
+
   main().catch((error) => {
-    defaultLogger.error("optimizer fatal error", { message: error.message });
-    process.exitCode = 1;
+    defaultLogger.error("optimizer fatal error", {
+      message: error.message,
+      stack: error.stack,
+    });
+    process.exit(1);
   });
 }
