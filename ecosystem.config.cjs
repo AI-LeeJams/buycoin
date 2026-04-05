@@ -44,6 +44,10 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         TZ: "Asia/Seoul",
+        TRADING_PROFILE: "safe",
+        EXECUTION_SYMBOL: "BTC_KRW",
+        OPTIMIZER_LIVE_SAFETY_GATE_ENABLED: "0",
+        OPTIMIZER_LIVE_SAFETY_GATE_MAX_AGE_SEC: "7200",
       },
 
       // 로그 설정 (절대 경로 — PM2 데몬이 cwd를 무시할 수 있음)
@@ -54,8 +58,8 @@ module.exports = {
 
       // 시그널 처리 (graceful shutdown)
       // 실시간 윈도우(기본 300초)가 끝날 때까지 대기해야 하므로
-      // kill_timeout은 windowSec + 여유시간으로 설정합니다.
-      kill_timeout: 10000,         // SIGTERM 후 10초 대기, 이후 SIGKILL
+      // 기본 windowSec(300초) + 여유시간을 반영해 graceful shutdown을 보장합니다.
+      kill_timeout: 330000,        // SIGTERM 후 330초 대기, 이후 SIGKILL
       listen_timeout: 10000,
       shutdown_with_message: false,
 
@@ -89,6 +93,12 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         TZ: "Asia/Seoul",
+        TRADING_PROFILE: "safe",
+        EXECUTION_SYMBOL: "BTC_KRW",
+        OPTIMIZER_SYMBOLS: "BTC_KRW,ETH_KRW",
+        OPTIMIZER_USE_MARKET_UNIVERSE_SYMBOLS: "0",
+        OPTIMIZER_LIVE_SAFETY_GATE_ENABLED: "true",
+        OPTIMIZER_LIVE_SAFETY_GATE_MAX_AGE_SEC: "7200",
       },
 
       // 로그 설정

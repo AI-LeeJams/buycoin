@@ -102,8 +102,10 @@ export class StrategySettingsSource {
     this.enabled = config.strategySettings?.enabled !== false;
     this.settingsFile = config.strategySettings?.settingsFile
       || path.join(process.cwd(), ".trader", "strategy-settings.json");
-    this.maxAgeSec = toPositiveInt(config.strategySettings?.maxAgeSec, 7_200);
+    this.maxAgeSec = toNonNegativeInt(config.strategySettings?.maxAgeSec, 0);
+    this.allowSymbolOverride = config.strategySettings?.allowSymbolOverride === true;
     this.lastError = null;
+    this.lastStaleWarningKey = null;
   }
 
   defaultExecution() {
@@ -208,8 +210,10 @@ export class StrategySettingsSource {
     const executionRaw = raw?.execution && typeof raw.execution === "object" ? raw.execution : {};
     const controlsRaw = raw?.controls && typeof raw.controls === "object" ? raw.controls : {};
 
-    const explicitSymbol = executionRaw.symbol ? normalizeSymbol(executionRaw.symbol) : null;
-    const symbols = toSymbolArray(executionRaw.symbols, explicitSymbol ? [explicitSymbol] : defaults.execution.symbols);
+    const explicitSymbol = this.allowSymbolOverride && executionRaw.symbol ? normalizeSymbol(executionRaw.symbol) : null;
+    const symbols = this.allowSymbolOverride
+      ? toSymbolArray(executionRaw.symbols, explicitSymbol ? [explicitSymbol] : defaults.execution.symbols)
+      : defaults.execution.symbols;
     const symbol = explicitSymbol || symbols[0] || defaults.execution.symbol;
 
     return {
@@ -241,8 +245,18 @@ export class StrategySettingsSource {
     try {
       const parsed = await readJson(this.settingsFile);
       if (this.isStale(parsed)) {
+        const warningKey = `${parsed?.updatedAt || parsed?.meta?.updatedAt || "unknown"}:${this.maxAgeSec}`;
+        if (this.lastStaleWarningKey !== warningKey) {
+          this.lastStaleWarningKey = warningKey;
+          this.logger.warn("strategy settings snapshot is stale; fallback to runtime defaults", {
+            file: this.settingsFile,
+            updatedAt: parsed?.updatedAt || parsed?.meta?.updatedAt || null,
+            maxAgeSec: this.maxAgeSec,
+          });
+        }
         return this.defaultSnapshot("stale_snapshot_fallback");
       }
+      this.lastStaleWarningKey = null;
       return this.normalize(parsed);
     } catch (error) {
       if (this.lastError !== error.message) {

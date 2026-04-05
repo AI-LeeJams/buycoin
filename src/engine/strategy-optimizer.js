@@ -333,6 +333,9 @@ function safetyCheck(metrics, constraints = {}) {
   const minWalkForwardScore = asNumber(constraints.minWalkForwardScore, -999999);
   const minWalkForwardFoldCount = asPositiveInt(constraints.minWalkForwardFoldCount, 0);
   const minWalkForwardPassRate = asNumber(constraints.minWalkForwardPassRate, 0);
+  const minWalkForwardAverageReturnPct = asNumber(constraints.minWalkForwardAverageReturnPct, -999999);
+  const minWalkForwardAverageWinRatePct = asNumber(constraints.minWalkForwardAverageWinRatePct, -999999);
+  const minWalkForwardAverageExpectancyKrw = asNumber(constraints.minWalkForwardAverageExpectancyKrw, -999999);
   const walkForwardEnabled = constraints.walkForwardEnabled === true;
 
   const checks = {
@@ -346,7 +349,10 @@ function safetyCheck(metrics, constraints = {}) {
     walkForward: walkForwardEnabled
       ? (asNumber(metrics.walkForwardScore, -999999) >= minWalkForwardScore
         && (asNumber(metrics.walkForwardFoldCount, 0) ?? 0) >= minWalkForwardFoldCount
-        && (asNumber(metrics.walkForwardPassRate, 0) ?? 0) >= minWalkForwardPassRate)
+        && (asNumber(metrics.walkForwardPassRate, 0) ?? 0) >= minWalkForwardPassRate
+        && (asNumber(metrics.walkForwardAverageReturnPct, -999999) ?? -999999) >= minWalkForwardAverageReturnPct
+        && (asNumber(metrics.walkForwardAverageWinRatePct, -999999) ?? -999999) >= minWalkForwardAverageWinRatePct
+        && (asNumber(metrics.walkForwardAverageExpectancyKrw, -999999) ?? -999999) >= minWalkForwardAverageExpectancyKrw)
       : true,
   };
 
@@ -649,9 +655,11 @@ export function simulateWalkForwardRiskManagedMomentum({
   const foldTrades = foldRows.map((row) => row.metrics.realizedTradeCount || 0);
   const foldSlippage = foldRows.map((row) => row.metrics.avgSlippageBps || 0);
   const foldMaxSlippage = foldRows.map((row) => row.metrics.maxSlippageBps || 0);
+  const foldExpectancy = foldRows.map((row) => row.metrics.expectancyKrw || 0);
 
   const averageReturnPct = safeMean(foldReturns);
   const averageWinRatePct = safeMean(foldWinRates);
+  const averageExpectancyKrw = safeMean(foldExpectancy);
   const averageFeeKrw = safeMean(foldFee);
   const averageTrades = safeMean(foldTrades);
   const minReturnPct = Math.min(...foldReturns);
@@ -666,6 +674,7 @@ export function simulateWalkForwardRiskManagedMomentum({
       foldCount: foldRows.length,
       averageReturnPct,
       averageWinRatePct,
+      averageExpectancyKrw,
       averageFeeKrw,
       averageTrades,
       averageSlippageBps: safeMean(foldSlippage),
@@ -767,6 +776,9 @@ function optimizeStrategies({
             walkForwardScore,
             walkForwardFoldCount: walkForwardResult?.metrics?.foldCount || 0,
             walkForwardPassRate: walkForwardResult?.metrics?.passRate || 0,
+            walkForwardAverageReturnPct: walkForwardResult?.metrics?.averageReturnPct || 0,
+            walkForwardAverageWinRatePct: walkForwardResult?.metrics?.averageWinRatePct || 0,
+            walkForwardAverageExpectancyKrw: walkForwardResult?.metrics?.averageExpectancyKrw || 0,
           },
           {
             ...constraints,

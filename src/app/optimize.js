@@ -130,6 +130,8 @@ function compressCandidate(candidate) {
             foldCount: walkForward.foldCount,
             averageReturnPct: roundNum(walkForward.averageReturnPct, 4),
             averageWinRatePct: roundNum(walkForward.averageWinRatePct, 4),
+            averageExpectancyKrw: roundNum(walkForward.averageExpectancyKrw, 2),
+            averageTrades: roundNum(walkForward.averageTrades, 4),
             averageSlippageBps: roundNum(walkForward.averageSlippageBps, 4),
             maxSlippageBps: roundNum(walkForward.maxSlippageBps, 4),
             passRate: roundNum(walkForward.passRate, 4),
@@ -137,6 +139,68 @@ function compressCandidate(candidate) {
           }
         : null,
     },
+  };
+}
+
+function matchesRuntimeStrategy(candidateStrategy = {}, runtimeStrategy = {}) {
+  const candidateName = String(candidateStrategy?.name || "").trim().toLowerCase();
+  const runtimeName = String(runtimeStrategy?.name || "").trim().toLowerCase();
+  if (!candidateName || candidateName !== runtimeName) {
+    return false;
+  }
+
+  if (runtimeName === "mean_reversion") {
+    return Number(candidateStrategy.meanLookback) === Number(runtimeStrategy.meanLookback)
+      && Number(candidateStrategy.meanEntryBps) === Number(runtimeStrategy.meanEntryBps)
+      && Number(candidateStrategy.meanExitBps) === Number(runtimeStrategy.meanExitBps);
+  }
+
+  if (runtimeName === "risk_managed_momentum") {
+    return Number(candidateStrategy.momentumLookback) === Number(runtimeStrategy.momentumLookback)
+      && Number(candidateStrategy.volatilityLookback) === Number(runtimeStrategy.volatilityLookback)
+      && Number(candidateStrategy.momentumEntryBps) === Number(runtimeStrategy.momentumEntryBps)
+      && Number(candidateStrategy.momentumExitBps) === Number(runtimeStrategy.momentumExitBps)
+      && Number(candidateStrategy.targetVolatilityPct) === Number(runtimeStrategy.targetVolatilityPct)
+      && Number(candidateStrategy.riskManagedMinMultiplier) === Number(runtimeStrategy.riskManagedMinMultiplier)
+      && Number(candidateStrategy.riskManagedMaxMultiplier) === Number(runtimeStrategy.riskManagedMaxMultiplier);
+  }
+
+  if (runtimeName === "breakout") {
+    return Number(candidateStrategy.breakoutLookback) === Number(runtimeStrategy.breakoutLookback)
+      && Number(candidateStrategy.breakoutBufferBps) === Number(runtimeStrategy.breakoutBufferBps);
+  }
+
+  return false;
+}
+
+export function summarizeRuntimeSupport(optimization, runtimeConfig) {
+  const ranked = Array.isArray(optimization?.ranked) ? optimization.ranked : [];
+  const safeRanked = Array.isArray(optimization?.safeRanked) ? optimization.safeRanked : [];
+  const executionSymbol = normalizeSymbol(runtimeConfig?.execution?.symbol || runtimeConfig?.strategy?.defaultSymbol);
+  const strategyName = String(runtimeConfig?.strategy?.name || "").trim().toLowerCase() || null;
+  const byScoreDesc = (left, right) => Number(right?.score || 0) - Number(left?.score || 0);
+
+  const currentConfigCandidate = ranked.find((candidate) =>
+    normalizeSymbol(candidate?.symbol) === executionSymbol
+      && matchesRuntimeStrategy(candidate?.strategy, runtimeConfig?.strategy),
+  ) || null;
+
+  const bestForExecutionSymbol = ranked
+    .filter((candidate) => normalizeSymbol(candidate?.symbol) === executionSymbol)
+    .sort(byScoreDesc)[0] || null;
+
+  const bestSafeForExecutionSymbol = safeRanked
+    .filter((candidate) => normalizeSymbol(candidate?.symbol) === executionSymbol)
+    .sort(byScoreDesc)[0] || null;
+
+  return {
+    executionSymbol,
+    strategyName,
+    currentConfigSafe: currentConfigCandidate?.safety?.safe === true,
+    symbolHasSafeCandidate: Boolean(bestSafeForExecutionSymbol),
+    currentConfig: compressCandidate(currentConfigCandidate),
+    bestForExecutionSymbol: compressCandidate(bestForExecutionSymbol),
+    bestSafeForExecutionSymbol: compressCandidate(bestSafeForExecutionSymbol),
   };
 }
 
@@ -175,7 +239,23 @@ export function pickRuntimeSymbols(optimization, runtimeConfig) {
     .slice(0, maxSymbols);
 }
 
+function pickRuntimeCandidates(optimization, runtimeConfig) {
+  const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
+  if (selectedSymbols.length === 0) {
+    return [];
+  }
+
+  const ranked = Array.isArray(optimization?.safeRanked) ? optimization.safeRanked : [];
+  return selectedSymbols
+    .map((symbol) => ranked.find((candidate) => normalizeSymbol(candidate?.symbol) === normalizeSymbol(symbol)))
+    .filter(Boolean);
+}
+
 async function loadMarketUniverseSymbols(config, logger) {
+  if (config?.optimizer?.useMarketUniverseSymbols === false) {
+    return [];
+  }
+
   const snapshotFile = config.marketUniverse?.snapshotFile;
   if (snapshotFile) {
     try {
@@ -210,10 +290,14 @@ async function loadMarketUniverseSymbols(config, logger) {
     : [];
 }
 
-async function resolveOptimizerSymbols(config, logger) {
+export async function resolveOptimizerSymbols(config, logger) {
   const fallbackSymbols = Array.isArray(config?.optimizer?.symbols)
     ? config.optimizer.symbols.map((item) => normalizeSymbol(item)).filter(Boolean)
     : [];
+
+  if (config?.optimizer?.useMarketUniverseSymbols === false) {
+    return fallbackSymbols;
+  }
 
   try {
     const universeSymbols = await loadMarketUniverseSymbols(config, logger);
@@ -318,6 +402,9 @@ export async function optimizeAndApplyBest({
       minWalkForwardFoldCount: runtimeConfig.optimizer.walkForwardMinFoldCount,
       minWalkForwardPassRate: runtimeConfig.optimizer.walkForwardMinPassRate,
       minWalkForwardScore: runtimeConfig.optimizer.walkForwardMinScore,
+      minWalkForwardAverageReturnPct: runtimeConfig.optimizer.walkForwardMinAverageReturnPct,
+      minWalkForwardAverageWinRatePct: runtimeConfig.optimizer.walkForwardMinAverageWinRatePct,
+      minWalkForwardAverageExpectancyKrw: runtimeConfig.optimizer.walkForwardMinAverageExpectancyKrw,
     },
     simulation: {
       interval: runtimeConfig.optimizer.interval,
@@ -367,7 +454,9 @@ export async function optimizeAndApplyBest({
   const evaluatedCandidates = Number(optimization.evaluatedCandidates || 0);
   const safeCandidates = Number(Array.isArray(optimization.safeRanked) ? optimization.safeRanked.length : 0);
   const safeRatio = evaluatedCandidates > 0 ? safeCandidates / evaluatedCandidates : 0;
-  const selectedSymbols = pickRuntimeSymbols(optimization, runtimeConfig);
+  const selectedCandidates = safeCandidates > 0 ? pickRuntimeCandidates(optimization, runtimeConfig) : [];
+  const selectedSymbols = selectedCandidates.map((candidate) => normalizeSymbol(candidate.symbol));
+  const runtimeSupport = summarizeRuntimeSupport(optimization, runtimeConfig);
 
   const report = {
     generatedAt: nowIso(),
@@ -392,7 +481,9 @@ export async function optimizeAndApplyBest({
       safeRatio: roundNum(safeRatio, 4),
       walkForwardEnabled: runtimeConfig.optimizer.walkForwardEnabled,
     },
+    runtimeSupport,
     best: compressCandidate(optimization.best),
+    selectedCandidates: selectedCandidates.map(compressCandidate),
     top: optimization.ranked.slice(0, topN).map(compressCandidate),
   };
 

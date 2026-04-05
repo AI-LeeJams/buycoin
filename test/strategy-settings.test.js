@@ -10,6 +10,7 @@ async function makeConfig(extra = {}) {
   const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "strategy-settings-test-"));
   return loadConfig({
     STRATEGY_SETTINGS_FILE: path.join(baseDir, "strategy-settings.json"),
+    STRATEGY_SETTINGS_ALLOW_SYMBOL_OVERRIDE: "1",
     EXECUTION_SYMBOL: "BTC_KRW",
     EXECUTION_ORDER_AMOUNT_KRW: "20000",
     EXECUTION_WINDOW_SEC: "30",
@@ -126,4 +127,52 @@ test("strategy settings source falls back to defaults on stale file", async () =
   const result = await source.read();
   assert.equal(result.source, "stale_snapshot_fallback");
   assert.equal(result.execution.symbol, "BTC_KRW");
+});
+
+test("strategy settings source does not stale operator settings by default", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "strategy-settings-no-stale-test-"));
+  const config = loadConfig({
+    STRATEGY_SETTINGS_FILE: path.join(baseDir, "strategy-settings.json"),
+    STRATEGY_SETTINGS_ALLOW_SYMBOL_OVERRIDE: "1",
+  });
+  const source = new StrategySettingsSource(config);
+
+  const payload = {
+    version: 1,
+    updatedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    execution: {
+      symbol: "USDT_KRW",
+      orderAmountKrw: 15000,
+    },
+  };
+  await fs.writeFile(config.strategySettings.settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const result = await source.read();
+  assert.equal(result.source, "settings_file");
+  assert.equal(result.execution.symbol, "USDT_KRW");
+  assert.equal(result.execution.orderAmountKrw, 15000);
+});
+
+test("strategy settings source ignores symbol override unless explicitly enabled", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "strategy-settings-symbol-guard-test-"));
+  const config = loadConfig({
+    STRATEGY_SETTINGS_FILE: path.join(baseDir, "strategy-settings.json"),
+    EXECUTION_SYMBOL: "BTC_KRW",
+    EXECUTION_ORDER_AMOUNT_KRW: "12000",
+  });
+  const source = new StrategySettingsSource(config);
+
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    execution: {
+      symbol: "SWAP_KRW",
+      orderAmountKrw: 9000,
+    },
+  };
+  await fs.writeFile(config.strategySettings.settingsFile, JSON.stringify(payload, null, 2), "utf8");
+
+  const result = await source.read();
+  assert.equal(result.execution.symbol, "BTC_KRW");
+  assert.equal(result.execution.orderAmountKrw, 9000);
 });

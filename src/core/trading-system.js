@@ -874,10 +874,8 @@ function normalizeOrderFromExchange(response, existing = {}) {
   const sideToken = String(payload.side || payload.order_side || existing.side || "").trim().toLowerCase();
   const side = sideToken === "ask" ? "sell" : sideToken === "bid" ? "buy" : existing.side || "buy";
   const typeToken = String(payload.ord_type || payload.orderType || payload.type || existing.type || "market").trim().toLowerCase();
-  const type = typeToken === "price" || typeToken === "limit" ? "limit" : typeToken === "market" ? "market" : existing.type || "market";
-  const rawAmount = asNumber(payload.price, existing.amountKrw);
-  const rowPrice = asNumber(payload.price, existing.price);
-  const rowQty = asNumber(payload.volume || payload.quantity, existing.qty);
+  const isMarketBuy = typeToken === "price";
+  const type = isMarketBuy ? "market" : typeToken === "limit" ? "limit" : typeToken === "market" ? "market" : existing.type || "market";
   const filledQty = asPositiveFiniteNumber(payload.executed_volume, asPositiveFiniteNumber(payload.volume_traded, existing.filledQty));
   const remainingQty = asPositiveFiniteNumber(payload.remaining_volume, asPositiveFiniteNumber(payload.volume_remain, existing.remainingQty));
   const avgPrice = asPositiveFiniteNumber(
@@ -889,6 +887,13 @@ function normalizeOrderFromExchange(response, existing = {}) {
   if (!Number.isFinite(filledPrice) && Number.isFinite(filledNotional) && Number.isFinite(filledQty) && filledQty > 0) {
     filledPrice = filledNotional / filledQty;
   }
+  const rawAmount = asNumber(payload.price, existing.amountKrw);
+  const rowPrice = isMarketBuy
+    ? asPositiveFiniteNumber(filledPrice, asPositiveFiniteNumber(existing.expectedPrice, existing.price))
+    : asNumber(payload.price, asPositiveFiniteNumber(filledPrice, existing.price));
+  const rowQty = isMarketBuy
+    ? asPositiveFiniteNumber(payload.volume || payload.quantity, asPositiveFiniteNumber(filledQty, existing.qty))
+    : asNumber(payload.volume || payload.quantity, asPositiveFiniteNumber(filledQty, existing.qty));
   const fee = asPositiveFiniteNumber(payload.paid_fee, asPositiveFiniteNumber(payload.fee, existing.fee));
   const exchangeOrderId = normalizeExchangeOrderId(payload);
 
@@ -2049,6 +2054,7 @@ export class TradingSystem {
     amount = null,
     durationSec = 300,
     cooldownSec = 30,
+    stopSignal = null,
     dryRun = false,
     executionPolicy = null,
     maxOrderAttemptsPerWindow = 0,
@@ -2114,6 +2120,8 @@ export class TradingSystem {
     let sellSignals = 0;
     let attemptedOrders = 0;
     let successfulOrders = 0;
+    let lastSignalAction = null;
+    let lastSignalReason = null;
     let lastSuccessfulOrderAtMs = 0;
     let lastRetryableFailureAtMs = 0;
     let symbolOrderBlocked = false;
@@ -2122,12 +2130,113 @@ export class TradingSystem {
     let streamHandle = null;
     let timer = null;
     let restFallbackTimer = null;
+    let removeAbortListener = null;
     let lastWsTickAtMs = 0;
     let processing = Promise.resolve();
     let overrideActionConsumed = this.isPolicyOverrideConsumedOnce(overrideConsumeKey);
     const orderAttemptsLimit = asPositiveInt(maxOrderAttemptsPerWindow, 0);
     const decisionTrailLimit = asPositiveInt(this.config.runtime?.retention?.strategyRunDecisions, 25);
     const retryableFailureBackoffMs = cooldownMs > 0 ? Math.min(cooldownMs, 1_000) : 0;
+    const pushDecision = (decision) => {
+      decisions.push(decision);
+      while (decisions.length > decisionTrailLimit) {
+        decisions.shift();
+      }
+    };
+    const submitRestFallbackProtectiveExit = async ({
+      price,
+      protectiveExit,
+      restFallbackReason,
+    }) => {
+      const fallbackAmountKrw = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
+      const sellPlan = await this.resolveSellOrderAmount({
+        symbol: normalizedSymbol,
+        price,
+        fallbackAmountKrw,
+      });
+      const orderAmountKrw = asNumber(sellPlan?.amountKrw, fallbackAmountKrw);
+
+      if (!Number.isFinite(orderAmountKrw) || orderAmountKrw <= 0) {
+        pushDecision({
+          at: nowIso(),
+          price,
+          signal: "SELL",
+          action: "SELL",
+          actionSource: "protective_exit",
+          actionReason: restFallbackReason,
+          side: "sell",
+          skipped: "no_position",
+          sellPlan,
+          protectiveExit,
+          restFallback: true,
+        });
+        return;
+      }
+
+      const minSellNotionalKrw = Math.max(asNumber(this.config?.risk?.chanceMinTotalKrw, 5000), 5000);
+      if (orderAmountKrw < minSellNotionalKrw) {
+        pushDecision({
+          at: nowIso(),
+          price,
+          signal: "SELL",
+          action: "SELL",
+          actionSource: "protective_exit",
+          actionReason: restFallbackReason,
+          side: "sell",
+          skipped: "sell_notional_below_min",
+          orderAmountKrw,
+          minSellNotionalKrw,
+          sellPlan,
+          protectiveExit,
+          restFallback: true,
+        });
+        return;
+      }
+
+      await this.recordRiskEvent({
+        type: "protective_exit",
+        source: "risk_exit_rule",
+        symbol: normalizedSymbol,
+        reason: protectiveExit.reason,
+        pnlRatio: protectiveExit.pnlRatio,
+        avgBuyPrice: protectiveExit.avgBuyPrice,
+        currentPrice: protectiveExit.currentPrice,
+      });
+
+      const order = await this.placeOrder({
+        symbol: normalizedSymbol,
+        side: "sell",
+        type: "market",
+        amount: orderAmountKrw,
+        price,
+        expectedPrice: price,
+        dryRun,
+        reason: restFallbackReason,
+      });
+
+      attemptedOrders += 1;
+      if (order.ok) {
+        successfulOrders += 1;
+        lastSuccessfulOrderAtMs = Date.now();
+      }
+
+      pushDecision({
+        at: nowIso(),
+        price,
+        signal: "SELL",
+        action: "SELL",
+        actionSource: "protective_exit",
+        actionReason: restFallbackReason,
+        side: "sell",
+        amountSubmittedKrw: orderAmountKrw,
+        sellPlan,
+        protectiveExit,
+        restFallback: true,
+        orderOk: order.ok,
+        orderCode: order.code,
+        error: order.ok ? null : order.error,
+      });
+    };
 
     try {
       // Determinism guard: keep one overlay snapshot per realtime window.
@@ -2152,6 +2261,8 @@ export class TradingSystem {
               }
 
               const signal = this.signalEngine.evaluate(candlesSnapshot);
+              lastSignalAction = signal.action || null;
+              lastSignalReason = signal.reason || null;
               if (signal.action === "BUY") {
                 buySignals += 1;
               } else if (signal.action === "SELL") {
@@ -2551,6 +2662,29 @@ export class TradingSystem {
         }, durationMs);
       }
 
+      if (stopSignal) {
+        const abortStream = () => {
+          if (timer) {
+            clearTimeout(timer);
+          }
+          if (restFallbackTimer) {
+            clearInterval(restFallbackTimer);
+          }
+          if (streamHandle) {
+            streamHandle.close();
+          }
+        };
+
+        if (stopSignal.aborted) {
+          abortStream();
+        } else if (typeof stopSignal.addEventListener === "function") {
+          stopSignal.addEventListener("abort", abortStream, { once: true });
+          removeAbortListener = () => {
+            stopSignal.removeEventListener("abort", abortStream);
+          };
+        }
+      }
+
       // REST fallback: when no WS ticks arrive for a sustained period, poll
       // the REST ticker endpoint so protective exits (stop-loss, trailing stop)
       // are never missed due to a dead or disconnected WebSocket stream.
@@ -2594,45 +2728,11 @@ export class TradingSystem {
                 return;
               }
 
-              // Bypass cooldown / attempt-cap checks for protective exits.
-              const orderSide = "sell";
-              const baseAmount = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
-              const orderAmountKrw = baseAmount;
-              let sellPlan = null;
-              const order = await this.placeOrder({
-                symbol: normalizedSymbol,
-                side: orderSide,
-                amountKrw: orderAmountKrw,
-                reason: protectiveExit.reason || "rest_fallback_protective_exit",
-                dryRun,
-                sellPlan,
-              });
-
-              attemptedOrders += 1;
-              if (order.ok) {
-                successfulOrders += 1;
-                lastSuccessfulOrderAtMs = Date.now();
-              }
-
-              decisions.push({
-                at: nowIso(),
+              await submitRestFallbackProtectiveExit({
                 price: restPrice,
-                signal: "SELL",
-                action: "SELL",
-                actionSource: "protective_exit",
-                actionReason: protectiveExit.reason || "rest_fallback_protective_exit",
-                side: orderSide,
-                amountSubmittedKrw: orderAmountKrw,
-                sellPlan,
                 protectiveExit,
-                restFallback: true,
-                orderOk: order.ok,
-                orderCode: order.code,
-                error: order.ok ? null : order.error,
+                restFallbackReason: protectiveExit.reason || "rest_fallback_protective_exit",
               });
-              while (decisions.length > decisionTrailLimit) {
-                decisions.shift();
-              }
             } catch (err) {
               this.logger.warn("realtime: REST fallback protective-exit poll failed", {
                 symbol: normalizedSymbol,
@@ -2649,6 +2749,9 @@ export class TradingSystem {
       }
       if (restFallbackTimer) {
         clearInterval(restFallbackTimer);
+      }
+      if (typeof removeAbortListener === "function") {
+        removeAbortListener();
       }
       await processing;
 
@@ -2672,38 +2775,11 @@ export class TradingSystem {
                 currentPrice: restPrice,
               });
               if (protectiveExit?.shouldExit) {
-                const orderSide = "sell";
-                const orderAmountKrw = asNumber(amount, null) ?? this.config.strategy.baseOrderAmountKrw;
-                const order = await this.placeOrder({
-                  symbol: normalizedSymbol,
-                  side: orderSide,
-                  amountKrw: orderAmountKrw,
-                  reason: protectiveExit.reason || "rest_fallback_protective_exit",
-                  dryRun,
-                  sellPlan: null,
-                });
-                attemptedOrders += 1;
-                if (order.ok) {
-                  successfulOrders += 1;
-                }
-                decisions.push({
-                  at: nowIso(),
+                await submitRestFallbackProtectiveExit({
                   price: restPrice,
-                  signal: "SELL",
-                  action: "SELL",
-                  actionSource: "protective_exit",
-                  actionReason: protectiveExit.reason || "rest_fallback_protective_exit",
-                  side: orderSide,
-                  amountSubmittedKrw: orderAmountKrw,
                   protectiveExit,
-                  restFallback: true,
-                  orderOk: order.ok,
-                  orderCode: order.code,
-                  error: order.ok ? null : order.error,
+                  restFallbackReason: protectiveExit.reason || "rest_fallback_protective_exit",
                 });
-                while (decisions.length > decisionTrailLimit) {
-                  decisions.shift();
-                }
               }
             }
           }
@@ -2750,10 +2826,13 @@ export class TradingSystem {
         startedAt,
         endedAt: nowIso(),
         durationSec: durationMs > 0 ? Math.floor(durationMs / 1000) : 0,
+        aborted: stopSignal?.aborted === true,
         cooldownSec: Math.floor(cooldownMs / 1000),
         tickCount,
         buySignals,
         sellSignals,
+        lastSignalAction,
+        lastSignalReason,
         attemptedOrders,
         successfulOrders,
         dryRun: Boolean(dryRun),

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadEnvFile } from "../config/env-loader.js";
@@ -12,6 +13,36 @@ import { StrategySettingsSource } from "./strategy-settings.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pruneOutLogIfNeeded(runtimeConfig, loggerInstance) {
+  const outLogFile = String(runtimeConfig?.runtime?.outLogFile || "").trim();
+  const outLogMaxLines = Math.max(1, Number(runtimeConfig?.runtime?.outLogMaxLines || 10_000));
+  if (!outLogFile) {
+    return;
+  }
+
+  try {
+    const content = await fs.readFile(outLogFile, "utf8");
+    const lineCount = content.length === 0 ? 0 : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+    if (lineCount <= outLogMaxLines) {
+      return;
+    }
+    await fs.writeFile(outLogFile, "");
+    loggerInstance.warn("trader out log pruned after exceeding max lines", {
+      outLogFile,
+      previousLineCount: lineCount,
+      maxLines: outLogMaxLines,
+    });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    loggerInstance.warn("failed to prune trader out log", {
+      outLogFile,
+      error: error?.message || String(error),
+    });
+  }
 }
 
 function asNumber(value, fallback = null) {
@@ -109,6 +140,247 @@ function resolveExecutionFromSettings(runtimeConfig, snapshot) {
   };
 }
 
+async function readOptimizerReport(reportFile) {
+  if (!reportFile) {
+    return null;
+  }
+
+  try {
+    const raw = await fs.readFile(reportFile, "utf8");
+    return raw.trim() ? JSON.parse(raw) : null;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function buildRuntimeStrategySignature(runtimeConfig, effectiveExecution) {
+  const strategyName = String(runtimeConfig?.strategy?.name || "mean_reversion").trim().toLowerCase();
+  const signature = {
+    name: strategyName,
+    autoSellEnabled: runtimeConfig?.strategy?.autoSellEnabled !== false,
+    baseOrderAmountKrw: asNumber(
+      effectiveExecution?.orderAmountKrw
+        ?? runtimeConfig?.strategy?.baseOrderAmountKrw
+        ?? runtimeConfig?.execution?.orderAmountKrw,
+      null,
+    ),
+  };
+
+  if (strategyName === "breakout") {
+    return {
+      ...signature,
+      breakoutLookback: asNumber(runtimeConfig?.strategy?.breakoutLookback, null),
+      breakoutBufferBps: asNumber(runtimeConfig?.strategy?.breakoutBufferBps, null),
+    };
+  }
+
+  if (strategyName === "risk_managed_momentum") {
+    return {
+      ...signature,
+      momentumLookback: asNumber(runtimeConfig?.strategy?.momentumLookback, null),
+      volatilityLookback: asNumber(runtimeConfig?.strategy?.volatilityLookback, null),
+      momentumEntryBps: asNumber(runtimeConfig?.strategy?.momentumEntryBps, null),
+      momentumExitBps: asNumber(runtimeConfig?.strategy?.momentumExitBps, null),
+      targetVolatilityPct: asNumber(runtimeConfig?.strategy?.targetVolatilityPct, null),
+      riskManagedMinMultiplier: asNumber(runtimeConfig?.strategy?.riskManagedMinMultiplier, null),
+      riskManagedMaxMultiplier: asNumber(runtimeConfig?.strategy?.riskManagedMaxMultiplier, null),
+    };
+  }
+
+  return {
+    ...signature,
+    meanLookback: asNumber(runtimeConfig?.strategy?.meanLookback, null),
+    meanEntryBps: asNumber(runtimeConfig?.strategy?.meanEntryBps, null),
+    meanExitBps: asNumber(runtimeConfig?.strategy?.meanExitBps, null),
+  };
+}
+
+function buildReportedStrategySignature(strategy) {
+  if (!strategy || typeof strategy !== "object") {
+    return null;
+  }
+
+  const strategyName = String(strategy.name || "").trim().toLowerCase();
+  if (!strategyName) {
+    return null;
+  }
+
+  const signature = {
+    name: strategyName,
+    autoSellEnabled: strategy.autoSellEnabled !== false,
+    baseOrderAmountKrw: asNumber(strategy.baseOrderAmountKrw, null),
+  };
+
+  if (strategyName === "breakout") {
+    return {
+      ...signature,
+      breakoutLookback: asNumber(strategy.breakoutLookback, null),
+      breakoutBufferBps: asNumber(strategy.breakoutBufferBps, null),
+    };
+  }
+
+  if (strategyName === "risk_managed_momentum") {
+    return {
+      ...signature,
+      momentumLookback: asNumber(strategy.momentumLookback, null),
+      volatilityLookback: asNumber(strategy.volatilityLookback, null),
+      momentumEntryBps: asNumber(strategy.momentumEntryBps, null),
+      momentumExitBps: asNumber(strategy.momentumExitBps, null),
+      targetVolatilityPct: asNumber(strategy.targetVolatilityPct, null),
+      riskManagedMinMultiplier: asNumber(strategy.riskManagedMinMultiplier, null),
+      riskManagedMaxMultiplier: asNumber(strategy.riskManagedMaxMultiplier, null),
+    };
+  }
+
+  return {
+    ...signature,
+    meanLookback: asNumber(strategy.meanLookback, null),
+    meanEntryBps: asNumber(strategy.meanEntryBps, null),
+    meanExitBps: asNumber(strategy.meanExitBps, null),
+  };
+}
+
+function sameStrategySignature(left, right) {
+  if (!left || !right || left.name !== right.name) {
+    return false;
+  }
+
+  const keys = Array.from(new Set([...Object.keys(left), ...Object.keys(right)]));
+  return keys.every((key) => left[key] === right[key]);
+}
+
+function resolveOptimizerGateDecision(runtimeConfig, effectiveExecution, report) {
+  if (runtimeConfig?.optimizer?.liveSafetyGateEnabled !== true) {
+    return {
+      blocked: false,
+      reason: null,
+      detail: null,
+    };
+  }
+
+  const reportGeneratedAt = Date.parse(report?.generatedAt || "");
+  const maxAgeSec = Math.max(1, Number(runtimeConfig?.optimizer?.liveSafetyGateMaxAgeSec || 7200));
+  const maxAgeMs = maxAgeSec * 1000;
+  if (!report || !Number.isFinite(reportGeneratedAt)) {
+    return {
+      blocked: true,
+      reason: "optimizer_live_safety_gate",
+      detail: "missing_report",
+    };
+  }
+
+  if (Date.now() - reportGeneratedAt > maxAgeMs) {
+    return {
+      blocked: true,
+      reason: "optimizer_live_safety_gate",
+      detail: "stale_report",
+    };
+  }
+
+  const runtimeSymbol = normalizeSymbol(effectiveExecution?.symbol || runtimeConfig?.execution?.symbol || "BTC_KRW");
+  const runtimeStrategy = buildRuntimeStrategySignature(runtimeConfig, effectiveExecution);
+  const runtimeStrategyName = runtimeStrategy.name;
+  const runtimeSupport = report?.runtimeSupport && typeof report.runtimeSupport === "object"
+    ? report.runtimeSupport
+    : null;
+
+  if (
+    normalizeSymbol(runtimeSupport?.executionSymbol || "") === runtimeSymbol
+      && String(runtimeSupport?.strategyName || "").trim().toLowerCase() === runtimeStrategyName
+  ) {
+    const reportedRuntimeStrategy = buildReportedStrategySignature(runtimeSupport?.currentConfig?.strategy);
+    if (!sameStrategySignature(reportedRuntimeStrategy, runtimeStrategy)) {
+      return {
+        blocked: true,
+        reason: "optimizer_live_safety_gate",
+        detail: runtimeSupport?.currentConfig ? "mismatched_runtime_config_assessment" : "missing_runtime_config_assessment",
+      };
+    }
+
+    if (runtimeSupport?.currentConfigSafe === true) {
+      return {
+        blocked: false,
+        reason: null,
+        detail: null,
+      };
+    }
+
+    return {
+      blocked: true,
+      reason: "optimizer_live_safety_gate",
+      detail: runtimeSupport?.currentConfig ? "unsafe_runtime_config" : "missing_runtime_config_assessment",
+    };
+  }
+
+  const selectedCandidates = Array.isArray(report?.selectedCandidates) ? report.selectedCandidates : [];
+  const matched = selectedCandidates.find((candidate) => (
+    normalizeSymbol(candidate?.symbol) === runtimeSymbol
+      && candidate?.safe === true
+      && String(candidate?.strategy?.name || "").trim().toLowerCase() === runtimeStrategyName
+      && sameStrategySignature(buildReportedStrategySignature(candidate?.strategy), runtimeStrategy)
+  ));
+
+  if (matched) {
+    return {
+      blocked: false,
+      reason: null,
+      detail: null,
+    };
+  }
+
+  return {
+    blocked: true,
+    reason: "optimizer_live_safety_gate",
+    detail: "no_safe_runtime_candidate",
+  };
+}
+
+async function logOptimizerRuntimeSupport(runtimeConfig, effectiveExecution, loggerInstance) {
+  const report = await readOptimizerReport(runtimeConfig?.optimizer?.reportFile);
+  if (!report) {
+    return;
+  }
+
+  const runtimeSymbol = normalizeSymbol(effectiveExecution?.symbol || runtimeConfig?.execution?.symbol || "BTC_KRW");
+  const runtimeStrategy = buildRuntimeStrategySignature(runtimeConfig, effectiveExecution);
+  const runtimeStrategyName = runtimeStrategy.name;
+  const runtimeSupport = report?.runtimeSupport && typeof report.runtimeSupport === "object"
+    ? report.runtimeSupport
+    : null;
+
+  if (
+    normalizeSymbol(runtimeSupport?.executionSymbol || "") !== runtimeSymbol
+      || String(runtimeSupport?.strategyName || "").trim().toLowerCase() !== runtimeStrategyName
+  ) {
+    return;
+  }
+
+  const reportedRuntimeStrategy = buildReportedStrategySignature(runtimeSupport?.currentConfig?.strategy);
+  if (!sameStrategySignature(reportedRuntimeStrategy, runtimeStrategy)) {
+    return;
+  }
+
+  const logFn = runtimeSupport.currentConfigSafe === true ? loggerInstance.info.bind(loggerInstance) : loggerInstance.warn.bind(loggerInstance);
+  logFn("latest optimizer runtime support", {
+    generatedAt: report.generatedAt || null,
+    executionSymbol: runtimeSupport.executionSymbol,
+    strategyName: runtimeSupport.strategyName,
+    currentConfigSafe: runtimeSupport.currentConfigSafe === true,
+    symbolHasSafeCandidate: runtimeSupport.symbolHasSafeCandidate === true,
+    currentConfigChecks: runtimeSupport.currentConfig?.checks || null,
+    bestForExecutionSymbol: runtimeSupport.bestForExecutionSymbol
+      ? {
+          safe: runtimeSupport.bestForExecutionSymbol.safe,
+          strategy: runtimeSupport.bestForExecutionSymbol.strategy,
+          score: runtimeSupport.bestForExecutionSymbol.score,
+        }
+      : null,
+  });
+}
+
 async function syncManualPause({ trader, snapshot, currentStatus }) {
   const pauseEntries = snapshot?.controls?.pauseEntries;
   if (pauseEntries === true && typeof trader.setEntryBlock === "function") {
@@ -178,6 +450,50 @@ async function syncRiskEntryBlock({ trader, runtimeConfig, executionStatus, exec
   return typeof trader.status === "function" ? trader.status() : executionStatus;
 }
 
+async function syncOptimizerSafetyGate({
+  trader,
+  runtimeConfig,
+  effectiveExecution,
+  executionStatus,
+  executionDryRun,
+}) {
+  const currentReason = executionStatus?.data?.entryBlockReason || null;
+  const currentSource = executionStatus?.data?.entryBlockSource || null;
+  const currentBlocked = executionStatus?.data?.entryBlocked === true;
+  const optimizerOwnsBlock = currentBlocked && (currentReason === "optimizer_live_safety_gate" || currentSource === "optimizer_live_safety_gate");
+
+  if (executionDryRun || runtimeConfig?.optimizer?.liveSafetyGateEnabled !== true) {
+    if (optimizerOwnsBlock && typeof trader.clearEntryBlock === "function") {
+      await trader.clearEntryBlock("optimizer_live_safety_gate");
+      return typeof trader.status === "function" ? trader.status() : executionStatus;
+    }
+    return executionStatus;
+  }
+
+  if (currentBlocked && !optimizerOwnsBlock) {
+    return executionStatus;
+  }
+
+  const report = await readOptimizerReport(runtimeConfig?.optimizer?.reportFile);
+  const decision = resolveOptimizerGateDecision(runtimeConfig, effectiveExecution, report);
+
+  if (decision.blocked && typeof trader.setEntryBlock === "function") {
+    await trader.setEntryBlock(true, {
+      reason: "optimizer_live_safety_gate",
+      source: "optimizer_live_safety_gate",
+      manual: false,
+    });
+    return typeof trader.status === "function" ? trader.status() : executionStatus;
+  }
+
+  if (!decision.blocked && optimizerOwnsBlock && typeof trader.clearEntryBlock === "function") {
+    await trader.clearEntryBlock("optimizer_live_safety_gate");
+    return typeof trader.status === "function" ? trader.status() : executionStatus;
+  }
+
+  return executionStatus;
+}
+
 function aggregateWindowResults(results = []) {
   return results.reduce((acc, row) => {
     if (!row?.ok) {
@@ -189,6 +505,13 @@ function aggregateWindowResults(results = []) {
     acc.sellSignals += Number(row.data?.sellSignals || 0);
     acc.attemptedOrders += Number(row.data?.attemptedOrders || 0);
     acc.successfulOrders += Number(row.data?.successfulOrders || 0);
+    if (row.data?.symbol) {
+      acc.lastSignals.push({
+        symbol: row.data.symbol,
+        action: row.data.lastSignalAction || null,
+        reason: row.data.lastSignalReason || null,
+      });
+    }
     return acc;
   }, {
     failed: 0,
@@ -197,6 +520,7 @@ function aggregateWindowResults(results = []) {
     sellSignals: 0,
     attemptedOrders: 0,
     successfulOrders: 0,
+    lastSignals: [],
   });
 }
 
@@ -254,10 +578,16 @@ export async function runExecutionService({
     let windows = 0;
     let stoppedBy = null;
     let stopRequested = false;
+    let lastExecutionSettingsKey = null;
+    let lastEntryBlockLogKey = null;
+    const stopController = new AbortController();
 
     const onSignal = (signal) => {
       stopRequested = true;
       stoppedBy = signal;
+      if (!stopController.signal.aborted) {
+        stopController.abort(new Error(`execution_service_stop:${signal}`));
+      }
     };
 
     process.on("SIGINT", onSignal);
@@ -274,16 +604,41 @@ export async function runExecutionService({
       maxOrderAttemptsPerWindow: 1,
       strategy: runtimeConfig.strategy.name,
       strategySettingsFile: strategySettings.settingsFile,
+      strategySettingsMaxAgeSec: runtimeConfig.strategySettings?.maxAgeSec ?? null,
       marketUniverseEnabled: marketUniverse.enabled,
     });
 
+    await logOptimizerRuntimeSupport(runtimeConfig, runtimeConfig.execution, logger).catch(() => {});
+
     await marketUniverse.maybeRefresh({ force: true, reason: "startup" }).catch(() => {});
+    await pruneOutLogIfNeeded(runtimeConfig, logger);
 
     while (!stopRequested) {
       windows += 1;
 
       const settingsSnapshot = await strategySettings.read();
       const effectiveExecution = resolveExecutionFromSettings(runtimeConfig, settingsSnapshot);
+      const executionSettingsKey = JSON.stringify({
+        source: settingsSnapshot.source,
+        symbol: effectiveExecution.symbol,
+        orderAmountKrw: effectiveExecution.orderAmountKrw,
+        windowSec: effectiveExecution.windowSec,
+        cooldownSec: effectiveExecution.cooldownSec,
+        pauseEntries: settingsSnapshot?.controls?.pauseEntries ?? null,
+      });
+
+      if (lastExecutionSettingsKey !== executionSettingsKey) {
+        lastExecutionSettingsKey = executionSettingsKey;
+        logger.info("execution settings applied", {
+          window: windows,
+          source: settingsSnapshot.source,
+          symbol: effectiveExecution.symbol,
+          orderAmountKrw: effectiveExecution.orderAmountKrw,
+          windowSec: effectiveExecution.windowSec,
+          cooldownSec: effectiveExecution.cooldownSec,
+          pauseEntries: settingsSnapshot?.controls?.pauseEntries ?? null,
+        });
+      }
 
       if (!effectiveExecution.enabled) {
         logger.warn("execution window skipped by settings", {
@@ -316,21 +671,48 @@ export async function runExecutionService({
           executionDryRun,
         });
 
+        executionStatus = await syncOptimizerSafetyGate({
+          trader,
+          runtimeConfig,
+          effectiveExecution,
+          executionStatus,
+          executionDryRun,
+        });
+
         const protectedSymbols = await resolveProtectedSymbols(trader);
         let requestedSymbols = effectiveExecution.symbols.slice(0, 1);
 
         if (marketUniverse.enabled && typeof marketUniverse.filterSymbols === "function") {
           const filtered = marketUniverse.filterSymbols(requestedSymbols);
+          if (Array.isArray(filtered?.filteredOut) && filtered.filteredOut.length > 0) {
+            logger.warn("execution symbols filtered out by market universe", {
+              window: windows,
+              requestedSymbols,
+              filteredOut: filtered.filteredOut,
+              universeSource: filtered.source || null,
+            });
+          }
           requestedSymbols = Array.isArray(filtered?.symbols) ? filtered.symbols : requestedSymbols;
         }
 
         if (executionStatus?.data?.entryBlocked) {
           requestedSymbols = [];
-          logger.warn("execution running in entry-block mode", {
-            window: windows,
-            reason: executionStatus.data.entryBlockReason || "unknown",
-            source: executionStatus.data.entryBlockSource || null,
+          const entryBlockReason = executionStatus.data.entryBlockReason || "unknown";
+          const entryBlockSource = executionStatus.data.entryBlockSource || null;
+          const entryBlockLogKey = JSON.stringify({
+            reason: entryBlockReason,
+            source: entryBlockSource,
           });
+          if (lastEntryBlockLogKey !== entryBlockLogKey) {
+            lastEntryBlockLogKey = entryBlockLogKey;
+            logger.warn("execution running in entry-block mode", {
+              window: windows,
+              reason: entryBlockReason,
+              source: entryBlockSource,
+            });
+          }
+        } else {
+          lastEntryBlockLogKey = null;
         }
 
         const plans = buildExecutionPlans({
@@ -346,6 +728,7 @@ export async function runExecutionService({
             amount: effectiveExecution.orderAmountKrw,
             durationSec: effectiveExecution.windowSec,
             cooldownSec: plan.role === "protected_exit_only" ? 0 : effectiveExecution.cooldownSec,
+            stopSignal: stopController.signal,
             dryRun: effectiveExecution.dryRun,
             executionPolicy: plan.executionPolicy,
             maxOrderAttemptsPerWindow: effectiveExecution.maxOrderAttemptsPerWindow,
@@ -361,11 +744,14 @@ export async function runExecutionService({
           || summary.failed > 0) {
           logger.info("execution window completed", {
             window: windows,
+            settingsSource: settingsSnapshot.source,
+            configuredSymbol: effectiveExecution.symbol,
             symbols: plans.map((plan) => plan.symbol),
             entryBlocked: Boolean(executionStatus?.data?.entryBlocked),
             tickCount: summary.tickCount,
             buySignals: summary.buySignals,
             sellSignals: summary.sellSignals,
+            lastSignals: summary.lastSignals,
             attemptedOrders: summary.attemptedOrders,
             successfulOrders: summary.successfulOrders,
             failedRuns: summary.failed,
@@ -379,6 +765,9 @@ export async function runExecutionService({
       }
 
       await marketUniverse.maybeRefresh({ reason: "periodic" }).catch(() => {});
+      if (windows % Math.max(1, Number(runtimeConfig.runtime?.outLogPruneCheckEveryWindows || 300)) === 0) {
+        await pruneOutLogIfNeeded(runtimeConfig, logger);
+      }
       await sleep(Math.max(0, Number(runtimeConfig.execution?.restartDelayMs || 1000)));
     }
 

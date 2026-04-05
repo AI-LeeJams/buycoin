@@ -155,6 +155,12 @@ function baseConfig() {
       enabled: false,
       settingsFile: null,
       maxAgeSec: 7200,
+      allowSymbolOverride: true,
+    },
+    optimizer: {
+      liveSafetyGateEnabled: false,
+      liveSafetyGateMaxAgeSec: 7200,
+      reportFile: null,
     },
     marketUniverse: {
       enabled: false,
@@ -430,4 +436,180 @@ test("execution service blocks new entries and switches to exit-only on open los
   assert.equal(system.calls.args[0].symbol, "BTC_KRW");
   assert.equal(system.calls.args[0].executionPolicy.allowBuy, false);
   assert.equal(system.calls.args[0].executionPolicy.allowSell, true);
+});
+
+test("execution service blocks entries when optimizer live safety gate has no safe runtime candidate", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-optimizer-gate-"));
+  const reportFile = path.join(baseDir, "optimizer-report.json");
+  await fs.writeFile(reportFile, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    selectedSymbols: ["TAIKO_KRW"],
+    selectedCandidates: [
+      {
+        symbol: "TAIKO_KRW",
+        safe: true,
+        strategy: {
+          name: "mean_reversion",
+        },
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const config = baseConfig();
+  config.optimizer.liveSafetyGateEnabled = true;
+  config.optimizer.reportFile = reportFile;
+
+  const system = new SystemMock();
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.entryBlockSet, 1);
+  assert.equal(system.calls.realtime, 0);
+  assert.deepEqual(system.calls.entryBlockArgs[0], {
+    blocked: true,
+    reason: "optimizer_live_safety_gate",
+    source: "optimizer_live_safety_gate",
+    manual: false,
+  });
+});
+
+test("execution service allows entries when optimizer live safety gate matches runtime symbol and strategy", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-optimizer-allow-"));
+  const reportFile = path.join(baseDir, "optimizer-report.json");
+  await fs.writeFile(reportFile, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    runtimeSupport: {
+      executionSymbol: "BTC_KRW",
+      strategyName: "mean_reversion",
+      currentConfigSafe: true,
+      symbolHasSafeCandidate: true,
+      currentConfig: {
+        symbol: "BTC_KRW",
+        safe: true,
+        strategy: {
+          name: "mean_reversion",
+          autoSellEnabled: true,
+          baseOrderAmountKrw: 20000,
+          meanLookback: 20,
+          meanEntryBps: 60,
+          meanExitBps: 10,
+        },
+      },
+      bestSafeForExecutionSymbol: {
+        symbol: "BTC_KRW",
+        safe: true,
+        strategy: {
+          name: "mean_reversion",
+          autoSellEnabled: true,
+          baseOrderAmountKrw: 20000,
+          meanLookback: 20,
+          meanEntryBps: 60,
+          meanExitBps: 10,
+        },
+      },
+    },
+    selectedSymbols: ["BTC_KRW"],
+    selectedCandidates: [
+      {
+        symbol: "BTC_KRW",
+        safe: true,
+        strategy: {
+          name: "mean_reversion",
+          autoSellEnabled: true,
+          baseOrderAmountKrw: 20000,
+          meanLookback: 20,
+          meanEntryBps: 60,
+          meanExitBps: 10,
+        },
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const config = baseConfig();
+  config.optimizer.liveSafetyGateEnabled = true;
+  config.optimizer.reportFile = reportFile;
+
+  const system = new SystemMock();
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.entryBlockSet, 0);
+  assert.equal(system.calls.realtime, 1);
+  assert.equal(system.calls.args[0].symbol, "BTC_KRW");
+});
+
+test("execution service clears optimizer gate block when live safety gate is disabled", async () => {
+  const config = baseConfig();
+  config.optimizer.liveSafetyGateEnabled = false;
+
+  const system = new SystemMock();
+  system.entryBlock = {
+    blocked: true,
+    reason: "optimizer_live_safety_gate",
+    source: "optimizer_live_safety_gate",
+    blockedAt: new Date().toISOString(),
+    tradeDate: null,
+  };
+
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.entryBlockClear >= 1, true);
+  assert.equal(system.calls.realtime, 1);
+  assert.equal(system.entryBlock.blocked, false);
+});
+
+test("execution service blocks entries when optimizer live safety report params do not match runtime config", async () => {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "execution-optimizer-mismatch-"));
+  const reportFile = path.join(baseDir, "optimizer-report.json");
+  await fs.writeFile(reportFile, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    runtimeSupport: {
+      executionSymbol: "BTC_KRW",
+      strategyName: "mean_reversion",
+      currentConfigSafe: true,
+      currentConfig: {
+        strategy: {
+          name: "mean_reversion",
+          autoSellEnabled: true,
+          baseOrderAmountKrw: 20000,
+          meanLookback: 48,
+          meanEntryBps: 60,
+          meanExitBps: 10,
+        },
+      },
+    },
+    selectedSymbols: ["BTC_KRW"],
+    selectedCandidates: [
+      {
+        symbol: "BTC_KRW",
+        safe: true,
+        strategy: {
+          name: "mean_reversion",
+          autoSellEnabled: true,
+          baseOrderAmountKrw: 20000,
+          meanLookback: 48,
+          meanEntryBps: 60,
+          meanExitBps: 10,
+        },
+      },
+    ],
+  }, null, 2), "utf8");
+
+  const config = baseConfig();
+  config.optimizer.liveSafetyGateEnabled = true;
+  config.optimizer.reportFile = reportFile;
+
+  const system = new SystemMock();
+  const result = await runExecutionService({ system, config, stopAfterWindows: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(system.calls.entryBlockSet, 1);
+  assert.equal(system.calls.realtime, 0);
+  assert.deepEqual(system.calls.entryBlockArgs[0], {
+    blocked: true,
+    reason: "optimizer_live_safety_gate",
+    source: "optimizer_live_safety_gate",
+    manual: false,
+  });
 });

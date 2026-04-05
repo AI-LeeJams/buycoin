@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { optimizeTradingStrategies, simulateRiskManagedMomentum } from "../src/engine/strategy-optimizer.js";
-import { pickRuntimeSymbols } from "../src/app/optimize.js";
+import { pickRuntimeSymbols, resolveOptimizerSymbols, summarizeRuntimeSupport } from "../src/app/optimize.js";
+import { loadConfig } from "../src/config/defaults.js";
 
 function makeCandles({ startPrice = 1000, count = 160, slope = 1, noise = 0.3 }) {
   const candles = [];
@@ -32,6 +36,22 @@ function withFinalShock(candles, shockPct) {
       low: close,
     };
   });
+}
+
+function makeLateReversalCandles() {
+  const candles = [];
+  let price = 1000;
+  for (let i = 0; i < 200; i += 1) {
+    price += i < 150 ? -1.2 + Math.sin(i / 4) * 3 : 6 + Math.sin(i / 3) * 1.5;
+    price = Math.max(50, price);
+    candles.push({
+      timestamp: i + 1,
+      close: price,
+      high: price,
+      low: price,
+    });
+  }
+  return candles;
 }
 
 test("simulateRiskManagedMomentum returns metrics", () => {
@@ -202,6 +222,86 @@ test("optimizer rejects candidates whose net edge is wiped out by slippage", () 
   assert.equal(result.safeRanked.length, 0);
 });
 
+test("optimizer rejects candidates with negative walk-forward average return", () => {
+  const result = optimizeTradingStrategies({
+    candlesBySymbol: {
+      BTC_KRW: makeLateReversalCandles(),
+    },
+    strategyBase: {
+      autoSellEnabled: true,
+      baseOrderAmountKrw: 10_000,
+    },
+    constraints: {
+      maxDrawdownPctLimit: 80,
+      minTrades: 0,
+      minWinRatePct: 0,
+      minProfitFactor: 0,
+      minReturnPct: -100,
+      minExpectancyKrw: -100000,
+      minNetEdgeBps: -100000,
+      minWalkForwardFoldCount: 3,
+      minWalkForwardPassRate: 0,
+      minWalkForwardScore: -999999,
+      minWalkForwardAverageReturnPct: 0,
+      minWalkForwardAverageWinRatePct: 0,
+      minWalkForwardAverageExpectancyKrw: -100000,
+    },
+    simulation: {
+      interval: "15m",
+      initialCashKrw: 1_000_000,
+      baseOrderAmountKrw: 10_000,
+      minOrderNotionalKrw: 5_000,
+      feeBps: 5,
+      simulatedSlippageBps: 12,
+      autoSellEnabled: true,
+    },
+    gridConfig: {
+      strategyNames: ["mean_reversion"],
+      meanLookbacks: [16],
+      meanEntryBpsCandidates: [60],
+      meanExitBpsCandidates: [12],
+    },
+    walkForward: {
+      enabled: true,
+      minScore: -999999,
+      minFoldCount: 3,
+      minPassRate: 0,
+      trainWindow: 80,
+      testWindow: 40,
+      stepWindow: 30,
+      maxFolds: 0,
+      scoreWeight: 0.25,
+    },
+  });
+
+  assert.equal(result.ranked.length > 0, true);
+  assert.equal(result.ranked[0].walkForward?.metrics?.averageReturnPct < 0, true);
+  assert.equal(result.ranked[0].safety.checks.walkForward, false);
+  assert.equal(result.safeRanked.length, 0);
+});
+
+test("resolveOptimizerSymbols can ignore market-universe snapshots when pinned", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "buycoin-opt-"));
+  const snapshotFile = path.join(tempDir, "market-universe.json");
+  await fs.writeFile(snapshotFile, JSON.stringify({
+    symbols: ["TAIKO_KRW", "BTC_KRW"],
+  }), "utf8");
+
+  const config = loadConfig({
+    MARKET_UNIVERSE_FILE: snapshotFile,
+    OPTIMIZER_SYMBOLS: "BTC_KRW,ETH_KRW",
+    OPTIMIZER_USE_MARKET_UNIVERSE_SYMBOLS: "false",
+  });
+
+  const symbols = await resolveOptimizerSymbols(config, {
+    warn() {},
+  });
+
+  assert.deepEqual(symbols, ["BTC_KRW", "ETH_KRW"]);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
 test("pickRuntimeSymbols selects per-symbol best candidates within score gap", () => {
   const selected = pickRuntimeSymbols({
     best: {
@@ -242,4 +342,59 @@ test("pickRuntimeSymbols selects per-symbol best candidates within score gap", (
   });
 
   assert.deepEqual(selected, ["BTC_KRW", "ETH_KRW"]);
+});
+
+test("summarizeRuntimeSupport reports exact runtime config safety separately from top symbol selection", () => {
+  const summary = summarizeRuntimeSupport({
+    ranked: [
+      {
+        symbol: "BTC_KRW",
+        strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 5 },
+        score: 42,
+        safety: { safe: false, checks: { minNetEdge: false } },
+        metrics: { totalReturnPct: -1, expectancyKrw: 50, netEdgeBps: -10 },
+      },
+      {
+        symbol: "BTC_KRW",
+        strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 15 },
+        score: 55,
+        safety: { safe: true, checks: {} },
+        metrics: { totalReturnPct: 2, expectancyKrw: 180, netEdgeBps: 12 },
+      },
+      {
+        symbol: "ETH_KRW",
+        strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 5 },
+        score: 88,
+        safety: { safe: true, checks: {} },
+        metrics: { totalReturnPct: 4, expectancyKrw: 220, netEdgeBps: 16 },
+      },
+    ],
+    safeRanked: [
+      {
+        symbol: "BTC_KRW",
+        strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 15 },
+        score: 55,
+        safety: { safe: true, checks: {} },
+        metrics: { totalReturnPct: 2, expectancyKrw: 180, netEdgeBps: 12 },
+      },
+      {
+        symbol: "ETH_KRW",
+        strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 5 },
+        score: 88,
+        safety: { safe: true, checks: {} },
+        metrics: { totalReturnPct: 4, expectancyKrw: 220, netEdgeBps: 16 },
+      },
+    ],
+  }, {
+    execution: { symbol: "BTC_KRW" },
+    strategy: { name: "mean_reversion", meanLookback: 20, meanEntryBps: 80, meanExitBps: 5 },
+  });
+
+  assert.equal(summary.executionSymbol, "BTC_KRW");
+  assert.equal(summary.strategyName, "mean_reversion");
+  assert.equal(summary.currentConfigSafe, false);
+  assert.equal(summary.symbolHasSafeCandidate, true);
+  assert.equal(summary.currentConfig?.safe, false);
+  assert.equal(summary.bestForExecutionSymbol?.safe, true);
+  assert.equal(summary.bestSafeForExecutionSymbol?.safe, true);
 });

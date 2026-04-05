@@ -164,6 +164,34 @@ class WsClientMock {
   }
 }
 
+class WsClientBlockingMock {
+  constructor() {
+    this.openCalls = [];
+    this.closeCalls = 0;
+  }
+
+  async openTickerStream({ symbols }) {
+    this.openCalls.push({ symbols });
+    let closed = false;
+    let resolveClosed;
+    const closedPromise = new Promise((resolve) => {
+      resolveClosed = resolve;
+    });
+
+    return {
+      close: () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        this.closeCalls += 1;
+        resolveClosed({ code: 1000, reason: "aborted" });
+      },
+      closed: closedPromise,
+    };
+  }
+}
+
 async function createConfig(extra = {}) {
   const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "system-test-"));
   return loadConfig({
@@ -496,6 +524,36 @@ test("strategy realtime executes buy from websocket ticks", async () => {
   assert.equal(exchange.placeCalls.length >= 1, true);
 });
 
+test("strategy realtime closes promptly when stop signal is aborted", async () => {
+  const config = await createConfig();
+  const exchange = new ExchangeMock();
+  const wsClient = new WsClientBlockingMock();
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(REALTIME_CANDLES_BUY),
+    overlayEngine: new OverlayMock(),
+    wsClient,
+  });
+  await system.init();
+
+  const controller = new AbortController();
+  const pending = system.runStrategyRealtime({
+    symbol: "BTC_KRW",
+    durationSec: 300,
+    stopSignal: controller.signal,
+  });
+
+  setTimeout(() => controller.abort(), 10);
+  const result = await Promise.race([
+    pending,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("abort_timeout")), 500)),
+  ]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.aborted, true);
+  assert.equal(wsClient.closeCalls, 1);
+});
+
 test("strategy realtime can execute policy override decision without signal trigger", async () => {
   const config = await createConfig();
   const exchange = new ExchangeMock();
@@ -815,6 +873,44 @@ test("orderList forwards uuids/states options to exchange listOrders", async () 
   });
 });
 
+test("market buy reconciliation keeps market type and fill-derived price/qty", async () => {
+  const config = await createConfig();
+  const exchange = new ExchangeMock();
+  exchange.getOrderStatus = async () => ({
+    uuid: "exchange-1",
+    state: "done",
+    side: "bid",
+    ord_type: "price",
+    price: "18000",
+    executed_volume: "131.38686131386862",
+    avg_price: "137",
+    paid_fee: "45",
+  });
+
+  const system = new TradingSystem(config, {
+    exchangeClient: exchange,
+    marketData: new MarketDataMock(),
+    overlayEngine: new OverlayMock(),
+  });
+  await system.init();
+
+  const result = await system.placeOrder({
+    symbol: "SWAP_KRW",
+    side: "buy",
+    type: "market",
+    amount: 18000,
+    expectedPrice: 137,
+    reason: "test_market_buy_reconcile",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.type, "market");
+  assert.equal(result.data.amountKrw, 18000);
+  assert.equal(result.data.price, 137);
+  assert.equal(result.data.qty, 131.38686131386862);
+  assert.equal(result.data.filledQty, 131.38686131386862);
+});
+
 // ---------------------------------------------------------------------------
 // FIX-1  protective exit bypasses cooldown and order-attempt cap
 // ---------------------------------------------------------------------------
@@ -967,6 +1063,11 @@ test("realtime REST fallback protective exit fires when no WS ticks arrive", asy
     (d) => d.side === "sell" && d.actionSource === "protective_exit",
   );
   assert.equal(sellDecisions.length >= 1, true, "REST fallback protective exit must fire when WS is dead");
+  assert.equal(sellDecisions.some((d) => d.orderOk === true), true, "REST fallback protective exit must submit");
+  assert.equal(exchange.placeCalls.length, 1);
+  assert.equal(exchange.placeCalls[0].side, "sell");
+  assert.equal(exchange.placeCalls[0].type, "market");
+  assert.equal(Math.round(exchange.placeCalls[0].amountKrw), 8000);
 });
 
 test("loadAccountContext cache reduces API calls within TTL window", async () => {
